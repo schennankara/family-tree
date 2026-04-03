@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chennamkara Family Tree</title>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    html, body, #root {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      min-height: 100%;
+      background: #0a0a08;
+    }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useCallback, useMemo, useRef, useEffect } = React;
+
+
+/* ───── EMBEDDED TREE DATA (37KB, parsed from GEDCOM via python-gedcom) ───── */
+const INIT={"id":"@62607986@","fn":"Mathan","ln":"Mathai","dn":"Mathan Mathai","g":"M","dec":false,"bo":0,"gen":0,"sp":{"id":"@9093798@","dn":"(Unknown)","g":"F","dec":false,"bo":0},"ch":[{"id":"@36417121@","fn":"Kochukunju","ln":"Mattapallil","dn":"Kochukunju Mattapallil","nk":"Mathai","g":"M","dec":false,"bo":1,"gen":0,"sp":{"id":"@31886751@","fn":"Mrs","mn":"Kochukunju","ln":"Mattapallil","dn":"Mrs Mattapallil","g":"F","dec":false,"bo":0},"ch":[{"id":"@31520900@","fn":"M","mn":"K","ln":"Abraham","dn":"M K Abraham","g":"M","dec":false,"bo":1,"gen":1,"sp":{"id":"@54154336@","fn":"Aleyamma","mn":"Kizhakemattackal","ln":"Ninan","dn":"Aleyamma Ninan","g":"F","dec":false,"bo":0},"ch":[{"id":"@11171685@","fn":"C","mn":"A","ln":"Annamma","dn":"C A Annamma","nk":"Kunjumol","g":"F","dec":false,"bo":1,"gen":1,"ch":[{"id":"@80068308@","fn":"Benoy","dn":"Benoy","g":"M","dec":false,"bo":1,"sp":{"id":"@47864504@","fn":"Jamol","dn":"Jamol","g":"F","dec":false,"bo":0},"ch":[{"id":"@54812619@","dn":"(Unknown)","g":"F","dec":false,"bo":1},{"id":"@77231557@","dn":"(Unknown)","g":"F","dec":false,"bo":2}]},{"id":"@40808637@","fn":"Betsy","dn":"Betsy","g":"F","dec":false,"bo":2,"sp":{"id":"@85186177@","fn":"Edison","dn":"Edison","g":"M","dec":false,"bo":0},"ch":[{"id":"@73182011@","dn":"(Unknown)","g":"F","dec":false,"bo":1},{"id":"@69765988@","dn":"(Unknown)","g":"M","dec":false,"bo":2},{"id":"@15367222@","dn":"(Unknown)","g":"M","dec":false,"bo":3}]},{"id":"@25551960@","fn":"Blessen","dn":"Blessen","g":"M","dec":false,"bo":3,"sp":{"id":"@16171984@","dn":"(Unknown)","g":"F","dec":false,"bo":0}}]},{"id":"@86239824@","fn":"Chinnamma","dn":"Chinnamma","g":"F","dec":false,"bo":2,"ch":[{"id":"@36504217@","fn":"Joy","dn":"Joy","g":"M","dec":false,"bo":1},{"id":"@19561568@","fn":"Lalamma","dn":"Lalamma","g":"F","dec":false,"bo":2},{"id":"@5581319@","fn":"Ponnamma","dn":"Ponnamma","g":"F","dec":false,"bo":3},{"id":"@81858336@","fn":"Raju","dn":"Raju","g":"M","dec":false,"bo":4},{"id":"@57169196@","fn":"Susy","dn":"Susy","g":"F","dec":false,"bo":5},{"id":"@26837592@","fn":"Unnikunju","dn":"Unnikunju","g":"M","dec":false,"bo":6}]},{"id":"@84535214@","fn":"M","mn":"A","ln":"George","dn":"M A George","nk":"Kunjunj","g":"M","dec":false,"bo":3,"ch":[{"id":"@37973516@","fn":"Shaila","dn":"Shaila","g":"F","dec":false,"bo":1},{"id":"@39230016@","fn":"Shajan","dn":"Shajan","g":"M","dec":false,"bo":2},{"id":"@84399939@","fn":"Shanty","dn":"Shanty","g":"F","dec":false,"bo":3}]},{"id":"@23748818@","fn":"M","mn":"A","ln":"Samuel","dn":"M A Samuel","nk":"Samu","g":"M","dec":false,"bo":4,"ch":[{"id":"@23989305@","fn":"Lizy","ln":"Samuel","dn":"Lizy Samuel","g":"F","dec":false,"bo":1,"sp":{"id":"@52636753@","fn":"James","dn":"James","g":"M","dec":false,"bo":0}}]},{"id":"@44040328@","fn":"M","mn":"A","ln":"Abraham","dn":"M A Abraham","nk":"Johny","g":"M","dec":false,"bo":5,"ch":[{"id":"@24395919@","fn":"Salina","dn":"Salina","g":"F","dec":false,"bo":1},{"id":"@30118728@","fn":"Samana","dn":"Samana","g":"F","dec":false,"bo":2,"sp":{"id":"@71050383@","fn":"Jose","dn":"Jose","g":"M","dec":false,"bo":0},"ch":[{"id":"@45768052@","dn":"(Unknown)","g":"M","dec":false,"bo":1}]}]},{"id":"@17803048@","fn":"M","mn":"A","ln":"Daniel","dn":"M A Daniel","g":"M","dec":false,"bo":6,"ch":[{"id":"@32035700@","fn":"Lala","dn":"Lala","g":"F","dec":false,"bo":1},{"id":"@32675569@","fn":"Valsa","dn":"Valsa","g":"F","dec":false,"bo":2,"ch":[{"id":"@2677452@","dn":"(Unknown)","g":"F","dec":false,"bo":1,"sp":{"id":"@58203584@","dn":"(Unknown)","g":"M","dec":false,"bo":0},"ch":[{"id":"@2851584@","dn":"(Unknown)","g":"F","dec":false,"bo":1}]}]}]},{"id":"@49873360@","fn":"M","mn":"A","ln":"Mathew","dn":"M A Mathew","nk":"Baby","g":"M","dec":false,"bo":7,"sp":{"id":"@84198968@","fn":"Kunjamma","ln":"Mathew","dn":"Kunjamma Mathew","g":"F","dec":false,"bo":0},"ch":[{"id":"@27192156@","fn":"Chennankara","mn":"Mathew","ln":"Raju","dn":"Chennankara Mathew Raju","g":"M","dob":"5/15/1949","dod":"9/20/2022","dec":true,"bo":1,"sp":{"id":"@672408@","fn":"Mercy","dn":"Mercy","g":"F","dob":"07/22/1952","dod":"02/17/2021","dec":true,"bo":0},"ch":[{"id":"@88137588@","fn":"Barry","dn":"Barry","g":"M","dec":false,"bo":1},{"id":"@57104506@","fn":"Hazel","dn":"Hazel","g":"F","dec":false,"bo":2},{"id":"@51356860@","fn":"Karen","dn":"Karen","g":"F","dec":false,"bo":3}]},{"id":"@33060048@","fn":"Leelamma","ln":"Mathew","dn":"Leelamma Mathew","g":"F","dob":"5/15/1951","dec":false,"bo":2,"prof":"Nurse","sp":{"id":"@17493452@","fn":"Rajan","ln":"Thomas","dn":"Rajan Thomas","g":"M","dob":"8/15/1951","dod":"3/20/2023","dec":true,"bo":0,"prof":"Telecom Engineer"},"ch":[{"id":"@1364544@","fn":"Abey","ln":"Rajan","dn":"Abey Rajan","g":"M","dob":"10/7/1978","dec":false,"bo":1,"prof":"Director EHS","mdate":"7/5/2003","sp":{"id":"@8314428@","fn":"Rachel","mn":"Ann","ln":"Kurikesu","dn":"Rachel Ann Kurikesu","nk":"Sani","g":"F","dob":"10/31/1979","dec":false,"bo":0},"ch":[{"id":"@59268874@","fn":"Aaron","ln":"Rajan","dn":"Aaron Rajan","g":"M","dec":false,"bo":1},{"id":"@76906888@","fn":"Andrew","ln":"Rajan","dn":"Andrew Rajan","g":"M","dec":false,"bo":2},{"id":"@2404204@","fn":"Asher","ln":"Rajan","dn":"Asher Rajan","g":"M","dec":false,"bo":3},{"id":"@56368396@","fn":"Ruthanne","ln":"Rajan","dn":"Ruthanne Rajan","g":"F","dec":false,"bo":4}]},{"id":"@47721394@","fn":"Anil","ln":"Rajan","dn":"Anil Rajan","g":"M","dob":"07/11/1980","dec":false,"bo":2,"sp":{"id":"@73411440@","fn":"Anju","mn":"Anil","ln":"Rajan","dn":"Anju Anil Rajan","g":"F","dec":false,"bo":0}},{"id":"@62263900@","fn":"Ashley","ln":"Rajan","dn":"Ashley Rajan","g":"M","dob":"07/07/1986","dec":false,"bo":3,"sp":{"id":"@52181262@","fn":"Meryl","mn":"Ann","ln":"Soman","dn":"Meryl Ann Soman","g":"F","dec":false,"bo":0}}]},{"id":"@94526928@","fn":"Sally","dn":"Sally","g":"M","dec":false,"bo":3}]},{"id":"@45431325@","fn":"M","mn":"A","ln":"Thomas","dn":"M A Thomas","nk":"Kunjumon","g":"M","dec":false,"bo":8,"ch":[{"id":"@41335800@","fn":"Jiju","dn":"Jiju","g":"M","dec":false,"bo":1}]},{"id":"@95304224@","fn":"M","mn":"A","ln":"Varughese","dn":"M A Varughese","nk":"Joy","g":"M","dec":false,"bo":9,"ch":[{"id":"@22261098@","fn":"Jaison","dn":"Jaison","g":"M","dec":false,"bo":1},{"id":"@24336856@","fn":"Jessy","dn":"Jessy","g":"F","dec":false,"bo":2}]}]},{"id":"@51744376@","fn":"M","mn":"K","ln":"George","dn":"M K George","g":"M","dod":"08/17/2000","dec":true,"bo":2,"gen":1,"sp":{"id":"@46296247@","fn":"Kunjamma","ln":"George","dn":"Kunjamma George","g":"F","dod":"05/13/1993","dec":true,"bo":0},"ch":[{"id":"@3651987@","fn":"George","mn":"Chennamkara","ln":"Abraham","dn":"George Chennamkara Abraham","nk":"Kunjumon","g":"M","dob":"3/28/1947","dec":false,"bo":1,"loc":"Ranni, Kerala, India","sp":{"id":"@23254320@","fn":"Aleyamma","ln":"Abraham","dn":"Aleyamma Abraham","nk":"Thankamma","g":"F","dob":"05/15/1952","dec":false,"bo":1},"ch":[{"id":"@92638417@","fn":"Rolson","mn":"Chennamkara","ln":"Abraham","dn":"Rolson Chennamkara Abraham","nk":"Roly","g":"M","dob":"05/31/1978","dec":false,"bo":1,"ph":"6462481367","loc":"Eraviperoor, Kerala, India","mdate":"4/8/2004","sp":{"id":"@34986560@","fn":"Sheeba","ln":"Abraham","dn":"Sheeba Abraham","nk":"Susan","g":"F","dob":"10/25/1978","dec":false,"bo":1},"ch":[{"id":"@2241874@","fn":"Rebekah","ln":"Abraham","dn":"Rebekah Abraham","nk":"Maalu","g":"F","dob":"09/02/2009","dec":false,"bo":1,"loc":"New Hyde Park, NY, USA"},{"id":"@42897332@","fn":"Esther","ln":"Abraham","dn":"Esther Abraham","nk":"Ammu","g":"F","dob":"11/16/2011","dec":false,"bo":2,"loc":"New Hyde Park, NY, USA"},{"id":"@91217409@","fn":"Ethan","mn":"Chennamkara","ln":"Abraham","dn":"Ethan Chennamkara Abraham","nk":"Appu","g":"M","dob":"11/16/2011","dec":false,"bo":3,"loc":"New Hyde Park, NY, USA"}]},{"id":"@59875295@","fn":"Rincy","ln":"Samuel","dn":"Rincy Samuel","g":"F","dob":"11/13/1979","dec":false,"bo":2,"loc":"Eraviperoor, Kerala, India","sp":{"id":"@9661840@","fn":"Arun","mn":"Kumar","ln":"Samuel","dn":"Arun Kumar Samuel","g":"M","dec":false,"bo":1},"ch":[{"id":"@32494516@","fn":"Oliva","mn":"Arun","ln":"Samuel","dn":"Oliva Arun Samuel","g":"F","dob":"11/16/2005","dec":false,"bo":1},{"id":"@31479380@","fn":"Glenn","mn":"Jeevan","ln":"Samuel","dn":"Glenn Jeevan Samuel","g":"M","dob":"03/01/2010","dec":false,"bo":2}]}]},{"id":"@92117632@","fn":"C","mn":"G","ln":"Sunnykutty","dn":"C G Sunnykutty","nk":"Sunnykutty","g":"M","dec":false,"bo":2,"sp":{"id":"@34948388@","fn":"Kunjamma","ln":"Sunny","dn":"Kunjamma Sunny","g":"F","dec":false,"bo":0},"ch":[{"id":"@8870808@","fn":"Godson","ln":"Sunnykutty","dn":"Godson Sunnykutty","g":"M","dec":false,"bo":1},{"id":"@70573437@","fn":"Lincy","ln":"Sunnykutty","dn":"Lincy Sunnykutty","g":"F","dec":false,"bo":2},{"id":"@15829236@","fn":"Linda","ln":"Sunnykutty","dn":"Linda Sunnykutty","g":"F","dec":false,"bo":3}]},{"id":"@97900892@","fn":"Elsy","mn":"chethakal","ln":"Vargheese","dn":"Elsy chethakal Vargheese","g":"F","dec":false,"bo":3,"sp":{"id":"@58455785@","fn":"Thomas","mn":"Kulanjikompil","ln":"Varghese","dn":"Thomas Kulanjikompil Varghese","nk":"Babykutty","g":"M","dec":false,"bo":0},"ch":[{"id":"@92186288@","ln":"Vargheese","dn":"Vargheese","g":"M","dec":false,"bo":1},{"id":"@5471440@","ln":"Vargheese","dn":"Vargheese","g":"M","dec":false,"bo":2}]},{"id":"@10740711@","fn":"George","mn":"(joy)","ln":"Mathew","dn":"George (joy) Mathew","nk":"Joy","g":"M","dec":false,"bo":4,"sp":{"id":"@53783728@","fn":"Thankamma","ln":"Joy","dn":"Thankamma Joy","g":"F","dec":false,"bo":0},"ch":[{"id":"@40708768@","fn":"Omana","ln":"Mathew","dn":"Omana Mathew","g":"M","dec":false,"bo":1},{"id":"@61115232@","fn":"Reji","mn":"Chennamkara","ln":"Mathew","dn":"Reji Chennamkara Mathew","g":"M","dec":false,"bo":2},{"id":"@30810016@","fn":"Saji","mn":"Chennamkara","ln":"Mathew","dn":"Saji Chennamkara Mathew","g":"M","dec":false,"bo":3}]},{"id":"@453227@","fn":"George","mn":"Pollachi","ln":"Vargheese","dn":"George Pollachi Vargheese","nk":"Kunjunjukutty","g":"M","dec":false,"bo":5,"sp":{"id":"@51060567@","fn":"Leelamma","ln":"Vargheese","dn":"Leelamma Vargheese","g":"F","dec":false,"bo":0},"ch":[{"id":"@71118976@","fn":"Samson","ln":"Vargheese","dn":"Samson Vargheese","nk":"Shabu","g":"M","dec":false,"bo":1},{"id":"@45862236@","fn":"Shobi","ln":"Vargheese","dn":"Shobi Vargheese","g":"F","dec":false,"bo":2}]},{"id":"@56759655@","fn":"Gracy","ln":"Thomas","dn":"Gracy Thomas","g":"F","dec":false,"bo":6,"sp":{"id":"@7288359@","fn":"K","mn":"M","ln":"Thomas","dn":"K M Thomas","nk":"Thadathil kochu","g":"M","dec":false,"bo":0},"ch":[{"id":"@15275908@","fn":"Jessy","ln":"Thomas","dn":"Jessy Thomas","g":"F","dec":false,"bo":1},{"id":"@62054634@","fn":"Moncy","ln":"Thomas","dn":"Moncy Thomas","g":"M","dec":false,"bo":2},{"id":"@53264728@","fn":"Shabu","ln":"Thomas","dn":"Shabu Thomas","g":"M","dec":false,"bo":3},{"id":"@86980123@","fn":"Sonu","ln":"Thomas","dn":"Sonu Thomas","g":"F","dec":false,"bo":4}]},{"id":"@45703688@","fn":"Kunjumol","mn":"Mallaserry","ln":"Abraham","dn":"Kunjumol Mallaserry Abraham","nk":"Kunjumol","g":"F","dec":false,"bo":7,"sp":{"id":"@7733272@","fn":"Pappachan","mn":"Mallaserry","dn":"Pappachan","g":"M","dec":false,"bo":0},"ch":[{"id":"@79074868@","fn":"Jaison","ln":"Abraham","dn":"Jaison Abraham","g":"M","dec":false,"bo":1},{"id":"@71393760@","fn":"Johnson","ln":"Abraham","dn":"Johnson Abraham","g":"M","dec":false,"bo":2},{"id":"@42993076@","fn":"Paulson","ln":"Abraham","dn":"Paulson Abraham","g":"M","dec":false,"bo":3},{"id":"@30446760@","fn":"Thomson","ln":"Abraham","dn":"Thomson Abraham","g":"M","dec":false,"bo":4},{"id":"@65353782@","fn":"Wilson","ln":"Abraham","dn":"Wilson Abraham","g":"M","dec":false,"bo":5}]},{"id":"@90997832@","fn":"Ponnamma","mn":"seethathodu","ln":"George","dn":"Ponnamma seethathodu George","g":"F","dec":false,"bo":8,"sp":{"id":"@48680695@","fn":"George","dn":"George","nk":"Georgekutty","g":"M","dec":true,"bo":0},"ch":[{"id":"@13083266@","fn":"Jaimon","ln":"George","dn":"Jaimon George","g":"M","dec":false,"bo":1},{"id":"@34691490@","fn":"Jessy","ln":"George","dn":"Jessy George","g":"F","dec":false,"bo":2},{"id":"@92028620@","fn":"Jomon","ln":"George","dn":"Jomon George","g":"M","dec":false,"bo":3}]},{"id":"@14417833@","fn":"Rajan","mn":"Chennamkara","ln":"George","dn":"Rajan Chennamkara George","g":"M","dec":false,"bo":9,"sp":{"id":"@26252096@","fn":"Marykutty","ln":"Rajan","dn":"Marykutty Rajan","nk":"Podimol George","g":"F","dec":false,"bo":0},"ch":[{"id":"@39284434@","fn":"Chris","mn":"Rajan","ln":"George","dn":"Chris Rajan George","g":"M","dec":false,"bo":1},{"id":"@18310318@","fn":"Christina","ln":"George","dn":"Christina George","g":"F","dec":false,"bo":2}]},{"id":"@51245580@","fn":"Valsamma","ln":"Mathew","dn":"Valsamma Mathew","g":"F","dec":false,"bo":10,"sp":{"id":"@37097856@","fn":"Mathew","mn":"C","ln":"Abraham","dn":"Mathew C Abraham","nk":"Babu","g":"M","dec":false,"bo":0},"ch":[{"id":"@75411488@","fn":"Jeena","ln":"Mathew","dn":"Jeena Mathew","g":"F","dec":false,"bo":1,"sp":{"id":"@60401840@","fn":"Chris","dn":"Chris","g":"M","dec":false,"bo":0},"ch":[{"id":"@81209224@","fn":"Kenny","ln":"Mathew","dn":"Kenny Mathew","g":"F","dec":false,"bo":1},{"id":"@62422340@","fn":"Maddy","ln":"Mathew","dn":"Maddy Mathew","g":"F","dec":false,"bo":2}]},{"id":"@71172390@","fn":"Jerry","ln":"Mathew","dn":"Jerry Mathew","g":"M","dec":false,"bo":2},{"id":"@9434172@","fn":"Jobin","ln":"Mathew","dn":"Jobin Mathew","g":"M","dec":false,"bo":3,"sp":{"id":"@29077034@","fn":"Grace","dn":"Grace","g":"F","dec":false,"bo":0},"ch":[{"id":"@76701004@","fn":"Mikayla","ln":"Mathew","dn":"Mikayla Mathew","g":"F","dec":false,"bo":1},{"id":"@6012736@","fn":"Oliver","ln":"Mathew","dn":"Oliver Mathew","g":"M","dec":false,"bo":2}]}]}]},{"id":"@3591272@","fn":"M","mn":"K","ln":"Samuel","dn":"M K Samuel","g":"M","dod":"10/26/1994","dec":true,"bo":3,"gen":1,"sp":{"id":"@71052995@","fn":"Mary","mn":"Vellaramala","ln":"Samuel","dn":"Mary Vellaramala Samuel","g":"F","dec":false,"bo":0},"ch":[{"id":"@26875136@","fn":"Benjamin","ln":"Samuel","dn":"Benjamin Samuel","nk":"Kunjumon","g":"M","dec":false,"bo":1,"sp":{"id":"@90304532@","fn":"Reena","ln":"Samuel","dn":"Reena Samuel","g":"F","dec":false,"bo":0},"ch":[{"id":"@42062669@","fn":"Renjan","dn":"Renjan","g":"M","dec":false,"bo":1},{"id":"@24589384@","fn":"Roben","dn":"Roben","g":"M","dec":false,"bo":2}]},{"id":"@16263292@","fn":"George","ln":"Samuel","dn":"George Samuel","g":"M","dec":false,"bo":2,"sp":{"id":"@47578040@","fn":"Aleyamma","dn":"Aleyamma","g":"F","dec":false,"bo":0},"ch":[{"id":"@59903150@","fn":"Binny","ln":"Samuel","dn":"Binny Samuel","g":"M","dec":false,"bo":1,"sp":{"id":"@32271670@","fn":"Priscilla","ln":"Samuel","dn":"Priscilla Samuel","g":"F","dec":false,"bo":0}},{"id":"@82109624@","fn":"Bobby","ln":"Samuel","dn":"Bobby Samuel","g":"M","dec":false,"bo":2,"sp":{"id":"@32878860@","fn":"Neena","ln":"Samuel","dn":"Neena Samuel","g":"F","dec":false,"bo":0},"ch":[{"id":"@1609530@","fn":"Eric","ln":"Samuel","dn":"Eric Samuel","g":"M","dec":false,"bo":1},{"id":"@12084044@","fn":"Lauren","ln":"Samuel","dn":"Lauren Samuel","g":"F","dec":false,"bo":2,"sp":{"id":"@22591587@","fn":"Anson","dn":"Anson","g":"M","dec":false,"bo":0}}]},{"id":"@50055216@","fn":"Stanley","ln":"George","dn":"Stanley George","g":"M","dec":false,"bo":3,"sp":{"id":"@28140159@","fn":"Sandy","ln":"George","dn":"Sandy George","g":"F","dec":false,"bo":0},"ch":[{"id":"@71576888@","fn":"Darren","ln":"George","dn":"Darren George","g":"M","dec":false,"bo":1,"mdate":"3/27/2026","sp":{"id":"@15821984@","fn":"Jovita","ln":"Jose","dn":"Jovita Jose","g":"F","dec":false,"bo":0}},{"id":"@18608216@","fn":"Kevin","ln":"George","dn":"Kevin George","g":"M","dec":false,"bo":2,"sp":{"id":"@24521846@","fn":"Christy","ln":"George","dn":"Christy George","g":"F","dec":false,"bo":0},"ch":[{"id":"@13659073@","fn":"Nathan","ln":"George","dn":"Nathan George","g":"M","dob":"5/18/2023","dec":false,"bo":1},{"id":"@23683013@","fn":"Sophia","ln":"George","dn":"Sophia George","g":"F","dec":false,"bo":2}]},{"id":"@15576923@","ln":"George","dn":"George","g":"M","dec":false,"bo":3}]}]},{"id":"@4299122@","fn":"Gracy","mn":"(Bhopal)","ln":"Samuel","dn":"Gracy (Bhopal) Samuel","g":"F","dec":false,"bo":3,"sp":{"id":"@49624660@","fn":"K","mn":"M","ln":"Mathai","dn":"K M Mathai","g":"M","dec":false,"bo":0},"ch":[{"id":"@25964313@","fn":"Babukutty","dn":"Babukutty","g":"M","dec":false,"bo":1},{"id":"@15600446@","fn":"James","dn":"James","g":"M","dec":false,"bo":2},{"id":"@84883233@","fn":"Johny","dn":"Johny","g":"M","dec":false,"bo":3,"sp":{"id":"@31998480@","fn":"Daisy","dn":"Daisy","g":"F","dec":false,"bo":0},"ch":[{"id":"@93521030@","fn":"Linu","dn":"Linu","g":"F","dec":false,"bo":1,"sp":{"id":"@60086292@","fn":"Titus","dn":"Titus","g":"M","dec":false,"bo":0},"ch":[{"id":"@2622256@","dn":"(Unknown)","g":"F","dec":false,"bo":1},{"id":"@37064314@","dn":"(Unknown)","g":"F","dec":false,"bo":2}]}]},{"id":"@55825192@","fn":"Rachel","dn":"Rachel","g":"F","dec":false,"bo":4},{"id":"@17313332@","fn":"Thampy","dn":"Thampy","g":"M","dec":false,"bo":5,"sp":{"id":"@52886400@","fn":"Valsa","dn":"Valsa","g":"F","dec":false,"bo":0},"ch":[{"id":"@98822949@","dn":"(Unknown)","g":"M","dec":false,"bo":1},{"id":"@22487230@","fn":"Ajay","dn":"Ajay","g":"M","dec":false,"bo":2},{"id":"@41095849@","fn":"Nikhil","dn":"Nikhil","g":"M","dec":false,"bo":3,"sp":{"id":"@52943848@","fn":"Princy","dn":"Princy","g":"F","dec":false,"bo":0},"ch":[{"id":"@33866336@","fn":"Adam","mn":"Abel","ln":"Nikhil","dn":"Adam Abel Nikhil","g":"M","dec":false,"bo":1}]}]}]},{"id":"@94179202@","fn":"Jacob","ln":"Samuel","dn":"Jacob Samuel","nk":"Babu","g":"M","dec":false,"bo":4,"sp":{"id":"@59849428@","fn":"Susi","ln":"Samuel","dn":"Susi Samuel","g":"F","dec":false,"bo":0},"ch":[{"id":"@8869416@","fn":"Roshan","dn":"Roshan","g":"M","dec":false,"bo":1,"sp":{"id":"@38368720@","fn":"Jeslin","dn":"Jeslin","g":"F","dec":false,"bo":0},"ch":[{"id":"@23591488@","fn":"Rebecca","dn":"Rebecca","g":"F","dec":false,"bo":1}]}]},{"id":"@80281288@","fn":"John","ln":"Samuel","dn":"John Samuel","nk":"Kochu Johnychayan","g":"M","dec":false,"bo":5,"sp":{"id":"@22305139@","fn":"Gracy","ln":"Samuel","dn":"Gracy Samuel","nk":"Kochupengal Samuel","g":"F","dec":false,"bo":0},"ch":[{"id":"@20498568@","fn":"Berty","ln":"Chennankara","dn":"Berty Chennankara","g":"M","dec":false,"bo":1,"sp":{"id":"@74892849@","fn":"Lydia","dn":"Lydia","g":"F","dec":false,"bo":0},"ch":[{"id":"@12913295@","fn":"Rachel","ln":"Chennankara","dn":"Rachel Chennankara","g":"F","dec":false,"bo":1},{"id":"@60619316@","fn":"Sara","ln":"Chennankara","dn":"Sara Chennankara","g":"F","dec":false,"bo":2}]},{"id":"@2842806@","fn":"Bevila","ln":"Samuel","dn":"Bevila Samuel","g":"F","dec":false,"bo":2,"sp":{"id":"@41897496@","fn":"Charles","mn":"Menachery","ln":"Daniel","dn":"Charles Menachery Daniel","g":"M","dob":"10/24/1964","dod":"2/5/2024","dec":true,"bo":0},"ch":[{"id":"@85661916@","ln":"Daniel","dn":"Daniel","g":"F","dec":false,"bo":1},{"id":"@43100984@","ln":"Daniel","dn":"Daniel","g":"M","dec":false,"bo":2}]},{"id":"@30988616@","fn":"Bevin","ln":"Samuel","dn":"Bevin Samuel","g":"M","dec":false,"bo":3}]},{"id":"@64566578@","fn":"Joy","ln":"Jacob","dn":"Joy Jacob","g":"F","dod":"10/25/2025","dec":true,"bo":6,"sp":{"id":"@1468078@","fn":"T","mn":"O","ln":"Jacob","dn":"T O Jacob","nk":"Baby","g":"M","dec":false,"bo":6},"ch":[{"id":"@10069994@","fn":"Jerry","ln":"Jacob","dn":"Jerry Jacob","g":"M","dec":false,"bo":1,"sp":{"id":"@47547592@","fn":"Jessy","ln":"Jacob","dn":"Jessy Jacob","g":"F","dec":false,"bo":0},"ch":[{"id":"@79916139@","fn":"Jilian","ln":"Jacob","dn":"Jilian Jacob","g":"F","dec":false,"bo":1},{"id":"@37279330@","fn":"Joan","ln":"Jacob","dn":"Joan Jacob","g":"F","dec":false,"bo":2},{"id":"@63766544@","fn":"Jordan","ln":"Jacob","dn":"Jordan Jacob","g":"M","dec":false,"bo":3}]},{"id":"@59378342@","fn":"Junitha","ln":"Jacob","dn":"Junitha Jacob","g":"F","dec":false,"bo":2,"sp":{"id":"@12821258@","fn":"Jense","ln":"Benjamin","dn":"Jense Benjamin","g":"M","dec":false,"bo":0},"ch":[{"id":"@25616228@","fn":"Jeffrey","ln":"Benjamin","dn":"Jeffrey Benjamin","g":"M","dec":false,"bo":1,"sp":{"id":"@56380326@","fn":"Reena","dn":"Reena","g":"F","dec":false,"bo":0}},{"id":"@69507966@","fn":"Jonnel","ln":"Benjamin","dn":"Jonnel Benjamin","g":"M","dec":false,"bo":2}]}]},{"id":"@21513688@","fn":"Kunjamma","dn":"Kunjamma","g":"F","dec":false,"bo":7,"sp":{"id":"@46355797@","fn":"C","mn":"J","ln":"Thomas","dn":"C J Thomas","g":"M","dec":false,"bo":0},"ch":[{"id":"@96521338@","fn":"Esly","dn":"Esly","g":"F","dec":false,"bo":1},{"id":"@26611728@","fn":"Mony","dn":"Mony","g":"F","dec":false,"bo":2}]},{"id":"@62326901@","fn":"Moly","ln":"Samuel","dn":"Moly Samuel","g":"F","dec":false,"bo":8,"sp":{"id":"@9269816@","fn":"A","mn":"S","ln":"John","dn":"A S John","g":"M","dec":false,"bo":0},"ch":[{"id":"@87595663@","fn":"Ashley","dn":"Ashley","g":"M","dec":false,"bo":1},{"id":"@10894974@","fn":"Bobby","dn":"Bobby","g":"M","dec":false,"bo":2}]},{"id":"@87340960@","fn":"Thomas","ln":"Samuel","dn":"Thomas Samuel","nk":"Pune baby","g":"M","dec":false,"bo":9,"sp":{"id":"@11901434@","fn":"Lisi","ln":"Samuel","dn":"Lisi Samuel","g":"F","dec":false,"bo":0},"ch":[{"id":"@57499778@","fn":"Lincy","ln":"Samuel","dn":"Lincy Samuel","g":"F","dec":false,"bo":1},{"id":"@97499056@","fn":"Linda","ln":"Samuel","dn":"Linda Samuel","g":"F","dec":false,"bo":2}]}]},{"id":"@25768505@","fn":"Sosamma","dn":"Sosamma","g":"M","dec":false,"bo":4,"gen":1,"ch":[{"id":"@76785444@","fn":"Baby","dn":"Baby","g":"M","dec":false,"bo":1,"ch":[{"id":"@275032@","fn":"Bobban","dn":"Bobban","g":"M","dec":false,"bo":1,"sp":{"id":"@50913508@","fn":"Molly","dn":"Molly","g":"F","dec":false,"bo":0}},{"id":"@21410070@","fn":"Jolly","dn":"Jolly","g":"F","dec":false,"bo":2,"sp":{"id":"@17962953@","fn":"Mohan","dn":"Mohan","g":"M","dec":false,"bo":0},"ch":[{"id":"@52971924@","dn":"(Unknown)","g":"F","dec":false,"bo":1}]},{"id":"@41512552@","fn":"Molly","dn":"Molly","g":"F","dec":false,"bo":3,"sp":{"id":"@80590436@","fn":"Jacob","dn":"Jacob","g":"M","dec":false,"bo":0},"ch":[{"id":"@47791776@","dn":"(Unknown)","g":"F","dec":false,"bo":1},{"id":"@36815335@","dn":"(Unknown)","g":"F","dec":false,"bo":2}]}]},{"id":"@18354242@","fn":"Joy","dn":"Joy","g":"M","dec":false,"bo":2,"ch":[{"id":"@37856479@","fn":"Betty","dn":"Betty","g":"F","dec":false,"bo":1},{"id":"@50587344@","fn":"Lovely","dn":"Lovely","g":"F","dec":false,"bo":2},{"id":"@98321877@","fn":"Moni","dn":"Moni","g":"F","dec":false,"bo":3},{"id":"@85791952@","fn":"Sabu","dn":"Sabu","g":"M","dec":false,"bo":4},{"id":"@70591232@","fn":"Stanley","dn":"Stanley","g":"M","dec":false,"bo":5}]},{"id":"@38527585@","fn":"Kunjamma","dn":"Kunjamma","g":"F","dec":false,"bo":3,"ch":[{"id":"@76582132@","fn":"Johnson","dn":"Johnson","g":"M","dec":false,"bo":1},{"id":"@42763649@","fn":"Mercy","dn":"Mercy","g":"F","dec":false,"bo":2}]},{"id":"@33428130@","fn":"Pappachan","dn":"Pappachan","g":"M","dec":false,"bo":4,"sp":{"id":"@34629876@","fn":"Leelamma","dn":"Leelamma","g":"F","dec":false,"bo":0},"ch":[{"id":"@40648056@","fn":"Alwin","ln":"Zachariah","dn":"Alwin Zachariah","g":"M","dec":false,"bo":1,"sp":{"id":"@34532640@","fn":"Betty","ln":"Zachariah","dn":"Betty Zachariah","g":"F","dec":false,"bo":0},"ch":[{"id":"@9258988@","fn":"Aaron","ln":"Zachariah","dn":"Aaron Zachariah","g":"M","dec":false,"bo":1},{"id":"@47729602@","fn":"Kristin","ln":"Zachariah","dn":"Kristin Zachariah","g":"F","dec":false,"bo":2},{"id":"@2608666@","fn":"Nathaniel","ln":"Zachariah","dn":"Nathaniel Zachariah","g":"M","dec":false,"bo":3}]},{"id":"@49733598@","fn":"Merlyn","dn":"Merlyn","g":"F","dec":false,"bo":2,"sp":{"id":"@51601434@","fn":"Steve","dn":"Steve","g":"M","dec":false,"bo":0},"ch":[{"id":"@24293366@","dn":"(Unknown)","g":"F","dec":false,"bo":1},{"id":"@58564384@","dn":"(Unknown)","g":"F","dec":false,"bo":2}]}]},{"id":"@25332413@","fn":"Ponnamma","dn":"Ponnamma","g":"F","dec":false,"bo":5,"ch":[{"id":"@13724902@","fn":"Minu","ln":"Thomas","dn":"Minu Thomas","g":"M","dob":"09/12/1974","dec":false,"bo":1,"mdate":"11/10/2003","sp":{"id":"@62667796@","fn":"Lissy","ln":"Chacko","dn":"Lissy Chacko","g":"F","dob":"05/08/1977","dec":false,"bo":0},"ch":[{"id":"@52508808@","fn":"Melvin","mn":"Minu","ln":"Thomas","dn":"Melvin Minu Thomas","g":"M","dob":"07/10/2005","dec":false,"bo":1},{"id":"@66315156@","fn":"Alvin","mn":"Minu","ln":"Thomas","dn":"Alvin Minu Thomas","g":"M","dob":"04/24/09","dec":false,"bo":2}]},{"id":"@65538020@","fn":"Mini","dn":"Mini","g":"F","dec":false,"bo":2}]}]},{"id":"@65170176@","fn":"Thankamma","mn":"M","ln":"George","dn":"Thankamma M George","g":"F","dec":false,"bo":5,"sp":{"id":"@39468848@","fn":"Modiyil","mn":"C","ln":"George","dn":"Modiyil C George","g":"M","dec":false,"bo":0},"ch":[{"id":"@50522230@","fn":"Chacko","ln":"George","dn":"Chacko George","nk":"KunjumonBabykutty","g":"M","dec":false,"bo":1,"sp":{"id":"@10750254@","ln":"George","dn":"Mrs. George (name unknown)","g":"F","dec":false,"bo":0},"ch":[{"id":"@62963323@","fn":"Gigi","dn":"Gigi","g":"M","dec":false,"bo":1},{"id":"@46212298@","fn":"Jojy","dn":"Jojy","nk":"Jiby","g":"M","dec":false,"bo":2,"sp":{"id":"@68524286@","fn":"Nissy","dn":"Nissy","g":"F","dec":false,"bo":0},"ch":[{"id":"@1575244@","dn":"(Unknown)","g":"M","dec":false,"bo":1}]}]},{"id":"@71676784@","fn":"V","mn":"G","ln":"Philip","dn":"V G Philip","nk":"Babu","g":"M","dec":false,"bo":2,"sp":{"id":"@28012128@","ln":"Philip","dn":"Mrs. Philip (name unknown)","g":"F","dec":false,"bo":0},"ch":[{"id":"@57395355@","fn":"Bevita","dn":"Bevita","g":"F","dec":false,"bo":1},{"id":"@66157078@","fn":"Jovita","dn":"Jovita","g":"F","dec":false,"bo":2},{"id":"@95500714@","fn":"Nevin","dn":"Nevin","g":"M","dec":false,"bo":3}]},{"id":"@83121920@","fn":"V","mn":"G","ln":"Mathew","dn":"V G Mathew","nk":"Raju","g":"M","dec":false,"bo":3,"sp":{"id":"@98555134@","ln":"Mathew","dn":"Mrs. Mathew (name unknown)","g":"F","dec":false,"bo":0},"ch":[{"id":"@26150130@","fn":"Abey","dn":"Abey","g":"M","dec":false,"bo":1},{"id":"@92635130@","fn":"Joby","dn":"Joby","g":"M","dec":false,"bo":2}]}]},{"id":"@79487971@","fn":"Thomas","ln":"Mathew","dn":"Thomas Mathew","g":"M","dec":false,"bo":6,"gen":1,"sp":{"id":"@41208428@","fn":"Saramma","ln":"Mathew","dn":"Saramma Mathew","g":"F","dod":"05/07/1993","dec":true,"bo":0},"ch":[{"id":"@64143188@","fn":"Jessy","ln":"Thomas","dn":"Jessy Thomas","g":"F","dec":false,"bo":1,"sp":{"id":"@54298586@","fn":"Sam","ln":"Joseph","dn":"Sam Joseph","g":"M","dec":false,"bo":0},"ch":[{"id":"@28255680@","fn":"Alexa","dn":"Alexa","g":"F","dec":false,"bo":1,"sp":{"id":"@81722764@","fn":"Jeffrey","dn":"Jeffrey","g":"M","dec":false,"bo":0},"ch":[{"id":"@49896095@","dn":"(Unknown)","g":"M","dec":false,"bo":1}]},{"id":"@3663454@","fn":"Megan","dn":"Megan","g":"F","dec":false,"bo":2},{"id":"@67497453@","fn":"Noah","dn":"Noah","g":"M","dec":false,"bo":3}]},{"id":"@63009768@","fn":"Jolly","ln":"Mathew","dn":"Jolly Mathew","g":"F","dec":false,"bo":2,"sp":{"id":"@75713577@","fn":"Raju","ln":"Mulampalil","dn":"Raju Mulampalil","g":"M","dec":false,"bo":0},"ch":[{"id":"@40330907@","fn":"Jocelin","ln":"Raju","dn":"Jocelin Raju","g":"F","dec":false,"bo":1},{"id":"@45118712@","fn":"Joelin","ln":"Raju","dn":"Joelin Raju","g":"F","dec":false,"bo":2},{"id":"@87635302@","fn":"Jeswin","mn":"Mulampalil","ln":"Raju","dn":"Jeswin Mulampalil Raju","g":"M","dob":"07/23","dec":false,"bo":3,"sp":{"id":"@30094935@","fn":"Simi","ln":"Gervadese","dn":"Simi Gervadese","g":"F","dob":"08/04","dec":false,"bo":0},"ch":[{"id":"@61064375@","dn":"(Unknown)","g":"F","dec":false,"bo":1},{"id":"@11244070@","dn":"(Unknown)","g":"F","dec":false,"bo":2},{"id":"@69285752@","dn":"(Unknown)","g":"M","dec":false,"bo":3},{"id":"@81186204@","dn":"(Unknown)","g":"F","dec":false,"bo":4}]}]},{"id":"@56877308@","fn":"Joyce","dn":"Joyce","g":"F","dec":false,"bo":3,"sp":{"id":"@48246525@","fn":"Babu","dn":"Babu","g":"M","dec":false,"bo":0},"ch":[{"id":"@68659682@","fn":"Besley","dn":"Besley","g":"F","dec":false,"bo":1,"sp":{"id":"@59490585@","fn":"Biju","dn":"Biju","g":"M","dec":false,"bo":0},"ch":[{"id":"@12054317@","fn":"Abel","dn":"Abel","g":"M","dec":false,"bo":1},{"id":"@83871319@","fn":"Angel","dn":"Angel","g":"F","dec":false,"bo":2}]},{"id":"@50743412@","fn":"Jeril","dn":"Jeril","g":"M","dec":false,"bo":2,"sp":{"id":"@21140412@","fn":"Blessy","dn":"Blessy","g":"F","dec":false,"bo":0},"ch":[{"id":"@51832018@","fn":"Joshahi","dn":"Joshahi","g":"M","dec":false,"bo":1},{"id":"@11786432@","fn":"Yeshaiah","dn":"Yeshaiah","g":"M","dec":false,"bo":2}]},{"id":"@36934342@","fn":"Jestin","dn":"Jestin","g":"M","dec":false,"bo":3,"sp":{"id":"@35784020@","fn":"Geen","dn":"Geen","nk":"Geemol","g":"F","dec":false,"bo":0},"ch":[{"id":"@99613600@","fn":"Dan","dn":"Dan","g":"M","dec":false,"bo":1},{"id":"@62133659@","fn":"Eliza","dn":"Eliza","g":"F","dec":false,"bo":2}]}]},{"id":"@68592480@","fn":"Licy","ln":"Mathew","dn":"Licy Mathew","g":"F","dod":"10/20/2024","dec":true,"bo":4,"sp":{"id":"@25680296@","fn":"Thamaravelil","mn":"O","ln":"Joseph","dn":"Thamaravelil O Joseph","nk":"Jose","g":"M","dec":false,"bo":0},"ch":[{"id":"@24946529@","fn":"Tency","ln":"Joseph","dn":"Tency Joseph","g":"F","dec":false,"bo":1,"sp":{"id":"@7212736@","fn":"Shaju","ln":"Jacob","dn":"Shaju Jacob","g":"M","dec":false,"bo":0}},{"id":"@5851840@","fn":"Terrance","ln":"Joseph","dn":"Terrance Joseph","nk":"Terry","g":"F","dec":false,"bo":2,"sp":{"id":"@68586240@","fn":"Tomcy","dn":"Tomcy","g":"M","dec":false,"bo":0}},{"id":"@39163600@","fn":"Tessy","ln":"Joseph","dn":"Tessy Joseph","g":"F","dec":false,"bo":3,"sp":{"id":"@59832160@","fn":"Willie","ln":"Abraham","dn":"Willie Abraham","g":"M","dec":false,"bo":0},"ch":[{"id":"@65873160@","fn":"Angelina","ln":"Abraham","dn":"Angelina Abraham","g":"F","dec":false,"bo":1},{"id":"@70041966@","fn":"Natasha","ln":"Abraham","dn":"Natasha Abraham","g":"M","dec":false,"bo":2},{"id":"@34806406@","fn":"Nivedita","ln":"Abraham","dn":"Nivedita Abraham","g":"F","dec":false,"bo":3}]},{"id":"@15576291@","fn":"Tetsy","ln":"Joseph","dn":"Tetsy Joseph","g":"F","dec":false,"bo":4,"sp":{"id":"@27063170@","fn":"Binu","ln":"Chacko","dn":"Binu Chacko","g":"M","dec":false,"bo":0},"ch":[{"id":"@84883412@","fn":"Nejin","ln":"Chacko","dn":"Nejin Chacko","g":"M","dec":false,"bo":1},{"id":"@52201480@","fn":"Nevin","ln":"Chacko","dn":"Nevin Chacko","g":"M","dec":false,"bo":2}]}]},{"id":"@80529196@","fn":"Rajan","ln":"Thomas","dn":"Rajan Thomas","nk":"Raju","g":"M","dec":false,"bo":5,"sp":{"id":"@83789826@","fn":"Lalu","dn":"Lalu","g":"F","dec":false,"bo":0},"ch":[{"id":"@61330190@","fn":"Reny","mn":"Rajan","ln":"Thomas","dn":"Reny Rajan Thomas","g":"M","dob":"01/26/1981","dod":"02/27/2018","dec":true,"bo":1,"mdate":"2009","sp":{"id":"@95290152@","fn":"Kesy","dn":"Kesy","g":"F","dec":false,"bo":0},"ch":[{"id":"@6231896@","fn":"Samara","dn":"Samara","g":"F","dec":false,"bo":1},{"id":"@85432251@","fn":"Sasha","dn":"Sasha","g":"F","dec":false,"bo":2},{"id":"@21422857@","fn":"Sean","dn":"Sean","g":"M","dec":false,"bo":3}]},{"id":"@73683982@","fn":"Regina","ln":"Thomas","dn":"Regina Thomas","g":"F","dec":false,"bo":2,"sp":{"id":"@1944512@","fn":"Dennis","mn":"Leslie","ln":"Mathew","dn":"Dennis Leslie Mathew","g":"M","dec":false,"bo":0},"ch":[{"id":"@40621330@","fn":"Jaden","dn":"Jaden","g":"M","dec":false,"bo":1},{"id":"@1153616@","fn":"Ruth","dn":"Ruth","g":"F","dec":false,"bo":2}]},{"id":"@63076136@","fn":"Renila","ln":"Thomas","dn":"Renila Thomas","g":"F","dec":false,"bo":3,"sp":{"id":"@75285702@","fn":"Bejoy","dn":"Bejoy","g":"M","dec":false,"bo":0},"ch":[{"id":"@64424148@","fn":"Joshua","dn":"Joshua","g":"M","dec":false,"bo":1},{"id":"@42689792@","fn":"Nathan","dn":"Nathan","g":"M","dec":false,"bo":2}]}]},{"id":"@66242950@","fn":"Shabu","ln":"Thomas","dn":"Shabu Thomas","g":"M","dec":false,"bo":6,"sp":{"id":"@39201106@","fn":"Nimmi","dn":"Nimmi","g":"F","dec":false,"bo":0},"ch":[{"id":"@89512349@","fn":"Sachin","ln":"Thomas","dn":"Sachin Thomas","g":"M","dec":false,"bo":1,"sp":{"id":"@59264844@","fn":"Jenny","dn":"Jenny","g":"F","dec":false,"bo":0}},{"id":"@16421426@","fn":"Shobha","ln":"Thomas","dn":"Shobha Thomas","g":"F","dec":false,"bo":2,"sp":{"id":"@43890419@","fn":"Siby","dn":"Siby","g":"M","dec":false,"bo":0},"ch":[{"id":"@87569056@","dn":"(Unknown)","g":"M","dec":false,"bo":1},{"id":"@86300626@","dn":"(Unknown)","g":"M","dec":false,"bo":2}]}]},{"id":"@99420646@","fn":"Soman","ln":"Chennankara","dn":"Soman Chennankara","g":"M","dec":false,"bo":7,"sp":{"id":"@76985921@","fn":"Sally","ln":"Soman","dn":"Sally Soman","g":"F","dec":false,"bo":0},"ch":[{"id":"@60173344@","fn":"Benjamin","ln":"Chennankara","dn":"Benjamin Chennankara","nk":"Benji","g":"M","dec":false,"bo":1,"sp":{"id":"@1657832@","fn":"Casey","dn":"Casey","g":"F","dec":false,"bo":0},"ch":[{"id":"@98999280@","fn":"Ezra","dn":"Ezra","g":"M","dec":false,"bo":1},{"id":"@50347605@","fn":"Nora","dn":"Nora","g":"F","dec":false,"bo":2}]},{"id":"@57550220@","fn":"Daine","ln":"Chennankara","dn":"Daine Chennankara","g":"M","dec":false,"bo":2,"sp":{"id":"@84125444@","fn":"Jensine","dn":"Jensine","g":"F","dec":false,"bo":0}},{"id":"@74007748@","fn":"Steve","ln":"Chennankara","dn":"Steve Chennankara","nk":"Anish","g":"M","dec":false,"bo":3,"sp":{"id":"@63097370@","fn":"Ashly","dn":"Ashly","g":"F","dec":false,"bo":0},"ch":[{"id":"@64523868@","fn":"Chelsey","dn":"Chelsey","g":"F","dec":false,"bo":1},{"id":"@4022631@","fn":"Henry","dn":"Henry","g":"M","dec":false,"bo":2}]}]},{"id":"@83541376@","fn":"Thomas","mn":"Sajan","ln":"Chennankara","dn":"Thomas Sajan Chennankara","nk":"Sajan","g":"M","dec":false,"bo":8,"sp":{"id":"@91628224@","fn":"Susan","ln":"Mathew","dn":"Susan Mathew","g":"F","dec":false,"bo":0},"ch":[{"id":"@75957312@","ln":"Chennankara","dn":"Chennankara","g":"M","dec":false,"bo":1},{"id":"@69300052@","fn":"Mahima","ln":"Sajan","dn":"Mahima Sajan","g":"F","dec":false,"bo":2,"sp":{"id":"@79478056@","fn":"Simon","dn":"Simon","g":"M","dec":false,"bo":0}},{"id":"@67921744@","fn":"Sneha","mn":"Sara","ln":"Sajan","dn":"Sneha Sara Sajan","g":"F","dec":false,"bo":3,"sp":{"id":"@78555904@","fn":"Steven","mn":"Philip","ln":"Abraham","dn":"Steven Philip Abraham","g":"M","dec":false,"bo":0},"ch":[{"id":"@55613294@","fn":"Jedediah","dn":"Jedediah","g":"M","dec":false,"bo":1}]}]}]}]},{"id":"@15555835@","fn":"Kunj","ln":"Avarachan","dn":"Kunj Avarachan","g":"M","dec":false,"bo":2,"ch":[{"id":"@90175744@","fn":"Jainama","dn":"Jainama","g":"F","dec":false,"bo":1}]},{"id":"@84046548@","fn":"Sister","mn":"1","dn":"Sister 1","g":"F","dec":false,"bo":3},{"id":"@43443968@","fn":"Sister","mn":"2","dn":"Sister 2","g":"F","dec":false,"bo":4,"sp":{"id":"@79283760@","fn":"Philipochan","ln":"Parel","dn":"Philipochan Parel","g":"M","dec":false,"bo":0},"ch":[{"id":"@43371334@","fn":"Philip","ln":"Parel","dn":"Philip Parel","g":"M","dec":false,"bo":1}]},{"id":"@73129696@","fn":"Sister","mn":"3","dn":"Sister 3","g":"F","dec":false,"bo":5}]};
+
+/* ───── HELPERS ───── */
+const MC='#6b9e72', FC='#9b82c4', GC='#c4a35a', GD='#8a7340', BG='#0a0a08', CD='#141410', TX='#d4cfc0', DM='#7a7568', BR='rgba(196,163,90,0.12)';
+const flattenAll=(n,p='')=>{const arr=[];const nm=n.dn||'?';const fp=p?p+' › '+nm:nm;arr.push({...n,_p:fp,_n:nm});(n.ch||[]).forEach(c=>arr.push(...flattenAll(c,fp)));return arr};
+const cnt=n=>{if(!n)return 0;let c=1+(n.sp?1:0);(n.ch||[]).forEach(x=>{c+=cnt(x)});return c};
+const findPath=(r,id,p=[])=>{if(r.id===id)return[...p,r];for(const c of r.ch||[]){const res=findPath(c,id,[...p,r]);if(res)return res}return null};
+
+/* ───── FIELD DEFS ───── */
+const SECTIONS=[
+  {title:'Basic Identity',fields:[
+    {k:'fn',l:'First Name'},{k:'mn',l:'Middle Name'},{k:'ln',l:'Last Name'},
+    {k:'dn',l:'Display Name'},{k:'nk',l:'Nickname'},{k:'md',l:'Maiden Name'},
+    {k:'g',l:'Gender',type:'select',opts:['M','F']},
+    {k:'dob',l:'Date of Birth'},{k:'dod',l:'Date of Death'},
+    {k:'dec',l:'Deceased',type:'checkbox'},{k:'bo',l:'Birth Order',type:'number'},
+  ]},
+  {title:'Contact Information',fields:[
+    {k:'em',l:'Email'},{k:'ph',l:'Phone'},
+    {k:'a1',l:'Address 1'},{k:'a2',l:'Address 2'},
+    {k:'ci',l:'City'},{k:'st',l:'State'},{k:'zp',l:'Zip'},{k:'co',l:'Country'},
+  ]},
+  {title:'Social Links',fields:[
+    {k:'fb',l:'Facebook'},{k:'ig',l:'Instagram'},{k:'li',l:'LinkedIn'},{k:'ws',l:'Website'},
+  ]},
+  {title:'Personal Details',fields:[
+    {k:'pp',l:'Profile Photo URL'},{k:'bio',l:'Bio',type:'textarea'},
+    {k:'loc',l:'Location'},{k:'prof',l:'Profession'},{k:'emp',l:'Employer'},
+  ]},
+  {title:'Family Content',fields:[
+    {k:'stories',l:'Stories / Memories',type:'textarea'},
+    {k:'notes',l:'Notes',type:'textarea'},
+    {k:'pgl',l:'Photo Gallery Link'},{k:'dl',l:'Documents Link'},
+  ]},
+  {title:'Marriage',fields:[
+    {k:'mdate',l:'Marriage Date'},{k:'mplace',l:'Marriage Place'},
+  ]},
+];
+
+const empty=()=>({id:'@new_'+Date.now()+'@',fn:'',mn:'',ln:'',dn:'',nk:'',md:'',g:'M',dob:'',dod:'',dec:false,bo:0,
+  em:'',ph:'',a1:'',a2:'',ci:'',st:'',zp:'',co:'',fb:'',ig:'',li:'',ws:'',pp:'',bio:'',loc:'',prof:'',emp:'',
+  stories:'',notes:'',pgl:'',dl:'',mdate:'',mplace:''});
+
+/* ───── FORM ───── */
+function EditForm({node,onSave,onCancel,isNew,parentId,parentName}){
+  const [f,setF]=useState(()=>({...empty(),...node}));
+  const set=(k,v)=>setF(p=>({...p,[k]:v}));
+  const inp={width:'100%',background:'#1a1a14',border:`1px solid ${BR}`,color:TX,padding:'6px 10px',
+    borderRadius:5,fontSize:13,outline:'none',fontFamily:'inherit'};
+  return(
+    <div style={{position:'fixed',inset:0,zIndex:200,display:'flex',alignItems:'center',justifyContent:'center'}}>
+      <div onClick={onCancel} style={{position:'absolute',inset:0,background:'rgba(0,0,0,0.6)'}}/>
+      <div style={{position:'relative',background:CD,border:`1px solid ${BR}`,borderRadius:12,width:Math.min(520,window.innerWidth-32),
+        maxHeight:'90vh',overflowY:'auto',padding:24,zIndex:201}}>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
+          <span style={{fontSize:20,color:GC,fontWeight:300}}>{isNew?'Add New Member':'Edit Member'}</span>
+          <button onClick={onCancel} style={{background:'none',border:'none',color:DM,fontSize:18,cursor:'pointer'}}>✕</button>
+        </div>
+        {isNew&&parentId&&<div style={{fontSize:12,color:DM,marginBottom:12}}>Adding as child of: {parentName||parentId}</div>}
+        {SECTIONS.map(sec=>(
+          <div key={sec.title} style={{marginBottom:16}}>
+            <div style={{fontSize:11,color:GD,textTransform:'uppercase',letterSpacing:2,marginBottom:8,borderBottom:`1px solid ${BR}`,paddingBottom:4}}>{sec.title}</div>
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8}}>
+              {sec.fields.map(fd=>(
+                <div key={fd.k} style={{gridColumn:fd.type==='textarea'?'1/-1':undefined}}>
+                  <label style={{fontSize:11,color:DM,display:'block',marginBottom:2}}>{fd.l}</label>
+                  {fd.type==='select'?(
+                    <select value={f[fd.k]||''} onChange={e=>set(fd.k,e.target.value)} style={inp}>
+                      {fd.opts.map(o=><option key={o} value={o}>{o==='M'?'Male':'Female'}</option>)}
+                    </select>
+                  ):fd.type==='checkbox'?(
+                    <input type="checkbox" checked={!!f[fd.k]} onChange={e=>set(fd.k,e.target.checked)}/>
+                  ):fd.type==='textarea'?(
+                    <textarea value={f[fd.k]||''} onChange={e=>set(fd.k,e.target.value)} rows={3} style={{...inp,resize:'vertical'}}/>
+                  ):fd.type==='number'?(
+                    <input type="number" value={f[fd.k]||0} onChange={e=>set(fd.k,parseInt(e.target.value)||0)} style={inp}/>
+                  ):(
+                    <input value={f[fd.k]||''} onChange={e=>set(fd.k,e.target.value)} style={inp}/>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+        <div style={{display:'flex',gap:8,justifyContent:'flex-end',marginTop:16}}>
+          <button onClick={onCancel} style={{background:'transparent',border:`1px solid ${BR}`,color:DM,padding:'8px 20px',borderRadius:6,cursor:'pointer',fontSize:13}}>Cancel</button>
+          <button onClick={()=>{const dn=f.dn||(f.fn+(f.mn?' '+f.mn:'')+(f.ln?' '+f.ln:'')).trim()||'(Unknown)';onSave({...f,dn})}}
+            style={{background:'rgba(196,163,90,0.15)',border:`1px solid ${GD}`,color:GC,padding:'8px 20px',borderRadius:6,cursor:'pointer',fontSize:13}}>
+            {isNew?'Add Member':'Save Changes'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ───── TREE NODE ───── */
+function TreeNode({node,exp,onTog,onSel,onEdit,onAdd,onDel,onEditSpouse,onDelSpouse,hl}){
+  const has=node.ch&&node.ch.length>0;
+  const open=exp.has(node.id);
+  const isHL=hl===node.id;
+  return(
+    <div>
+      <div style={{display:'flex',alignItems:'center',gap:6,padding:'6px 8px',borderRadius:6,
+        background:isHL?'rgba(196,163,90,0.15)':'transparent',transition:'background 0.15s'}}
+        onMouseEnter={e=>{if(!isHL)e.currentTarget.style.background='rgba(255,255,255,0.03)'}}
+        onMouseLeave={e=>{if(!isHL)e.currentTarget.style.background='transparent'}}>
+        <span onClick={()=>has&&onTog(node.id)} style={{width:16,height:16,display:'flex',alignItems:'center',justifyContent:'center',
+          fontSize:10,color:DM,transform:open?'rotate(90deg)':'none',transition:'transform 0.2s',
+          opacity:has?1:0.2,cursor:has?'pointer':'default',background:has?'rgba(196,163,90,0.06)':'none',borderRadius:3,flexShrink:0}}>
+          {has?'▶':'·'}
+        </span>
+        <span style={{width:7,height:7,borderRadius:'50%',background:node.g==='M'?MC:FC,flexShrink:0}}/>
+        <span onClick={()=>onSel(node)} style={{fontSize:14,color:node.dec?'#6b6560':'#f0ebe0',cursor:'pointer',
+          whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{node.dn}</span>
+        {node.nk&&node.nk!==node.dn&&<span style={{fontSize:11,color:DM,fontStyle:'italic'}}>"{node.nk}"</span>}
+        {node.sp?.dn&&<span style={{fontSize:12,color:DM,display:'inline-flex',alignItems:'center',gap:4}}>
+          <span style={{color:GD,fontSize:11}}>⚭</span> <span style={{opacity:0.7}}>{node.sp.dn}</span>
+          <span style={{display:'inline-flex',gap:1,opacity:0.65}}
+            onMouseEnter={e=>e.currentTarget.style.opacity='1'} onMouseLeave={e=>e.currentTarget.style.opacity='0.65'}>
+            <button onClick={e=>{e.stopPropagation();onEditSpouse(node)}} title="Edit spouse" style={{background:'none',border:'none',color:GD,cursor:'pointer',fontSize:11,padding:'1px 3px'}}>✎</button>
+            <button onClick={e=>{e.stopPropagation();onDelSpouse(node.id)}} title="Delete spouse" style={{background:'none',border:'none',color:'#a05050',cursor:'pointer',fontSize:11,padding:'1px 3px'}}>✕</button>
+          </span>
+        </span>}
+        {node.dob&&<span style={{fontSize:11,color:DM,marginLeft:'auto',opacity:0.6}}>b.{node.dob}</span>}
+        {has&&<span style={{fontSize:10,color:GD,background:'rgba(196,163,90,0.08)',padding:'1px 6px',borderRadius:8,flexShrink:0}}>{node.ch.length}</span>}
+        <span style={{display:'flex',gap:2,marginLeft:has?0:'auto',opacity:0.4,transition:'opacity 0.2s'}}
+          onMouseEnter={e=>e.currentTarget.style.opacity='1'} onMouseLeave={e=>e.currentTarget.style.opacity='0.4'}>
+          <button onClick={e=>{e.stopPropagation();onEdit(node)}} title="Edit" style={{background:'none',border:'none',color:GD,cursor:'pointer',fontSize:12,padding:'2px 4px'}}>✎</button>
+          <button onClick={e=>{e.stopPropagation();onAdd(node.id)}} title="Add child" style={{background:'none',border:'none',color:MC,cursor:'pointer',fontSize:12,padding:'2px 4px'}}>+</button>
+          {!has&&<button onClick={e=>{e.stopPropagation();onDel(node.id)}} title="Delete" style={{background:'none',border:'none',color:'#a05050',cursor:'pointer',fontSize:12,padding:'2px 4px'}}>✕</button>}
+        </span>
+      </div>
+      {has&&open&&<div style={{paddingLeft:20,marginLeft:18,borderLeft:`1px solid ${BR}`}}>
+        {node.ch.map(c=><TreeNode key={c.id} node={c} exp={exp} onTog={onTog} onSel={onSel} onEdit={onEdit} onAdd={onAdd} onDel={onDel} onEditSpouse={onEditSpouse} onDelSpouse={onDelSpouse} hl={hl}/>)}
+      </div>}
+    </div>
+  );
+}
+
+/* ───── DETAIL ───── */
+function Detail({node,onClose,onEdit,onEditSpouse,onDelSpouse,root}){
+  if(!node)return null;
+  const R=({l,v})=>v?<div style={{display:'flex',justifyContent:'space-between',padding:'3px 0',fontSize:13}}><span style={{color:DM}}>{l}</span><span style={{color:TX}}>{v}</span></div>:null;
+  const lineage=(findPath(root,node.id)||[]).map(n=>n.dn);
+  return(<>
+    <div onClick={onClose} style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.5)',zIndex:90}}/>
+    <div style={{position:'fixed',right:0,top:0,width:Math.min(380,window.innerWidth),height:'100vh',background:CD,borderLeft:`1px solid ${BR}`,zIndex:100,overflowY:'auto',padding:24}}>
+      <div style={{display:'flex',justifyContent:'space-between'}}>
+        <div/>
+        <div style={{display:'flex',gap:8}}>
+          <button onClick={()=>onEdit(node)} style={{background:'none',border:`1px solid ${BR}`,color:GD,padding:'4px 12px',borderRadius:5,cursor:'pointer',fontSize:12}}>Edit</button>
+          <button onClick={onClose} style={{background:'none',border:'none',color:DM,fontSize:18,cursor:'pointer'}}>✕</button>
+        </div>
+      </div>
+      <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:4,marginTop:8}}>
+        <span style={{width:10,height:10,borderRadius:'50%',background:node.g==='M'?MC:FC}}/>
+        <span style={{fontSize:11,color:DM,textTransform:'uppercase',letterSpacing:2}}>{node.g==='M'?'Male':'Female'}{node.dec?' · Deceased':''}</span>
+      </div>
+      <div style={{fontSize:26,color:GC,fontWeight:300,marginBottom:4}}>{node.dn}</div>
+      {node.nk&&<div style={{fontSize:13,color:DM,fontStyle:'italic',marginBottom:12}}>"{node.nk}"</div>}
+      <R l="Born" v={node.dob}/><R l="Birthplace" v={node.loc}/><R l="Died" v={node.dod}/><R l="Married" v={node.mdate}/>
+      <R l="Profession" v={node.prof}/><R l="Employer" v={node.emp}/><R l="Email" v={node.em}/><R l="Phone" v={node.ph}/>
+      {node.bio&&<div style={{marginTop:12}}><div style={{fontSize:11,color:GD,textTransform:'uppercase',letterSpacing:2,marginBottom:4}}>Bio</div><div style={{fontSize:13,color:TX,lineHeight:1.6}}>{node.bio}</div></div>}
+      {node.sp?.dn&&<div style={{marginTop:16}}>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:6}}>
+          <div style={{fontSize:11,color:GD,textTransform:'uppercase',letterSpacing:2}}>Spouse</div>
+          <div style={{display:'flex',gap:8}}>
+            <button onClick={()=>onEditSpouse(node)} style={{background:'none',border:`1px solid ${BR}`,color:GD,padding:'3px 10px',borderRadius:5,cursor:'pointer',fontSize:12}}>Edit Spouse</button>
+            <button onClick={()=>onDelSpouse(node.id)} style={{background:'none',border:`1px solid rgba(160,80,80,0.35)`,color:'#c07a7a',padding:'3px 10px',borderRadius:5,cursor:'pointer',fontSize:12}}>Delete Spouse</button>
+          </div>
+        </div>
+        <R l="Name" v={node.sp.dn}/><R l="Born" v={node.sp.dob}/><R l="Died" v={node.sp.dod}/>
+      </div>}
+      {node.ch?.length>0&&<div style={{marginTop:16}}><div style={{fontSize:11,color:GD,textTransform:'uppercase',letterSpacing:2,marginBottom:6}}>Children ({node.ch.length})</div>
+        {node.ch.map(c=><div key={c.id} style={{display:'flex',alignItems:'center',gap:6,padding:'3px 0',fontSize:13}}>
+          <span style={{width:5,height:5,borderRadius:'50%',background:c.g==='M'?MC:FC}}/><span style={{color:TX}}>{c.dn}</span>
+          {c.dob&&<span style={{color:DM,marginLeft:'auto',fontSize:11}}>{c.dob}</span>}
+        </div>)}
+      </div>}
+      {lineage.length>1&&<div style={{marginTop:16}}><div style={{fontSize:11,color:GD,textTransform:'uppercase',letterSpacing:2,marginBottom:6}}>Lineage</div>
+        <div style={{fontSize:12,color:DM,lineHeight:1.8}}>
+          {lineage.map((p,i)=><span key={i}><span style={{color:i===lineage.length-1?GC:TX}}>{p}</span>{i<lineage.length-1&&<span style={{color:GD}}> › </span>}</span>)}
+        </div>
+      </div>}
+    </div>
+  </>);
+}
+
+/* ───── APP ───── */
+function App(){
+  const [tree,setTree]=useState(INIT);
+  const [exp,setExp]=useState(()=>{const s=new Set();const add=(n,d)=>{if(d<2&&n.ch?.length){s.add(n.id);n.ch.forEach(c=>add(c,d+1))}};add(INIT,0);return s});
+  const [sel,setSel]=useState(null);
+  const [search,setSearch]=useState('');
+  const [hl,setHl]=useState(null);
+  const [editing,setEditing]=useState(null);
+  const [adding,setAdding]=useState(null);
+  const [spouseEditing,setSpouseEditing]=useState(null);
+  const [msg,setMsg]=useState('');
+  const flat=useMemo(()=>flattenAll(tree),[tree]);
+
+  const findNodeById=useCallback((root,id)=>{
+    if(!root)return null;
+    if(root.id===id)return root;
+    for(const c of root.ch||[]){
+      const found=findNodeById(c,id);
+      if(found)return found;
+    }
+    return null;
+  },[]);
+
+  const getAncestorIds=useCallback((root,id)=>{
+    const path=findPath(root,id)||[];
+    return path.slice(0,-1).map(n=>n.id);
+  },[]);
+
+  const updateNode=useCallback((root,id,updater)=>{
+    if(root.id===id)return updater(root);
+    if(!root.ch)return root;
+    return {...root,ch:root.ch.map(c=>updateNode(c,id,updater))};
+  },[]);
+
+  const removeNode=useCallback((root,targetId)=>{
+    if(!root.ch)return root;
+    return {...root,ch:root.ch.filter(c=>c.id!==targetId).map(c=>removeNode(c,targetId))};
+  },[]);
+
+  const toggle=useCallback(id=>{
+    setExp(p=>{const n=new Set(p);n.has(id)?n.delete(id):n.add(id);return n});
+  },[]);
+
+  const expandAll=()=>{const s=new Set();flat.forEach(n=>{if(n.ch?.length)s.add(n.id)});setExp(s)};
+  const collapseAll=()=>setExp(new Set());
+  const expandTo=d=>{const s=new Set();const add=(n,depth)=>{if(depth<d&&n.ch?.length){s.add(n.id);n.ch.forEach(c=>add(c,depth+1))}};add(tree,0);setExp(s)};
+
+  const matches=useMemo(()=>{
+    if(search.length<2)return[];
+    const q=search.toLowerCase();
+    return flat.filter(n=>(n.dn||'').toLowerCase().includes(q)||(n.nk||'').toLowerCase().includes(q)||(n.sp?.dn||'').toLowerCase().includes(q)).slice(0,12);
+  },[search,flat]);
+
+  const revealNode=useCallback((nodeId,opts={})=>{
+    const ancestorIds=getAncestorIds(tree,nodeId);
+    setExp(p=>{
+      const s=new Set(p);
+      ancestorIds.forEach(id=>s.add(id));
+      return s;
+    });
+    setHl(nodeId);
+    if(opts.select){
+      const latest=findNodeById(tree,nodeId);
+      if(latest)setSel(latest);
+    }
+    setTimeout(()=>setHl(null),2000);
+  },[tree,getAncestorIds,findNodeById]);
+
+  const navigateTo=useCallback(node=>{
+    revealNode(node.id,{select:true});
+    setSearch('');
+  },[revealNode]);
+
+  const handleSaveEdit=(data)=>{
+    let updatedNodeId=data.id;
+    setTree(prev=>{
+      const next=updateNode(prev,data.id,(existing)=>({...existing,...data,ch:existing.ch||[],sp:existing.sp}));
+      return next;
+    });
+    setEditing(null);
+    setTimeout(()=>{
+      const latest=findNodeById({...tree},updatedNodeId) || flat.find(n=>n.id===updatedNodeId);
+      revealNode(updatedNodeId,{select:false});
+    },0);
+    setMsg('Saved!');
+    setTimeout(()=>setMsg(''),2000);
+  };
+
+  const handleAdd=(data)=>{
+    const parentId=adding;
+    const newNode={...data,ch:[]};
+    setTree(prev=>updateNode(prev,parentId,p=>({...p,ch:[...(p.ch||[]),newNode]})));
+    setAdding(null);
+    setSel(newNode);
+    setTimeout(()=>revealNode(newNode.id,{select:false}),0);
+    setMsg('Member added!');
+    setTimeout(()=>setMsg(''),2000);
+  };
+
+  const handleDelete=(id)=>{
+    const node=findNodeById(tree,id);
+    if(node?.ch?.length){
+      setMsg('Cannot delete: has descendants');
+      setTimeout(()=>setMsg(''),3000);
+      return;
+    }
+    if(!confirm(`Delete ${node?.dn||'this person'}?`))return;
+    const parentIds=getAncestorIds(tree,id);
+    const parentId=parentIds[parentIds.length-1]||null;
+    setTree(prev=>removeNode(prev,id));
+    if(sel?.id===id)setSel(parentId?findNodeById(tree,parentId):null);
+    if(editing?.id===id)setEditing(null);
+    if(adding===id)setAdding(null);
+    setExp(p=>{const s=new Set(p); s.delete(id); return s;});
+    setTimeout(()=>{
+      if(parentId) revealNode(parentId,{select:true});
+    },0);
+    setMsg('Deleted');
+    setTimeout(()=>setMsg(''),2000);
+  };
+
+  const handleSaveSpouse=(data)=>{
+    if(!spouseEditing?.parentId)return;
+    const parentId=spouseEditing.parentId;
+    setTree(prev=>updateNode(prev,parentId,(existing)=>({...existing,sp:{...(existing.sp||{}),...data,id:(existing.sp&&existing.sp.id)||data.id||('@sp_'+Date.now()+'@')}})));
+    setSpouseEditing(null);
+    setMsg('Spouse saved!');
+    setTimeout(()=>setMsg(''),2000);
+  };
+
+  const handleDeleteSpouse=(parentId)=>{
+    const parent=findNodeById(tree,parentId);
+    if(!parent?.sp){
+      setMsg('No spouse to delete');
+      setTimeout(()=>setMsg(''),2000);
+      return;
+    }
+    if(!confirm(`Delete spouse ${parent.sp.dn||'record'}?`))return;
+    setTree(prev=>updateNode(prev,parentId,(existing)=>({...existing,sp:null})));
+    if(spouseEditing?.parentId===parentId)setSpouseEditing(null);
+    setMsg('Spouse deleted');
+    setTimeout(()=>setMsg(''),2000);
+  };
+
+  const total=cnt(tree);
+  const btnS={background:CD,border:`1px solid ${BR}`,color:DM,padding:'6px 12px',borderRadius:5,fontSize:12,cursor:'pointer',whiteSpace:'nowrap'};
+
+  return(
+    <div style={{background:BG,minHeight:'100vh',color:TX,fontFamily:'system-ui,-apple-system,sans-serif'}}>
+      <div style={{position:'sticky',top:0,zIndex:50,background:`linear-gradient(180deg,${BG} 80%,transparent)`,padding:'16px 16px 24px'}}>
+        <div style={{maxWidth:1200,margin:'0 auto'}}>
+          <div style={{display:'flex',alignItems:'baseline',gap:12,marginBottom:4}}>
+            <span style={{fontSize:28,color:GC,fontWeight:300,letterSpacing:1}}>Chennamkara</span>
+            <span style={{fontSize:11,color:DM,letterSpacing:3,textTransform:'uppercase'}}>Family Tree</span>
+            {msg&&<span style={{fontSize:12,color:'#6b9e72',marginLeft:16,animation:'fadeIn 0.3s'}}>{msg}</span>}
+          </div>
+          <div style={{display:'flex',gap:20,fontSize:12,color:DM,marginBottom:12}}>
+            <span><strong style={{color:GD}}>{total}</strong> people</span>
+          </div>
+          <div style={{display:'flex',gap:8,flexWrap:'wrap',alignItems:'center'}}>
+            <div style={{position:'relative',flex:1,minWidth:180,maxWidth:360}}>
+              <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search by name..."
+                style={{width:'100%',background:CD,border:`1px solid ${BR}`,color:TX,padding:'7px 12px',borderRadius:6,fontSize:13,outline:'none'}}/>
+              {matches.length>0&&<div style={{position:'absolute',top:'100%',left:0,right:0,background:CD,border:`1px solid rgba(196,163,90,0.25)`,
+                borderTop:'none',borderRadius:'0 0 6px 6px',maxHeight:280,overflowY:'auto',zIndex:60}}>
+                {matches.map(m=><div key={m.id} onClick={()=>navigateTo(m)}
+                  style={{padding:'6px 12px',cursor:'pointer',fontSize:13,display:'flex',alignItems:'center',gap:6}}
+                  onMouseEnter={e=>e.currentTarget.style.background='rgba(255,255,255,0.04)'}
+                  onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
+                  <span style={{width:6,height:6,borderRadius:'50%',background:m.g==='M'?MC:FC}}/><span>{m._n}</span>
+                </div>)}
+              </div>}
+            </div>
+            {[['Expand All',expandAll],['Collapse',collapseAll],['2 Lvls',()=>expandTo(2)],['3 Lvls',()=>expandTo(3)]].map(([l,f])=>
+              <button key={l} onClick={f} style={btnS}>{l}</button>)}
+          </div>
+        </div>
+      </div>
+      <div style={{maxWidth:1200,margin:'0 auto',padding:'0 16px 60px'}}>
+        <TreeNode node={tree} exp={exp} onTog={toggle} onSel={(node)=>setSel(findNodeById(tree,node.id)||node)} onEdit={(node)=>setEditing(findNodeById(tree,node.id)||node)} onAdd={setAdding} onDel={handleDelete} onEditSpouse={(node)=>setSpouseEditing({parentId:node.id,spouse:{...(node.sp||{}),dn:(node.sp&&node.sp.dn)||''}})} onDelSpouse={handleDeleteSpouse} hl={hl}/>
+      </div>
+      {sel&&!editing&&<Detail node={findNodeById(tree,sel.id)||sel} root={tree} onClose={()=>setSel(null)} onEdit={(node)=>setEditing(findNodeById(tree,node.id)||node)} onEditSpouse={(node)=>setSpouseEditing({parentId:node.id,spouse:{...(node.sp||{}),dn:(node.sp&&node.sp.dn)||''}})} onDelSpouse={handleDeleteSpouse}/>}
+      {editing&&<EditForm node={findNodeById(tree,editing.id)||editing} onSave={handleSaveEdit} onCancel={()=>setEditing(null)} isNew={false}/>}
+      {spouseEditing&&<EditForm node={spouseEditing.spouse||empty()} onSave={handleSaveSpouse} onCancel={()=>setSpouseEditing(null)} isNew={false}/>}
+      {adding&&<EditForm node={empty()} onSave={handleAdd} onCancel={()=>setAdding(null)} isNew={true} parentId={adding} parentName={flat.find(n=>n.id===adding)?._n}/>}
+    </div>
+  );
+}
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App />);
+  </script>
+</body>
+</html>
