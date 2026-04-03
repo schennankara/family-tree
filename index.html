@@ -215,6 +215,333 @@ function downloadGedcom(tree) {
   URL.revokeObjectURL(url);
 }
 
+/* ───── GEDCOM 5.5.1 IMPORTER / PARSER ───── */
+function parseGedcomFile(text) {
+  // Normalize line endings
+  const raw = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const lines = raw.split('\n').filter(l => l.trim());
+
+  // Parse into elements: {level, pointer, tag, value, children[]}
+  const elements = [];
+  const stack = [{ children: elements, level: -1 }];
+
+  for (const line of lines) {
+    const m = line.match(/^(\d+)\s+(@[^@]+@)?\s*(\S+)\s*(.*)?$/);
+    if (!m) continue;
+    const level = parseInt(m[1]);
+    const pointer = (m[2] || '').trim();
+    const tag = m[3].trim();
+    const value = (m[4] || '').trim();
+    const el = { level, pointer, tag, value, children: [] };
+
+    // Pop stack to find parent
+    while (stack.length > 1 && stack[stack.length - 1].level >= level) {
+      stack.pop();
+    }
+    stack[stack.length - 1].children.push(el);
+    stack.push(el);
+  }
+
+  // Extract individuals
+  const people = {};
+  const families = {};
+
+  for (const el of elements) {
+    if (el.tag === 'INDI' && el.pointer) {
+      const p = parseIndi(el);
+      people[p.id] = p;
+    } else if (el.tag === 'FAM' && el.pointer) {
+      const f = parseFam(el);
+      families[f.id] = f;
+    }
+  }
+
+  // Compute generations & build tree
+  return buildTreeFromFlat(people, families);
+}
+
+function getChildValue(el, tag) {
+  const ch = el.children.find(c => c.tag === tag);
+  return ch ? ch.value : '';
+}
+
+function getNestedValue(el, parentTag, childTag) {
+  const parent = el.children.find(c => c.tag === parentTag);
+  if (!parent) return '';
+  const child = parent.children.find(c => c.tag === childTag);
+  return child ? child.value : '';
+}
+
+function parseIndi(el) {
+  const id = el.pointer;
+
+  // Primary name
+  let fn = '', mn = '', ln = '', nk = '', md = '';
+  const nameEls = el.children.filter(c => c.tag === 'NAME');
+
+  for (const nameEl of nameEls) {
+    const typeEl = nameEl.children.find(c => c.tag === 'TYPE');
+    const type = typeEl ? typeEl.value : '';
+
+    if (type === 'nick') {
+      nk = nameEl.value.replace(/\//g, '').trim();
+    } else if (type === 'birth') {
+      md = nameEl.value.replace(/\//g, '').trim();
+    } else if (type === 'married') {
+      // Skip married-name-only entries (the "George married to George" issue)
+      continue;
+    } else if (!fn && !ln) {
+      // Primary name - parse from structured value or sub-tags
+      const givnEl = nameEl.children.find(c => c.tag === 'GIVN');
+      const surnEl = nameEl.children.find(c => c.tag === 'SURN');
+      const secgEl = nameEl.children.find(c => c.tag === 'SECG');
+
+      if (givnEl) {
+        const parts = givnEl.value.split(' ');
+        fn = parts[0] || '';
+        if (parts.length > 1 && !mn) mn = parts.slice(1).join(' ');
+      }
+      if (surnEl) ln = surnEl.value;
+      if (secgEl && !mn) mn = secgEl.value;
+
+      // Fallback: parse "Given /Surname/" format
+      if (!fn && !ln) {
+        const nameVal = nameEl.value;
+        const slashMatch = nameVal.match(/^(.*?)\/([^\/]*)\//);
+        if (slashMatch) {
+          const givenPart = slashMatch[1].trim();
+          ln = slashMatch[2].trim();
+          const gParts = givenPart.split(' ');
+          fn = gParts[0] || '';
+          if (gParts.length > 1) mn = gParts.slice(1).join(' ');
+        } else {
+          fn = nameVal.replace(/\//g, '').trim();
+        }
+      }
+    }
+  }
+
+  const g = getChildValue(el, 'SEX');
+  const dob = getNestedValue(el, 'BIRT', 'DATE');
+  const loc = getNestedValue(el, 'BIRT', 'PLAC');
+  const dod = getNestedValue(el, 'DEAT', 'DATE');
+  const hasDeat = el.children.some(c => c.tag === 'DEAT');
+
+  // Contact
+  const ph = getChildValue(el, 'PHON');
+  const em = getChildValue(el, 'EMAI') || getChildValue(el, 'EMAIL');
+  const ws = getChildValue(el, 'WWW');
+
+  // Address
+  let a1='',a2='',ci='',st='',zp='',co='';
+  const addrEl = el.children.find(c => c.tag === 'ADDR' || c.tag === 'RESI');
+  if (addrEl) {
+    a1 = addrEl.value || getChildValue(addrEl, 'ADR1') || '';
+    a2 = getChildValue(addrEl, 'ADR2');
+    ci = getChildValue(addrEl, 'CITY');
+    st = getChildValue(addrEl, 'STAE');
+    zp = getChildValue(addrEl, 'POST');
+    co = getChildValue(addrEl, 'CTRY');
+  }
+
+  // Other fields
+  const prof = getChildValue(el, 'OCCU');
+  const notes = getChildValue(el, 'NOTE');
+
+  // Custom tags
+  const fb = getChildValue(el, '_FACEBOOK');
+  const ig = getChildValue(el, '_INSTAGRAM');
+  const li = getChildValue(el, '_LINKEDIN');
+  const pp = getChildValue(el, '_PHOTO');
+  const emp = getChildValue(el, '_EMPLOYER');
+  const pgl = getChildValue(el, '_PHOTOGALLERY');
+  const dl = getChildValue(el, '_DOCUMENTS');
+
+  // Family links
+  const fams = el.children.filter(c => c.tag === 'FAMS').map(c => c.value);
+  const famc = el.children.filter(c => c.tag === 'FAMC').map(c => c.value);
+
+  // Build display name
+  let dn = (fn + (mn ? ' ' + mn : '') + (ln ? ' ' + ln : '')).trim();
+  if (!dn) dn = nk || '(Unknown)';
+
+  // Handle the "surname only" spouse issue - if no first name and only surname
+  if (!fn && ln && !mn) {
+    dn = `Mrs. ${ln} (name unknown)`;
+  }
+
+  return {
+    id, fn, mn, ln, dn, nk, md, g,
+    dob, dod, dec: hasDeat || !!dod, bo: 0,
+    em, ph, a1, a2, ci, st, zp, co,
+    fb, ig, li, ws, pp, bio: '', loc,
+    prof, emp, stories: '', notes, pgl, dl,
+    fams, famc,
+  };
+}
+
+function parseFam(el) {
+  return {
+    id: el.pointer,
+    husb: getChildValue(el, 'HUSB'),
+    wife: getChildValue(el, 'WIFE'),
+    children: el.children.filter(c => c.tag === 'CHIL').map(c => c.value),
+    mdate: getNestedValue(el, 'MARR', 'DATE'),
+    mplace: getNestedValue(el, 'MARR', 'PLAC'),
+  };
+}
+
+function parseDateSort(d) {
+  if (!d) return 99999999;
+  const months = {JAN:1,FEB:2,MAR:3,APR:4,MAY:5,JUN:6,JUL:7,AUG:8,SEP:9,OCT:10,NOV:11,DEC:12};
+  // MM/DD/YYYY
+  let m = d.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if (m) return parseInt(m[3])*10000 + parseInt(m[1])*100 + parseInt(m[2]);
+  // DD MON YYYY
+  m = d.match(/(\d{1,2})\s+(\w{3})\s+(\d{4})/);
+  if (m) return parseInt(m[3])*10000 + (months[m[2].toUpperCase()]||0)*100 + parseInt(m[1]);
+  return 99999999;
+}
+
+function buildTreeFromFlat(people, families) {
+  // Compute birth order per family
+  for (const fam of Object.values(families)) {
+    const kids = fam.children.filter(cid => people[cid]);
+    kids.sort((a, b) => parseDateSort(people[a].dob) - parseDateSort(people[b].dob));
+    kids.forEach((cid, i) => { if (people[cid]) people[cid].bo = i + 1; });
+  }
+
+  // BFS to assign generations
+  const hasParents = new Set();
+  for (const fam of Object.values(families)) {
+    fam.children.forEach(c => hasParents.add(c));
+  }
+  const roots = Object.keys(people).filter(pid => !hasParents.has(pid));
+
+  const genMap = {};
+  const visited = new Set();
+  const queue = roots.map(pid => [pid, 0]);
+
+  while (queue.length > 0) {
+    const [pid, gen] = queue.shift();
+    if (visited.has(pid)) continue;
+    visited.add(pid);
+    genMap[pid] = gen;
+
+    const person = people[pid];
+    if (!person) continue;
+
+    for (const famId of person.fams) {
+      const fam = families[famId];
+      if (!fam) continue;
+      // Spouse gets same gen
+      const spouseId = fam.husb === pid ? fam.wife : fam.husb;
+      if (spouseId && !visited.has(spouseId)) queue.push([spouseId, gen]);
+      // Children get gen+1
+      for (const cid of fam.children) {
+        if (!visited.has(cid)) queue.push([cid, gen + 1]);
+      }
+    }
+  }
+
+  // Find the person with most descendants as root
+  function countDesc(pid, seen = new Set()) {
+    if (seen.has(pid)) return 0;
+    seen.add(pid);
+    let count = 1;
+    const p = people[pid];
+    if (!p) return 0;
+    for (const famId of p.fams) {
+      const fam = families[famId];
+      if (!fam) continue;
+      for (const cid of fam.children) {
+        count += countDesc(cid, seen);
+      }
+    }
+    return count;
+  }
+
+  let bestRoot = roots[0];
+  let bestCount = 0;
+  for (const pid of roots) {
+    const p = people[pid];
+    const c = countDesc(pid);
+    // Prefer roots with actual names; skip unnamed spouse-only entries
+    const hasName = p && (p.fn || p.nk);
+    const score = c + (hasName ? 100000 : 0);
+    if (score > bestCount) { bestCount = score; bestRoot = pid; }
+  }
+
+  // Build hierarchical tree
+  function buildNode(pid, visitedNodes = new Set()) {
+    if (visitedNodes.has(pid)) return null;
+    visitedNodes.add(pid);
+
+    const p = people[pid];
+    if (!p) return null;
+
+    const node = { ...p, gen: genMap[pid] || 0, sp: null, ch: [] };
+    // Remove flat refs from display node
+    delete node.fams;
+    delete node.famc;
+
+    for (const famId of (p.fams || [])) {
+      const fam = families[famId];
+      if (!fam) continue;
+
+      // Spouse
+      const spId = fam.husb === pid ? fam.wife : fam.husb;
+      if (spId && people[spId] && !visitedNodes.has(spId)) {
+        visitedNodes.add(spId);
+        const sp = { ...people[spId], mdate: fam.mdate || '', mplace: fam.mplace || '' };
+        delete sp.fams;
+        delete sp.famc;
+        node.sp = sp;
+      }
+      node.mdate = fam.mdate || '';
+      node.mplace = fam.mplace || '';
+
+      // Children
+      for (const cid of fam.children) {
+        const childNode = buildNode(cid, visitedNodes);
+        if (childNode) node.ch.push(childNode);
+      }
+      // Sort children by birth order
+      node.ch.sort((a, b) => (a.bo || 999) - (b.bo || 999));
+    }
+
+    return node;
+  }
+
+  return buildNode(bestRoot);
+}
+
+function triggerImportGedcom(onImport) {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.ged,.gedcom';
+  input.onchange = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      try {
+        const tree = parseGedcomFile(evt.target.result);
+        if (tree) {
+          onImport(tree, file.name);
+        } else {
+          alert('Could not parse the GEDCOM file. No valid records found.');
+        }
+      } catch (err) {
+        alert('Error parsing GEDCOM file: ' + err.message);
+        console.error(err);
+      }
+    };
+    reader.readAsText(file, 'utf-8');
+  };
+  input.click();
+}
+
 /* ───── HELPERS ───── */
 const MC='#6b9e72', FC='#9b82c4', GC='#c4a35a', GD='#8a7340', BG='#0a0a08', CD='#141410', TX='#d4cfc0', DM='#7a7568', BR='rgba(196,163,90,0.12)';
 const flattenAll=(n,p='')=>{const arr=[];const nm=n.dn||'?';const fp=p?p+' › '+nm:nm;arr.push({...n,_p:fp,_n:nm});(n.ch||[]).forEach(c=>arr.push(...flattenAll(c,fp)));return arr};
@@ -578,6 +905,7 @@ function App(){
             {[['Expand All',expandAll],['Collapse',collapseAll],['2 Lvls',()=>expandTo(2)],['3 Lvls',()=>expandTo(3)]].map(([l,f])=>
               <button key={l} onClick={f} style={btnS}>{l}</button>)}
             <button onClick={()=>{downloadGedcom(tree);setMsg('GEDCOM exported!')}} style={{...btnS,background:'rgba(196,163,90,0.1)',borderColor:GD,color:GC}}>⬇ Export GEDCOM</button>
+            <button onClick={()=>triggerImportGedcom((newTree,fileName)=>{setTree(newTree);flat.length=0;flat.push(...flattenAll(newTree));setMsg('Imported: '+fileName);expandTo(2)})} style={{...btnS,background:'rgba(107,158,114,0.1)',borderColor:MC,color:MC}}>⬆ Import GEDCOM</button>
           </div>
         </div>
       </div>
