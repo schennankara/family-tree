@@ -101,14 +101,16 @@ function buildTreeFromDB(persons, families) {
     for(const fid of p._fams){const f=fMap[fid];if(f)(f.children||[]).forEach(cid=>{c+=countDesc(cid,seen)});}
     return c;
   }
-  let bestRoot=roots[0],bestScore=0;
+  let bestRoot=null,bestScore=0;
   for(const pid of roots){
     const p=pMap[pid];
     if(!p||(!p.fn&&!p.nk)) continue;
     const c=countDesc(pid);
     if(c>bestScore){bestScore=c;bestRoot=pid;}
   }
-  if(bestScore===0){ for(const pid of roots){ const c=countDesc(pid); if(c>bestScore){bestScore=c;bestRoot=pid;} } }
+  if(!bestRoot){ for(const pid of roots){ const c=countDesc(pid); if(c>bestScore){bestScore=c;bestRoot=pid;} } }
+  if(!bestRoot) bestRoot=roots[0];
+  console.log('DB tree root:', bestRoot, pMap[bestRoot]?.dn, 'with', bestScore, 'descendants');
 
   // Build hierarchical tree
   function buildNode(pid, visited=new Set()) {
@@ -981,7 +983,7 @@ function buildTreeFromFlat(people, families) {
     return count;
   }
 
-  let bestRoot = roots[0];
+  let bestRoot = null;
   let bestCount = 0;
   for (const pid of roots) {
     const p = people[pid];
@@ -991,12 +993,14 @@ function buildTreeFromFlat(people, families) {
     if (c > bestCount) { bestCount = c; bestRoot = pid; }
   }
   // If no named root found, fall back to most descendants
-  if (bestCount === 0) {
+  if (!bestRoot) {
     for (const pid of roots) {
       const c = countDesc(pid);
       if (c > bestCount) { bestCount = c; bestRoot = pid; }
     }
   }
+  if (!bestRoot) bestRoot = roots[0];
+  console.log('Tree root:', bestRoot, people[bestRoot]?.dn, 'with', bestCount, 'descendants');
 
   // Build hierarchical tree
   function buildNode(pid, visitedNodes = new Set()) {
