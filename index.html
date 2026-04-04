@@ -103,11 +103,12 @@ function buildTreeFromDB(persons, families) {
   }
   let bestRoot=roots[0],bestScore=0;
   for(const pid of roots){
-    const p=pMap[pid];const c=countDesc(pid);
-    const hasName=p&&(p.fn||p.nk);
-    const score=c+(hasName?100000:0);
-    if(score>bestScore){bestScore=score;bestRoot=pid;}
+    const p=pMap[pid];
+    if(!p||(!p.fn&&!p.nk)) continue;
+    const c=countDesc(pid);
+    if(c>bestScore){bestScore=c;bestRoot=pid;}
   }
+  if(bestScore===0){ for(const pid of roots){ const c=countDesc(pid); if(c>bestScore){bestScore=c;bestRoot=pid;} } }
 
   // Build hierarchical tree
   function buildNode(pid, visited=new Set()) {
@@ -984,11 +985,17 @@ function buildTreeFromFlat(people, families) {
   let bestCount = 0;
   for (const pid of roots) {
     const p = people[pid];
+    // Skip unnamed people entirely as root candidates
+    if (!p || (!p.fn && !p.nk)) continue;
     const c = countDesc(pid);
-    // Prefer roots with actual names; skip unnamed spouse-only entries
-    const hasName = p && (p.fn || p.nk);
-    const score = c + (hasName ? 100000 : 0);
-    if (score > bestCount) { bestCount = score; bestRoot = pid; }
+    if (c > bestCount) { bestCount = c; bestRoot = pid; }
+  }
+  // If no named root found, fall back to most descendants
+  if (bestCount === 0) {
+    for (const pid of roots) {
+      const c = countDesc(pid);
+      if (c > bestCount) { bestCount = c; bestRoot = pid; }
+    }
   }
 
   // Build hierarchical tree
