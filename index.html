@@ -347,7 +347,8 @@ async function migrateGedcomToSupabase(gedcomText, onProgress) {
       const dob = gnv(el, 'BIRT', 'DATE');
       const loc = gnv(el, 'BIRT', 'PLAC');
       const dod = gnv(el, 'DEAT', 'DATE');
-      const hasDeat = el.children.some(c => c.tag === 'DEAT');
+      const deatEl1 = el.children.find(c => c.tag === 'DEAT');
+      const hasDeat = deatEl1 ? (deatEl1.value === 'Y' || !!dod) : false;
       let dn = (fn + (mn ? ' ' + mn : '') + (ln ? ' ' + ln : '')).trim();
       if (!dn) dn = nk || '(Unknown)';
       if (!fn && ln && !mn) dn = 'Mrs. ' + ln + ' (name unknown)';
@@ -847,7 +848,8 @@ function parseIndi(el) {
   const dob = getNestedValue(el, 'BIRT', 'DATE');
   const loc = getNestedValue(el, 'BIRT', 'PLAC');
   const dod = getNestedValue(el, 'DEAT', 'DATE');
-  const hasDeat = el.children.some(c => c.tag === 'DEAT');
+  const deatEl2 = el.children.find(c => c.tag === 'DEAT');
+  const hasDeat = deatEl2 ? (deatEl2.value === 'Y' || !!dod) : false;
 
   // Contact
   const ph = getChildValue(el, 'PHON');
