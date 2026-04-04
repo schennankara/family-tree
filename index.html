@@ -731,161 +731,6 @@ function downloadGedcom(tree) {
   URL.revokeObjectURL(url);
 }
 
-/* ───── GITHUB API: PUBLISH TO SOURCE ───── */
-const GITHUB_OWNER = 'schennankara';
-const GITHUB_REPO = 'family-tree';
-const SOURCE_FILE_PATH = 'Chennankara_or_Chennamkara.ged';
-const ARCHIVE_FOLDER = 'archive';
-
-let githubToken = null;
-
-function GitHubPublishDialog({tree, editUser, onDone, onCancel}) {
-  const [token, setToken] = useState(githubToken || '');
-  const [status, setStatus] = useState('');
-  const [publishing, setPublishing] = useState(false);
-  const [error, setError] = useState('');
-  const [success, setSuccess] = useState(false);
-  const inp={width:'100%',background:'#1a1a14',border:'1px solid '+BR,color:TX,padding:'8px 12px',borderRadius:6,fontSize:13,outline:'none',fontFamily:'inherit'};
-
-  const handlePublish = async () => {
-    if (!token.trim()) { setError('GitHub Personal Access Token is required'); return; }
-    setPublishing(true);
-    setError('');
-    githubToken = token.trim();
-
-    const headers = {
-      'Authorization': 'token ' + githubToken,
-      'Accept': 'application/vnd.github.v3+json',
-      'Content-Type': 'application/json',
-    };
-    const apiBase = 'https://api.github.com/repos/' + GITHUB_OWNER + '/' + GITHUB_REPO + '/contents/';
-
-    try {
-      // Step 1: Get current source file SHA
-      setStatus('Reading current source file...');
-      const currentResp = await fetch(apiBase + SOURCE_FILE_PATH, { headers });
-      let currentSha = null;
-      let currentContent = null;
-      if (currentResp.ok) {
-        const currentData = await currentResp.json();
-        currentSha = currentData.sha;
-        currentContent = currentData.content; // base64 encoded
-      }
-
-      // Step 2: Archive the current file with timestamp
-      if (currentContent) {
-        const now = new Date();
-        const ts = now.getFullYear() + '-' +
-          String(now.getMonth()+1).padStart(2,'0') + '-' +
-          String(now.getDate()).padStart(2,'0') + '_' +
-          String(now.getHours()).padStart(2,'0') + '-' +
-          String(now.getMinutes()).padStart(2,'0') + '-' +
-          String(now.getSeconds()).padStart(2,'0');
-        const archivePath = ARCHIVE_FOLDER + '/Chennankara_' + ts + '.ged';
-
-        setStatus('Archiving previous version as ' + archivePath + '...');
-        const archiveResp = await fetch(apiBase + archivePath, {
-          method: 'PUT',
-          headers,
-          body: JSON.stringify({
-            message: 'Archive: ' + ts + ' (before update by ' + (editUser || 'admin') + ')',
-            content: currentContent, // already base64
-          }),
-        });
-        if (!archiveResp.ok) {
-          const errData = await archiveResp.json();
-          throw new Error('Archive failed: ' + (errData.message || archiveResp.status));
-        }
-      }
-
-      // Step 3: Generate new GEDCOM content
-      setStatus('Generating updated GEDCOM...');
-      const newContent = exportTreeToGedcom(tree);
-      const newContentB64 = btoa(unescape(encodeURIComponent(newContent)));
-
-      // Step 4: Commit the updated source file
-      setStatus('Publishing updated source...');
-      const updateBody = {
-        message: 'Updated family tree by ' + (editUser || 'admin') + ' via FTLS',
-        content: newContentB64,
-      };
-      if (currentSha) updateBody.sha = currentSha;
-
-      const updateResp = await fetch(apiBase + SOURCE_FILE_PATH, {
-        method: 'PUT',
-        headers,
-        body: JSON.stringify(updateBody),
-      });
-
-      if (!updateResp.ok) {
-        const errData = await updateResp.json();
-        throw new Error('Publish failed: ' + (errData.message || updateResp.status));
-      }
-
-      setStatus('');
-      setSuccess(true);
-    } catch (err) {
-      setError(err.message);
-      setStatus('');
-      console.error('Publish error:', err);
-    } finally {
-      setPublishing(false);
-    }
-  };
-
-  if (success) return(
-    <div style={{position:'fixed',inset:0,zIndex:300,display:'flex',alignItems:'center',justifyContent:'center'}}>
-      <div onClick={onDone} style={{position:'absolute',inset:0,background:'rgba(0,0,0,0.7)'}}/>
-      <div style={{position:'relative',background:CD,border:'1px solid '+BR,borderRadius:12,width:Math.min(440,window.innerWidth-32),padding:28,zIndex:301,textAlign:'center'}}>
-        <div style={{fontSize:48,marginBottom:12}}>✓</div>
-        <div style={{fontSize:20,color:GC,fontWeight:300,marginBottom:8}}>Published Successfully</div>
-        <div style={{fontSize:13,color:DM,lineHeight:1.6,marginBottom:8}}>
-          The previous version has been archived and the source of truth has been updated.
-          Changes will be live on the website within 30–60 seconds as GitHub Pages rebuilds.
-        </div>
-        <div style={{fontSize:12,color:DM,marginBottom:20}}>
-          Next page load will show the updated tree.
-        </div>
-        <button onClick={onDone} style={{background:'rgba(196,163,90,0.15)',border:'1px solid '+GD,color:GC,padding:'10px 24px',borderRadius:6,cursor:'pointer',fontSize:14}}>Done</button>
-      </div>
-    </div>
-  );
-
-  return(
-    <div style={{position:'fixed',inset:0,zIndex:300,display:'flex',alignItems:'center',justifyContent:'center'}}>
-      <div onClick={onCancel} style={{position:'absolute',inset:0,background:'rgba(0,0,0,0.7)'}}/>
-      <div style={{position:'relative',background:CD,border:'1px solid '+BR,borderRadius:12,width:Math.min(480,window.innerWidth-32),padding:28,zIndex:301}}>
-        <div style={{fontSize:20,color:GC,fontWeight:300,marginBottom:4}}>Publish to Source</div>
-        <div style={{fontSize:12,color:DM,marginBottom:20,lineHeight:1.6}}>
-          This will archive the current GEDCOM file (with timestamp) and commit your changes as the new source of truth.
-          You need a GitHub Personal Access Token with <strong style={{color:TX}}>repo</strong> scope.
-          <br/><br/>
-          <span style={{color:'#c4a35a'}}>Generate one at:</span>{' '}
-          <span style={{color:TX,textDecoration:'underline',cursor:'pointer'}} onClick={()=>window.open('https://github.com/settings/tokens/new?scopes=repo&description=FTLS+Publish','_blank')}>
-            github.com/settings/tokens
-          </span>
-        </div>
-        <div style={{marginBottom:16}}>
-          <label style={{fontSize:11,color:DM,display:'block',marginBottom:3}}>GitHub Personal Access Token</label>
-          <input type="password" value={token} onChange={e=>{setToken(e.target.value);setError('')}} placeholder="ghp_xxxxxxxxxxxxxxxxxxxx" style={inp}
-            onKeyDown={e=>{if(e.key==='Enter'&&!publishing)handlePublish()}} disabled={publishing}/>
-        </div>
-        {status && <div style={{fontSize:12,color:'#6b9e72',marginBottom:12,display:'flex',alignItems:'center',gap:8}}>
-          <div style={{width:12,height:12,border:'2px solid '+BR,borderTopColor:MC,borderRadius:'50%',animation:'spin 0.8s linear infinite'}}/>
-          {status}
-        </div>}
-        {error && <div style={{fontSize:12,color:'#c05050',marginBottom:12}}>{error}</div>}
-        <div style={{display:'flex',gap:8,justifyContent:'flex-end'}}>
-          <button onClick={onCancel} disabled={publishing} style={{background:'transparent',border:'1px solid '+BR,color:DM,padding:'8px 20px',borderRadius:6,cursor:'pointer',fontSize:13,opacity:publishing?0.5:1}}>Cancel</button>
-          <button onClick={handlePublish} disabled={publishing} style={{background:publishing?'rgba(107,158,114,0.05)':'rgba(107,158,114,0.15)',border:'1px solid '+MC,color:MC,padding:'8px 20px',borderRadius:6,cursor:'pointer',fontSize:13,opacity:publishing?0.6:1}}>
-            {publishing ? 'Publishing...' : '📤 Publish Now'}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 /* ───── GEDCOM 5.5.1 IMPORTER / PARSER ───── */
 function parseGedcomFile(text) {
   // Normalize line endings
@@ -1485,7 +1330,6 @@ function App(){
   const [spouseEditing,setSpouseEditing]=useState(null);
   const [msg,setMsg]=useState('');
   const [showAuth,setShowAuth]=useState(false);
-  const [showPublish,setShowPublish]=useState(false);
   const [showMigrate,setShowMigrate]=useState(false);
   const [pendingAction,setPendingAction]=useState(null);
   const [editUser,setEditUser]=useState('');
@@ -1737,8 +1581,7 @@ function App(){
               <button key={l} onClick={f} style={btnS}>{l}</button>)}
             <button onClick={()=>{downloadGedcom(tree);setMsg('GEDCOM exported!')}} style={{...btnS,background:'rgba(196,163,90,0.1)',borderColor:GD,color:GC}}>⬇ Export GEDCOM</button>
             <button onClick={()=>triggerImportGedcom((newTree,fileName)=>{setTree(newTree);setMsg('Imported: '+fileName);expandTo(2)})} style={{...btnS,background:'rgba(107,158,114,0.1)',borderColor:MC,color:MC}}>⬆ Import GEDCOM</button>
-            {editSessionActive&&<button onClick={()=>setShowPublish(true)} style={{...btnS,background:'rgba(155,130,196,0.1)',borderColor:FC,color:FC}}>📤 Publish to Source</button>}
-            {editSessionActive&&<button onClick={()=>setShowMigrate(true)} style={{...btnS,background:'rgba(196,163,90,0.06)',borderColor:'rgba(196,163,90,0.3)',color:GD}}>🗄 Migrate GEDCOM→DB</button>}
+            <button onClick={()=>requireAuth(()=>setShowMigrate(true))} style={{...btnS,background:'rgba(196,163,90,0.06)',borderColor:'rgba(196,163,90,0.3)',color:GD}}>🗄 Migrate GEDCOM→DB</button>
           </div>
         </div>
       </div>
@@ -1750,7 +1593,6 @@ function App(){
       {spouseEditing&&<EditForm node={spouseEditing.spouse||empty()} onSave={handleSaveSpouse} onCancel={()=>setSpouseEditing(null)} isNew={false}/>}
       {adding&&<EditForm node={empty()} onSave={handleAdd} onCancel={()=>setAdding(null)} isNew={true} parentId={adding} parentName={flat.find(n=>n.id===adding)?._n}/>}
       {showAuth&&<PasswordGate onSuccess={(name)=>{setShowAuth(false);setEditUser(name);setMsg('Edit mode: '+name);setTimeout(()=>setMsg(''),3000);if(pendingAction){pendingAction();setPendingAction(null)}}} onCancel={()=>{setShowAuth(false);setPendingAction(null)}}/>}
-      {showPublish&&<GitHubPublishDialog tree={tree} editUser={editUser||editSessionUser} onDone={()=>{setShowPublish(false);setMsg('Published to source!')}} onCancel={()=>setShowPublish(false)}/>}
       {showMigrate&&<MigrateDialog onDone={()=>setShowMigrate(false)} onCancel={()=>setShowMigrate(false)}/>}
       {editSessionActive&&<div style={{position:'fixed',bottom:16,right:16,background:CD,border:'1px solid '+BR,borderRadius:8,padding:'8px 14px',fontSize:11,color:DM,zIndex:80,display:'flex',alignItems:'center',gap:8}}>
         <span style={{width:6,height:6,borderRadius:'50%',background:MC}}/>
