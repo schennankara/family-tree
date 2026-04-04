@@ -26,9 +26,256 @@
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
 
-/* ───── SOURCE OF TRUTH: Fetch GEDCOM from repo on load ───── */
+/* ───── SUPABASE CONFIG ───── */
+const SUPABASE_URL = 'https://hnsikxxbpyhsybqmjgss.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_Pe8ZW66e6BVCZ7kLdL0-XA_bejiFhId';
+const SB_HEADERS = {
+  'apikey': SUPABASE_KEY,
+  'Authorization': 'Bearer ' + SUPABASE_KEY,
+  'Content-Type': 'application/json',
+  'Prefer': 'return=representation'
+};
+
+async function sbFetch(path, opts = {}) {
+  const url = SUPABASE_URL + '/rest/v1/' + path;
+  const resp = await fetch(url, { ...opts, headers: { ...SB_HEADERS, ...(opts.headers||{}) } });
+  if (!resp.ok) {
+    const err = await resp.text();
+    throw new Error(`Supabase ${resp.status}: ${err}`);
+  }
+  return resp.json();
+}
+
+/* ───── LOAD FROM SUPABASE ───── */
+async function loadFromSupabase() {
+  try {
+    // Fetch all persons and families
+    const [persons, families] = await Promise.all([
+      sbFetch('persons?select=*&order=display_name'),
+      sbFetch('families?select=*'),
+    ]);
+    console.log(`Loaded ${persons.length} persons, ${families.length} families from Supabase`);
+    return buildTreeFromDB(persons, families);
+  } catch (err) {
+    console.error('Supabase load failed:', err);
+    return null;
+  }
+}
+
+function buildTreeFromDB(persons, families) {
+  const pMap = {};
+  persons.forEach(p => {
+    pMap[p.id] = {
+      id:p.id, fn:p.first_name, mn:p.middle_name, ln:p.last_name,
+      dn:p.display_name, nk:p.nickname, md:p.maiden_name, g:p.gender,
+      dob:p.date_of_birth, dod:p.date_of_death, dec:p.is_deceased, bo:p.birth_order,
+      em:p.email, ph:p.phone, a1:p.address1, a2:p.address2,
+      ci:p.city, st:p.state, zp:p.zip, co:p.country,
+      fb:p.facebook, ig:p.instagram, li:p.linkedin, ws:p.website,
+      pp:p.profile_photo, bio:p.bio, loc:p.location, prof:p.profession, emp:p.employer,
+      stories:p.stories, notes:p.notes, pgl:p.photo_gallery_link, dl:p.documents_link,
+      _fams: [], _famc: [],
+    };
+  });
+
+  // Build family links
+  const fMap = {};
+  families.forEach(f => {
+    fMap[f.id] = f;
+    if (f.husband_id && pMap[f.husband_id]) pMap[f.husband_id]._fams.push(f.id);
+    if (f.wife_id && pMap[f.wife_id]) pMap[f.wife_id]._fams.push(f.id);
+    (f.children || []).forEach(cid => {
+      if (pMap[cid]) pMap[cid]._famc.push(f.id);
+    });
+  });
+
+  // Find roots (no famc)
+  const hasParents = new Set();
+  families.forEach(f => (f.children||[]).forEach(c => hasParents.add(c)));
+  const roots = Object.keys(pMap).filter(pid => !hasParents.has(pid));
+
+  // Find best root (most descendants, prefer named)
+  function countDesc(pid, seen=new Set()) {
+    if(seen.has(pid))return 0;seen.add(pid);let c=1;
+    const p=pMap[pid];if(!p)return 0;
+    for(const fid of p._fams){const f=fMap[fid];if(f)(f.children||[]).forEach(cid=>{c+=countDesc(cid,seen)});}
+    return c;
+  }
+  let bestRoot=roots[0],bestScore=0;
+  for(const pid of roots){
+    const p=pMap[pid];const c=countDesc(pid);
+    const hasName=p&&(p.fn||p.nk);
+    const score=c+(hasName?100000:0);
+    if(score>bestScore){bestScore=score;bestRoot=pid;}
+  }
+
+  // Build hierarchical tree
+  function buildNode(pid, visited=new Set()) {
+    if(visited.has(pid))return null;visited.add(pid);
+    const p=pMap[pid];if(!p)return null;
+    const node={...p, sp:null, ch:[]};
+    delete node._fams; delete node._famc;
+
+    for(const fid of (p._fams||[])){
+      const fam=fMap[fid];if(!fam)continue;
+      const spId = fam.husband_id===pid ? fam.wife_id : fam.husband_id;
+      if(spId&&pMap[spId]&&!visited.has(spId)){
+        visited.add(spId);
+        const sp={...pMap[spId], mdate:fam.marriage_date||'', mplace:fam.marriage_place||''};
+        delete sp._fams; delete sp._famc;
+        node.sp=sp;
+      }
+      node.mdate=fam.marriage_date||'';
+      node.mplace=fam.marriage_place||'';
+      for(const cid of (fam.children||[])){
+        const cn=buildNode(cid,visited);
+        if(cn)node.ch.push(cn);
+      }
+      node.ch.sort((a,b)=>(a.bo||999)-(b.bo||999));
+    }
+    return node;
+  }
+
+  return buildNode(bestRoot);
+}
+
+/* ───── SAVE TO SUPABASE ───── */
+async function savePerson(person, editUser) {
+  const row = {
+    id: person.id,
+    first_name: person.fn||'', middle_name: person.mn||'', last_name: person.ln||'',
+    display_name: person.dn||'', nickname: person.nk||'', maiden_name: person.md||'',
+    gender: person.g||'', date_of_birth: person.dob||'', date_of_death: person.dod||'',
+    is_deceased: !!person.dec, birth_order: person.bo||0,
+    email: person.em||'', phone: person.ph||'',
+    address1: person.a1||'', address2: person.a2||'', city: person.ci||'',
+    state: person.st||'', zip: person.zp||'', country: person.co||'',
+    facebook: person.fb||'', instagram: person.ig||'', linkedin: person.li||'',
+    website: person.ws||'', profile_photo: person.pp||'', bio: person.bio||'',
+    location: person.loc||'', profession: person.prof||'', employer: person.emp||'',
+    stories: person.stories||'', notes: person.notes||'',
+    photo_gallery_link: person.pgl||'', documents_link: person.dl||'',
+    updated_by: editUser||'',
+  };
+  await sbFetch('persons?on_conflict=id', {
+    method: 'POST',
+    body: JSON.stringify(row),
+    headers: { 'Prefer': 'resolution=merge-duplicates,return=representation' }
+  });
+  // Log edit
+  try {
+    await sbFetch('edit_log', {
+      method: 'POST',
+      body: JSON.stringify({ person_id: person.id, action: 'update', edited_by: editUser||'', changes: row })
+    });
+  } catch(e) { console.warn('Edit log failed:', e); }
+}
+
+async function saveFamily(familyId, husbandId, wifeId, children, mdate, mplace) {
+  const row = {
+    id: familyId,
+    husband_id: husbandId||null, wife_id: wifeId||null,
+    children: children||[],
+    marriage_date: mdate||'', marriage_place: mplace||'',
+  };
+  await sbFetch('families?on_conflict=id', {
+    method: 'POST',
+    body: JSON.stringify(row),
+    headers: { 'Prefer': 'resolution=merge-duplicates,return=representation' }
+  });
+}
+
+async function deletePersonFromDB(personId, editUser) {
+  // Remove from family children arrays
+  const fams = await sbFetch(`families?select=*&children=cs.{${personId}}`);
+  for (const f of fams) {
+    const newChildren = (f.children||[]).filter(c=>c!==personId);
+    await sbFetch(`families?id=eq.${f.id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ children: newChildren })
+    });
+  }
+  // Remove families where this person is husband or wife (if no children)
+  const asFams = await sbFetch(`families?select=*&or=(husband_id.eq.${personId},wife_id.eq.${personId})`);
+  for (const f of asFams) {
+    if (!f.children || f.children.length === 0) {
+      await sbFetch(`families?id=eq.${f.id}`, { method: 'DELETE' });
+    }
+  }
+  // Delete person
+  await sbFetch(`persons?id=eq.${personId}`, { method: 'DELETE' });
+  // Log
+  try {
+    await sbFetch('edit_log', {
+      method: 'POST',
+      body: JSON.stringify({ person_id: personId, action: 'delete', edited_by: editUser||'' })
+    });
+  } catch(e) {}
+}
+
+async function addPersonToDB(person, parentId, editUser) {
+  // Save the new person
+  await savePerson(person, editUser);
+  // Find or create family for the parent
+  if (parentId) {
+    const parentFams = await sbFetch(`families?select=*&or=(husband_id.eq.${parentId},wife_id.eq.${parentId})`);
+    if (parentFams.length > 0) {
+      // Add to first family's children
+      const fam = parentFams[0];
+      const newChildren = [...(fam.children||[]), person.id];
+      await sbFetch(`families?id=eq.${fam.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ children: newChildren })
+      });
+    } else {
+      // Create new family with parent + child
+      const parent = await sbFetch(`persons?id=eq.${parentId}&select=gender`);
+      const pGender = parent[0]?.gender || 'M';
+      await saveFamily(
+        '@F_new_' + Date.now() + '@',
+        pGender === 'M' ? parentId : null,
+        pGender === 'F' ? parentId : null,
+        [person.id], '', ''
+      );
+    }
+  }
+}
+
+async function saveSpouseToDB(parentId, spouse, editUser) {
+  // Save spouse person record
+  await savePerson(spouse, editUser);
+  // Find parent's family or create one
+  const parentFams = await sbFetch(`families?select=*&or=(husband_id.eq.${parentId},wife_id.eq.${parentId})`);
+  const parent = await sbFetch(`persons?id=eq.${parentId}&select=gender`);
+  const pGender = parent[0]?.gender || 'M';
+  if (parentFams.length > 0) {
+    const fam = parentFams[0];
+    const patch = pGender === 'M' ? { wife_id: spouse.id } : { husband_id: spouse.id };
+    await sbFetch(`families?id=eq.${fam.id}`, { method: 'PATCH', body: JSON.stringify(patch) });
+  } else {
+    await saveFamily(
+      '@F_sp_' + Date.now() + '@',
+      pGender === 'M' ? parentId : spouse.id,
+      pGender === 'F' ? parentId : spouse.id,
+      [], '', ''
+    );
+  }
+}
+
+async function deleteSpouseFromDB(parentId, spouseId, editUser) {
+  // Remove spouse from family, don't delete the person record
+  const fams = await sbFetch(`families?select=*&or=(husband_id.eq.${parentId},wife_id.eq.${parentId})`);
+  for (const f of fams) {
+    if (f.husband_id === spouseId) {
+      await sbFetch(`families?id=eq.${f.id}`, { method: 'PATCH', body: JSON.stringify({ husband_id: null }) });
+    } else if (f.wife_id === spouseId) {
+      await sbFetch(`families?id=eq.${f.id}`, { method: 'PATCH', body: JSON.stringify({ wife_id: null }) });
+    }
+  }
+}
+
+/* ───── FALLBACK: GEDCOM file fetch (if Supabase is empty/down) ───── */
 const GEDCOM_SOURCE_URL = 'Chennankara_or_Chennamkara.ged';
-let INIT_LOADED = null;
 
 async function loadSourceGedcom() {
   try {
@@ -40,6 +287,262 @@ async function loadSourceGedcom() {
     console.error('Failed to load source GEDCOM:', err);
     return null;
   }
+}
+
+/* ───── BROWSER-BASED GEDCOM → SUPABASE MIGRATION ───── */
+async function migrateGedcomToSupabase(gedcomText, onProgress) {
+  // Parse GEDCOM into flat persons/families
+  const raw = gedcomText.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const lines = raw.split('\n').filter(l => l.trim());
+  const elements = [];
+  const stack = [{ children: elements, level: -1 }];
+  for (const line of lines) {
+    const m = line.match(/^(\d+)\s+(@[^@]+@)?\s*(\S+)\s*(.*)?$/);
+    if (!m) continue;
+    const level = parseInt(m[1]);
+    const pointer = (m[2] || '').trim();
+    const tag = m[3].trim();
+    const value = (m[4] || '').trim();
+    const el = { level, pointer, tag, value, children: [] };
+    while (stack.length > 1 && stack[stack.length - 1].level >= level) stack.pop();
+    stack[stack.length - 1].children.push(el);
+    stack.push(el);
+  }
+
+  function gv(el, tag) { const ch = el.children.find(c => c.tag === tag); return ch ? ch.value : ''; }
+  function gnv(el, pt, ct) { const p = el.children.find(c => c.tag === pt); if (!p) return ''; const c = p.children.find(x => x.tag === ct); return c ? c.value : ''; }
+
+  const persons = [];
+  const families = [];
+
+  for (const el of elements) {
+    if (el.tag === 'INDI' && el.pointer) {
+      let fn='',mn='',ln='',nk='',md='';
+      const nameEls = el.children.filter(c => c.tag === 'NAME');
+      for (const nameEl of nameEls) {
+        const typeEl = nameEl.children.find(c => c.tag === 'TYPE');
+        const type = typeEl ? typeEl.value : '';
+        if (type === 'nick') { nk = nameEl.value.replace(/\//g, '').trim(); }
+        else if (type === 'birth') { md = nameEl.value.replace(/\//g, '').trim(); }
+        else if (type === 'married') { continue; }
+        else if (!fn && !ln) {
+          const givnEl = nameEl.children.find(c => c.tag === 'GIVN');
+          const surnEl = nameEl.children.find(c => c.tag === 'SURN');
+          const secgEl = nameEl.children.find(c => c.tag === 'SECG');
+          if (givnEl) { let v=givnEl.value.replace(/^\d+\.\s*/,''); const parts=v.split(' '); fn=parts[0]||''; if(parts.length>1&&!mn)mn=parts.slice(1).join(' '); }
+          if (surnEl) ln = surnEl.value;
+          if (secgEl && !mn) mn = secgEl.value;
+          if (!fn && !ln) {
+            const nv = nameEl.value.replace(/^\d+\.\s*/,'');
+            const sm = nv.match(/^(.*?)\/([^\/]*)\//);
+            if (sm) { const gp=sm[1].trim(); ln=sm[2].trim(); const gs=gp.split(' '); fn=gs[0]||''; if(gs.length>1)mn=gs.slice(1).join(' '); }
+            else fn = nv.replace(/\//g, '').trim();
+          }
+        }
+      }
+      const g = gv(el, 'SEX');
+      const dob = gnv(el, 'BIRT', 'DATE');
+      const loc = gnv(el, 'BIRT', 'PLAC');
+      const dod = gnv(el, 'DEAT', 'DATE');
+      const hasDeat = el.children.some(c => c.tag === 'DEAT');
+      let dn = (fn + (mn ? ' ' + mn : '') + (ln ? ' ' + ln : '')).trim();
+      if (!dn) dn = nk || '(Unknown)';
+      if (!fn && ln && !mn) dn = 'Mrs. ' + ln + ' (name unknown)';
+
+      // Address
+      let a1='',a2='',ci='',st='',zp='',co='';
+      const addrEl = el.children.find(c => c.tag === 'ADDR' || c.tag === 'RESI');
+      if (addrEl) {
+        a1 = addrEl.value || gv(addrEl, 'ADR1') || '';
+        a2 = gv(addrEl, 'ADR2'); ci = gv(addrEl, 'CITY');
+        st = gv(addrEl, 'STAE'); zp = gv(addrEl, 'POST'); co = gv(addrEl, 'CTRY');
+      }
+
+      persons.push({
+        id: el.pointer, first_name: fn, middle_name: mn, last_name: ln,
+        display_name: dn, nickname: nk, maiden_name: md, gender: g,
+        date_of_birth: dob, date_of_death: dod, is_deceased: hasDeat || !!dod, birth_order: 0,
+        email: gv(el,'EMAI')||gv(el,'EMAIL'), phone: gv(el,'PHON'),
+        address1:a1, address2:a2, city:ci, state:st, zip:zp, country:co,
+        facebook: gv(el,'_FACEBOOK'), instagram: gv(el,'_INSTAGRAM'),
+        linkedin: gv(el,'_LINKEDIN'), website: gv(el,'WWW'),
+        profile_photo: gv(el,'_PHOTO'), bio: '', location: loc,
+        profession: gv(el,'OCCU'), employer: gv(el,'_EMPLOYER'),
+        stories: '', notes: gv(el,'NOTE'),
+        photo_gallery_link: gv(el,'_PHOTOGALLERY'), documents_link: gv(el,'_DOCUMENTS'),
+        updated_by: 'GEDCOM migration',
+      });
+    } else if (el.tag === 'FAM' && el.pointer) {
+      families.push({
+        id: el.pointer,
+        husband_id: gv(el,'HUSB') || null,
+        wife_id: gv(el,'WIFE') || null,
+        children: el.children.filter(c => c.tag === 'CHIL').map(c => c.value),
+        marriage_date: gnv(el,'MARR','DATE'),
+        marriage_place: gnv(el,'MARR','PLAC'),
+      });
+    }
+  }
+
+  // Compute birth order
+  const pMap = {};
+  persons.forEach(p => pMap[p.id] = p);
+  families.forEach(f => {
+    (f.children||[]).forEach((cid, i) => { if (pMap[cid]) pMap[cid].birth_order = i + 1; });
+  });
+
+  onProgress(`Parsed: ${persons.length} persons, ${families.length} families`);
+
+  // Clear existing data
+  onProgress('Clearing existing data...');
+  try { await sbFetch('edit_log?id=gt.0', { method: 'DELETE' }); } catch(e) {}
+  try { await sbFetch('families?id=neq.', { method: 'DELETE' }); } catch(e) {}
+  try { await sbFetch('persons?id=neq.', { method: 'DELETE' }); } catch(e) {}
+
+  // Insert persons in batches
+  const batchSize = 30;
+  for (let i = 0; i < persons.length; i += batchSize) {
+    const batch = persons.slice(i, i + batchSize);
+    onProgress(`Inserting persons ${i + 1}-${Math.min(i + batchSize, persons.length)} of ${persons.length}...`);
+    try {
+      await sbFetch('persons', {
+        method: 'POST',
+        body: JSON.stringify(batch),
+        headers: { 'Prefer': 'resolution=merge-duplicates,return=minimal' }
+      });
+    } catch (e) {
+      // Try one by one
+      for (const p of batch) {
+        try {
+          await sbFetch('persons', {
+            method: 'POST',
+            body: JSON.stringify(p),
+            headers: { 'Prefer': 'resolution=merge-duplicates,return=minimal' }
+          });
+        } catch (e2) {
+          console.warn('Skip person:', p.id, e2);
+        }
+      }
+    }
+  }
+
+  // Insert families in batches
+  for (let i = 0; i < families.length; i += batchSize) {
+    const batch = families.slice(i, i + batchSize);
+    onProgress(`Inserting families ${i + 1}-${Math.min(i + batchSize, families.length)} of ${families.length}...`);
+    try {
+      await sbFetch('families', {
+        method: 'POST',
+        body: JSON.stringify(batch),
+        headers: { 'Prefer': 'resolution=merge-duplicates,return=minimal' }
+      });
+    } catch (e) {
+      for (const f of batch) {
+        try {
+          await sbFetch('families', {
+            method: 'POST',
+            body: JSON.stringify(f),
+            headers: { 'Prefer': 'resolution=merge-duplicates,return=minimal' }
+          });
+        } catch (e2) {
+          console.warn('Skip family:', f.id, e2);
+        }
+      }
+    }
+  }
+
+  onProgress('Verifying...');
+  const pCount = await sbFetch('persons?select=id');
+  const fCount = await sbFetch('families?select=id');
+  return { persons: pCount.length, families: fCount.length };
+}
+
+function MigrateDialog({onDone, onCancel}) {
+  const [status, setStatus] = useState('');
+  const [running, setRunning] = useState(false);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState('');
+  const inp={width:'100%',background:'#1a1a14',border:'1px solid '+BR,color:TX,padding:'8px 12px',borderRadius:6,fontSize:13,outline:'none',fontFamily:'inherit'};
+
+  const handleFile = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    setRunning(true); setError('');
+    setStatus('Reading file...');
+    try {
+      const text = await file.text();
+      const res = await migrateGedcomToSupabase(text, setStatus);
+      setResult(res);
+      setStatus('');
+    } catch (err) {
+      setError(err.message);
+      setStatus('');
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  const handleFromRepo = async () => {
+    setRunning(true); setError('');
+    setStatus('Fetching GEDCOM from repo...');
+    try {
+      const resp = await fetch(GEDCOM_SOURCE_URL + '?t=' + Date.now());
+      if (!resp.ok) throw new Error('Could not fetch GEDCOM file: ' + resp.status);
+      const text = await resp.text();
+      const res = await migrateGedcomToSupabase(text, setStatus);
+      setResult(res);
+      setStatus('');
+    } catch (err) {
+      setError(err.message);
+      setStatus('');
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  if (result) return(
+    <div style={{position:'fixed',inset:0,zIndex:300,display:'flex',alignItems:'center',justifyContent:'center'}}>
+      <div onClick={onDone} style={{position:'absolute',inset:0,background:'rgba(0,0,0,0.7)'}}/>
+      <div style={{position:'relative',background:CD,border:'1px solid '+BR,borderRadius:12,width:Math.min(440,window.innerWidth-32),padding:28,zIndex:301,textAlign:'center'}}>
+        <div style={{fontSize:48,marginBottom:12}}>✓</div>
+        <div style={{fontSize:20,color:GC,fontWeight:300,marginBottom:8}}>Migration Complete</div>
+        <div style={{fontSize:14,color:TX}}>{result.persons} persons, {result.families} families loaded into Supabase</div>
+        <div style={{fontSize:12,color:DM,marginTop:8,marginBottom:20}}>Refresh the page to load from the database.</div>
+        <button onClick={()=>{ onDone(); window.location.reload(); }} style={{background:'rgba(196,163,90,0.15)',border:'1px solid '+GD,color:GC,padding:'10px 24px',borderRadius:6,cursor:'pointer',fontSize:14}}>Reload Page</button>
+      </div>
+    </div>
+  );
+
+  return(
+    <div style={{position:'fixed',inset:0,zIndex:300,display:'flex',alignItems:'center',justifyContent:'center'}}>
+      <div onClick={onCancel} style={{position:'absolute',inset:0,background:'rgba(0,0,0,0.7)'}}/>
+      <div style={{position:'relative',background:CD,border:'1px solid '+BR,borderRadius:12,width:Math.min(480,window.innerWidth-32),padding:28,zIndex:301}}>
+        <div style={{fontSize:20,color:GC,fontWeight:300,marginBottom:4}}>Migrate GEDCOM → Supabase</div>
+        <div style={{fontSize:12,color:DM,marginBottom:20,lineHeight:1.6}}>
+          This will parse a GEDCOM file and load all persons and families into the Supabase database.
+          <strong style={{color:'#c05050'}}> This replaces all existing data in the database.</strong>
+        </div>
+        <div style={{display:'flex',gap:10,marginBottom:16}}>
+          <button onClick={handleFromRepo} disabled={running}
+            style={{flex:1,background:'rgba(196,163,90,0.1)',border:'1px solid '+GD,color:GC,padding:'12px',borderRadius:6,cursor:'pointer',fontSize:13,opacity:running?0.5:1}}>
+            Load from repo<br/><span style={{fontSize:10,color:DM}}>({GEDCOM_SOURCE_URL})</span>
+          </button>
+          <label style={{flex:1,background:'rgba(107,158,114,0.1)',border:'1px solid '+MC,color:MC,padding:'12px',borderRadius:6,cursor:'pointer',fontSize:13,textAlign:'center',opacity:running?0.5:1}}>
+            Upload .ged file<br/><span style={{fontSize:10,color:DM}}>from your computer</span>
+            <input type="file" accept=".ged,.gedcom" onChange={handleFile} disabled={running} style={{display:'none'}}/>
+          </label>
+        </div>
+        {status && <div style={{fontSize:12,color:MC,marginBottom:12,display:'flex',alignItems:'center',gap:8}}>
+          <div style={{width:12,height:12,border:'2px solid '+BR,borderTopColor:MC,borderRadius:'50%',animation:'spin 0.8s linear infinite',flexShrink:0}}/>
+          {status}
+        </div>}
+        {error && <div style={{fontSize:12,color:'#c05050',marginBottom:12}}>Error: {error}</div>}
+        <div style={{display:'flex',justifyContent:'flex-end'}}>
+          <button onClick={onCancel} disabled={running} style={{background:'transparent',border:'1px solid '+BR,color:DM,padding:'8px 20px',borderRadius:6,cursor:'pointer',fontSize:13}}>Cancel</button>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 /* ───── GEDCOM 5.5.1 EXPORTER ───── */
@@ -983,6 +1486,7 @@ function App(){
   const [msg,setMsg]=useState('');
   const [showAuth,setShowAuth]=useState(false);
   const [showPublish,setShowPublish]=useState(false);
+  const [showMigrate,setShowMigrate]=useState(false);
   const [pendingAction,setPendingAction]=useState(null);
   const [editUser,setEditUser]=useState('');
   const flat=useMemo(()=>tree?flattenAll(tree):[],[tree]);
@@ -997,22 +1501,30 @@ function App(){
     }
   }, []);
 
-  // Load source GEDCOM on mount
+  // Load from Supabase first, fall back to GEDCOM file
   useEffect(()=>{
-    loadSourceGedcom().then(parsed=>{
+    (async()=>{
+      // Try Supabase
+      let parsed = await loadFromSupabase();
+      let source = 'Supabase';
+      // Fallback to GEDCOM file
+      if(!parsed){
+        parsed = await loadSourceGedcom();
+        source = 'GEDCOM file';
+      }
       if(parsed){
         setTree(parsed);
         const s=new Set();
         const add=(n,d)=>{if(d<2&&n.ch?.length){s.add(n.id);n.ch.forEach(c=>add(c,d+1))}};
         add(parsed,0);
         setExp(s);
-        setMsg('Loaded '+cnt(parsed)+' people from source');
+        setMsg('Loaded '+cnt(parsed)+' people from '+source);
         setTimeout(()=>setMsg(''),3000);
       } else {
-        setMsg('Failed to load source GEDCOM');
+        setMsg('Failed to load family tree');
       }
       setLoading(false);
-    });
+    })();
   },[]);
 
   const findNodeById=useCallback((root,id)=>{
@@ -1082,11 +1594,14 @@ function App(){
       return next;
     });
     setEditing(null);
-    setTimeout(()=>{
-      const latest=findNodeById({...tree},updatedNodeId) || flat.find(n=>n.id===updatedNodeId);
-      revealNode(updatedNodeId,{select:false});
-    },0);
-    setMsg('Saved!');
+    // Save to Supabase
+    savePerson(data, editUser||editSessionUser).then(()=>{
+      setMsg('Saved to database!');
+    }).catch(e=>{
+      console.error('Save error:',e);
+      setMsg('Saved locally (DB sync failed)');
+    });
+    setTimeout(()=>{revealNode(updatedNodeId,{select:false})},0);
     setTimeout(()=>setMsg(''),2000);
   };
 
@@ -1096,8 +1611,14 @@ function App(){
     setTree(prev=>updateNode(prev,parentId,p=>({...p,ch:[...(p.ch||[]),newNode]})));
     setAdding(null);
     setSel(newNode);
+    // Save to Supabase
+    addPersonToDB(data, parentId, editUser||editSessionUser).then(()=>{
+      setMsg('Added to database!');
+    }).catch(e=>{
+      console.error('Add error:',e);
+      setMsg('Added locally (DB sync failed)');
+    });
     setTimeout(()=>revealNode(newNode.id,{select:false}),0);
-    setMsg('Member added!');
     setTimeout(()=>setMsg(''),2000);
   };
 
@@ -1116,19 +1637,31 @@ function App(){
     if(editing?.id===id)setEditing(null);
     if(adding===id)setAdding(null);
     setExp(p=>{const s=new Set(p); s.delete(id); return s;});
-    setTimeout(()=>{
-      if(parentId) revealNode(parentId,{select:true});
-    },0);
-    setMsg('Deleted');
+    // Delete from Supabase
+    deletePersonFromDB(id, editUser||editSessionUser).then(()=>{
+      setMsg('Deleted from database');
+    }).catch(e=>{
+      console.error('Delete error:',e);
+      setMsg('Deleted locally (DB sync failed)');
+    });
+    setTimeout(()=>{if(parentId) revealNode(parentId,{select:true})},0);
     setTimeout(()=>setMsg(''),2000);
   };
 
   const handleSaveSpouse=(data)=>{
     if(!spouseEditing?.parentId)return;
     const parentId=spouseEditing.parentId;
-    setTree(prev=>updateNode(prev,parentId,(existing)=>({...existing,sp:{...(existing.sp||{}),...data,id:(existing.sp&&existing.sp.id)||data.id||('@sp_'+Date.now()+'@')}})));
+    const spouseId=(spouseEditing.spouse&&spouseEditing.spouse.id)||data.id||('@sp_'+Date.now()+'@');
+    const spouseData={...data, id:spouseId};
+    setTree(prev=>updateNode(prev,parentId,(existing)=>({...existing,sp:{...(existing.sp||{}),...spouseData}})));
     setSpouseEditing(null);
-    setMsg('Spouse saved!');
+    // Save to Supabase
+    saveSpouseToDB(parentId, spouseData, editUser||editSessionUser).then(()=>{
+      setMsg('Spouse saved to database!');
+    }).catch(e=>{
+      console.error('Spouse save error:',e);
+      setMsg('Spouse saved locally (DB sync failed)');
+    });
     setTimeout(()=>setMsg(''),2000);
   };
 
@@ -1139,9 +1672,16 @@ function App(){
       setTimeout(()=>setMsg(''),2000);
       return;
     }
+    const spouseId=parent.sp.id;
     if(!confirm(`Delete spouse ${parent.sp.dn||'record'}?`))return;
     setTree(prev=>updateNode(prev,parentId,(existing)=>({...existing,sp:null})));
     if(spouseEditing?.parentId===parentId)setSpouseEditing(null);
+    // Delete from Supabase
+    if(spouseId){
+      deleteSpouseFromDB(parentId, spouseId, editUser||editSessionUser).catch(e=>{
+        console.error('Spouse delete error:',e);
+      });
+    }
     setMsg('Spouse deleted');
     setTimeout(()=>setMsg(''),2000);
   };
@@ -1198,6 +1738,7 @@ function App(){
             <button onClick={()=>{downloadGedcom(tree);setMsg('GEDCOM exported!')}} style={{...btnS,background:'rgba(196,163,90,0.1)',borderColor:GD,color:GC}}>⬇ Export GEDCOM</button>
             <button onClick={()=>triggerImportGedcom((newTree,fileName)=>{setTree(newTree);setMsg('Imported: '+fileName);expandTo(2)})} style={{...btnS,background:'rgba(107,158,114,0.1)',borderColor:MC,color:MC}}>⬆ Import GEDCOM</button>
             {editSessionActive&&<button onClick={()=>setShowPublish(true)} style={{...btnS,background:'rgba(155,130,196,0.1)',borderColor:FC,color:FC}}>📤 Publish to Source</button>}
+            {editSessionActive&&<button onClick={()=>setShowMigrate(true)} style={{...btnS,background:'rgba(196,163,90,0.06)',borderColor:'rgba(196,163,90,0.3)',color:GD}}>🗄 Migrate GEDCOM→DB</button>}
           </div>
         </div>
       </div>
@@ -1210,11 +1751,12 @@ function App(){
       {adding&&<EditForm node={empty()} onSave={handleAdd} onCancel={()=>setAdding(null)} isNew={true} parentId={adding} parentName={flat.find(n=>n.id===adding)?._n}/>}
       {showAuth&&<PasswordGate onSuccess={(name)=>{setShowAuth(false);setEditUser(name);setMsg('Edit mode: '+name);setTimeout(()=>setMsg(''),3000);if(pendingAction){pendingAction();setPendingAction(null)}}} onCancel={()=>{setShowAuth(false);setPendingAction(null)}}/>}
       {showPublish&&<GitHubPublishDialog tree={tree} editUser={editUser||editSessionUser} onDone={()=>{setShowPublish(false);setMsg('Published to source!')}} onCancel={()=>setShowPublish(false)}/>}
+      {showMigrate&&<MigrateDialog onDone={()=>setShowMigrate(false)} onCancel={()=>setShowMigrate(false)}/>}
       {editSessionActive&&<div style={{position:'fixed',bottom:16,right:16,background:CD,border:'1px solid '+BR,borderRadius:8,padding:'8px 14px',fontSize:11,color:DM,zIndex:80,display:'flex',alignItems:'center',gap:8}}>
         <span style={{width:6,height:6,borderRadius:'50%',background:MC}}/>
         <span>Editing as <strong style={{color:TX}}>{editUser||editSessionUser}</strong></span>
         <span style={{color:GD}}>·</span>
-        <span>Export GEDCOM or Publish to Source to save</span>
+        <span>Export GEDCOM or edit — changes save to database automatically</span>
       </div>}
     </div>
   );
