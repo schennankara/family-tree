@@ -1421,7 +1421,18 @@ function App(){
   const matches=useMemo(()=>{
     if(search.length<2)return[];
     const q=search.toLowerCase();
-    return flat.filter(n=>(n.dn||'').toLowerCase().includes(q)||(n.nk||'').toLowerCase().includes(q)||(n.sp?.dn||'').toLowerCase().includes(q)).slice(0,12);
+    const results=[];
+    flat.forEach(n=>{
+      // Match on person name or nickname
+      if((n.dn||'').toLowerCase().includes(q)||(n.nk||'').toLowerCase().includes(q)){
+        results.push({...n, _matchType:'person'});
+      }
+      // Match on spouse name - show spouse as a separate result pointing to this node
+      if(n.sp?.dn && (n.sp.dn||'').toLowerCase().includes(q)){
+        results.push({...n, _n: n.sp.dn, _matchType:'spouse', _spouseOf: n.dn, g: n.sp.g || 'F'});
+      }
+    });
+    return results.slice(0,15);
   },[search,flat]);
 
   const revealNode=useCallback((nodeId,opts={})=>{
@@ -1582,11 +1593,12 @@ function App(){
                 style={{width:'100%',background:CD,border:`1px solid ${BR}`,color:TX,padding:'7px 12px',borderRadius:6,fontSize:13,outline:'none'}}/>
               {matches.length>0&&<div style={{position:'absolute',top:'100%',left:0,right:0,background:CD,border:`1px solid rgba(196,163,90,0.25)`,
                 borderTop:'none',borderRadius:'0 0 6px 6px',maxHeight:280,overflowY:'auto',zIndex:60}}>
-                {matches.map(m=><div key={m.id} onClick={()=>navigateTo(m)}
+                {matches.map((m,mi)=><div key={m.id+'_'+mi} onClick={()=>navigateTo(m)}
                   style={{padding:'6px 12px',cursor:'pointer',fontSize:13,display:'flex',alignItems:'center',gap:6}}
                   onMouseEnter={e=>e.currentTarget.style.background='rgba(255,255,255,0.04)'}
                   onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
                   <span style={{width:6,height:6,borderRadius:'50%',background:m.g==='M'?MC:FC}}/><span>{m._n}</span>
+                  {m._matchType==='spouse'&&<span style={{fontSize:10,color:DM,fontStyle:'italic'}}>⚭ spouse of {m._spouseOf}</span>}
                 </div>)}
               </div>}
             </div>
