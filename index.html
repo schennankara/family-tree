@@ -1080,67 +1080,516 @@ const flattenAll=(n,p='')=>{const arr=[];const nm=n.dn||'?';const fp=p?p+' › '
 const cnt=n=>{if(!n)return 0;let c=1+(n.sp?1:0);(n.ch||[]).forEach(x=>{c+=cnt(x)});return c};
 const findPath=(r,id,p=[])=>{if(r.id===id)return[...p,r];for(const c of r.ch||[]){const res=findPath(c,id,[...p,r]);if(res)return res}return null};
 
-/* ───── PASSWORD GATE FOR EDITING ───── */
-// SHA-256 hash of the edit password. Change this by running:
-//   crypto.subtle.digest('SHA-256', new TextEncoder().encode('YOUR_PASSWORD'))
-// Default password: "chennamkara2026"
-const EDIT_PASSWORD_HASH = 'a1c4f3b7e6d2f8a9b3c5d7e1f4a6b8c2d9e3f5a7b1c4d6e8f2a5b7c9d1e3f6';
+/* ───── SUPABASE AUTH SYSTEM ───── */
+const SB_AUTH_URL = SUPABASE_URL + '/auth/v1';
 
-let editSessionActive = false;
-let editSessionUser = '';
-
-async function hashPassword(pwd) {
-  const data = new TextEncoder().encode(pwd);
-  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-  return Array.from(new Uint8Array(hashBuffer)).map(b=>b.toString(16).padStart(2,'0')).join('');
+async function sbAuthFetch(path, opts = {}) {
+  const url = SB_AUTH_URL + path;
+  const resp = await fetch(url, {
+    ...opts,
+    headers: { 'apikey': SUPABASE_KEY, 'Content-Type': 'application/json', ...(opts.headers||{}) }
+  });
+  const data = await resp.json();
+  if (!resp.ok) throw new Error(data.error_description || data.msg || data.message || 'Auth error');
+  return data;
 }
 
-function PasswordGate({onSuccess, onCancel}) {
-  const [pwd, setPwd] = useState('');
-  const [name, setName] = useState('');
-  const [error, setError] = useState('');
-  const inp={width:'100%',background:'#1a1a14',border:'1px solid '+BR,color:TX,padding:'8px 12px',borderRadius:6,fontSize:14,outline:'none',fontFamily:'inherit'};
+// Auth state
+let authSession = null; // { access_token, user: {id, email} }
+let authUser = null;    // { id, name, email, role, person_id } from users table
 
-  const handleSubmit = async () => {
-    if (!name.trim()) { setError('Please enter your name'); return; }
-    if (!pwd) { setError('Please enter the edit password'); return; }
-    const hash = await hashPassword(pwd);
-    // For now, accept any non-empty password (change to hash check for production)
-    // To lock it down: if (hash !== EDIT_PASSWORD_HASH) { setError('Incorrect password'); return; }
-    if (pwd.toLowerCase() !== 'chennamkara') {
-      setError('Incorrect password. Contact the family admin for access.');
-      return;
+async function signIn(email, password) {
+  const data = await sbAuthFetch('/token?grant_type=password', {
+    method: 'POST',
+    body: JSON.stringify({ email, password })
+  });
+  authSession = data;
+  // Fetch user profile from users table
+  const users = await sbFetch(`users?id=eq.${data.user.id}&select=*`, {
+    headers: { 'Authorization': 'Bearer ' + data.access_token }
+  });
+  authUser = users[0] || null;
+  return { session: data, user: authUser };
+}
+
+async function signOut() {
+  if (authSession?.access_token) {
+    try { await sbAuthFetch('/logout', { method: 'POST', headers: { 'Authorization': 'Bearer ' + authSession.access_token } }); } catch(e) {}
+  }
+  authSession = null;
+  authUser = null;
+}
+
+async function resetPassword(email) {
+  await sbAuthFetch('/recover', {
+    method: 'POST',
+    body: JSON.stringify({ email })
+  });
+}
+
+async function createUserAccount(email, password, name, personId, role) {
+  // Create auth user
+  const data = await sbAuthFetch('/admin/users', {
+    method: 'POST',
+    headers: { 'Authorization': 'Bearer ' + authSession.access_token, 'apikey': SUPABASE_KEY },
+    body: JSON.stringify({ email, password, email_confirm: true })
+  });
+  // Insert into users table
+  await sbFetch('users', {
+    method: 'POST',
+    headers: { 'Authorization': 'Bearer ' + authSession.access_token, 'Prefer': 'return=minimal' },
+    body: JSON.stringify({ id: data.id, name, email, person_id: personId || null, role: role || 'editor' })
+  });
+  return data;
+}
+
+// Override sbFetch to use auth token when available
+const _origSbFetch = sbFetch;
+async function sbAuthenticatedFetch(path, opts = {}) {
+  if (authSession?.access_token) {
+    opts.headers = { ...(opts.headers||{}), 'Authorization': 'Bearer ' + authSession.access_token };
+  }
+  return _origSbFetch(path, opts);
+}
+// Monkey-patch: after auth, use authenticated fetch
+function getHeaders() {
+  const h = { ...SB_HEADERS };
+  if (authSession?.access_token) h['Authorization'] = 'Bearer ' + authSession.access_token;
+  return h;
+}
+
+function canEdit() { return authUser && ['editor','admin','super_admin'].includes(authUser.role); }
+function isAdmin() { return authUser && ['admin','super_admin'].includes(authUser.role); }
+function isSuperAdmin() { return authUser && authUser.role === 'super_admin'; }
+
+function canEditPerson(personId) {
+  if (!authUser) return false;
+  if (isAdmin()) return true;
+  // Editors: check scope later (for now allow, RLS enforces)
+  return authUser.role === 'editor';
+}
+
+/* ───── LOGIN MODAL ───── */
+function LoginModal({onSuccess, onCancel, onRequestAccount}) {
+  const [mode, setMode] = useState('login'); // 'login' | 'forgot' | 'viewer'
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [viewerPwd, setViewerPwd] = useState('');
+  const [error, setError] = useState('');
+  const [info, setInfo] = useState('');
+  const [busy, setBusy] = useState(false);
+  const inp={width:'100%',background:'#1a1a14',border:'1px solid rgba(196,163,90,0.12)',color:'#d4cfc0',padding:'8px 12px',borderRadius:6,fontSize:14,outline:'none',fontFamily:'inherit'};
+
+  const handleLogin = async () => {
+    if (!email || !password) { setError('Enter email and password'); return; }
+    setBusy(true); setError('');
+    try {
+      const result = await signIn(email, password);
+      if (!result.user) {
+        setError('Account not set up. Contact the family admin.');
+        setBusy(false);
+        return;
+      }
+      onSuccess(result.user);
+    } catch (e) {
+      setError(e.message || 'Login failed');
     }
-    editSessionActive = true;
-    editSessionUser = name.trim();
-    onSuccess(name.trim());
+    setBusy(false);
+  };
+
+  const handleForgot = async () => {
+    if (!email) { setError('Enter your email first'); return; }
+    setBusy(true); setError('');
+    try {
+      await resetPassword(email);
+      setInfo('Password reset email sent! Check your inbox.');
+    } catch (e) { setError(e.message); }
+    setBusy(false);
+  };
+
+  const handleViewer = async () => {
+    if (!viewerPwd) { setError('Enter the family password'); return; }
+    setBusy(true); setError('');
+    try {
+      const settings = await sbFetch("settings?key=eq.viewer_password&select=value");
+      if (settings[0]?.value === viewerPwd) {
+        onSuccess({ role: 'viewer', name: 'Viewer' });
+      } else {
+        setError('Incorrect family password');
+      }
+    } catch (e) { setError('Could not verify password'); }
+    setBusy(false);
   };
 
   return(
     <div style={{position:'fixed',inset:0,zIndex:300,display:'flex',alignItems:'center',justifyContent:'center'}}>
-      <div onClick={onCancel} style={{position:'absolute',inset:0,background:'rgba(0,0,0,0.7)'}}/>
-      <div style={{position:'relative',background:CD,border:'1px solid '+BR,borderRadius:12,width:Math.min(400,window.innerWidth-32),padding:28,zIndex:301}}>
-        <div style={{fontSize:20,color:GC,fontWeight:300,marginBottom:4}}>Edit Access</div>
-        <div style={{fontSize:12,color:DM,marginBottom:20,lineHeight:1.6}}>
-          Editing is password-protected. Enter your name and the family edit password to make changes.
-          Your edits will be local to this session — export the GEDCOM file and send to the admin to update the source.
+      <div style={{position:'absolute',inset:0,background:'rgba(0,0,0,0.8)'}}/>
+      <div style={{position:'relative',background:'#141410',border:'1px solid rgba(196,163,90,0.12)',borderRadius:12,width:Math.min(400,window.innerWidth-32),padding:28,zIndex:301}}>
+        <div style={{textAlign:'center',marginBottom:20}}>
+          <div style={{fontSize:28,color:'#c4a35a',fontWeight:300,letterSpacing:1}}>Chennamkara</div>
+          <div style={{fontSize:11,color:'#7a7568',letterSpacing:3,textTransform:'uppercase'}}>Family Tree</div>
+        </div>
+
+        {mode==='login'&&<>
+          <div style={{marginBottom:12}}>
+            <label style={{fontSize:11,color:'#7a7568',display:'block',marginBottom:3}}>Email</label>
+            <input value={email} onChange={e=>{setEmail(e.target.value);setError('')}} placeholder="your@email.com" style={inp}
+              onKeyDown={e=>{if(e.key==='Enter')handleLogin()}}/>
+          </div>
+          <div style={{marginBottom:16}}>
+            <label style={{fontSize:11,color:'#7a7568',display:'block',marginBottom:3}}>Password</label>
+            <input type="password" value={password} onChange={e=>{setPassword(e.target.value);setError('')}} placeholder="Enter password" style={inp}
+              onKeyDown={e=>{if(e.key==='Enter')handleLogin()}}/>
+          </div>
+          {error&&<div style={{fontSize:12,color:'#c05050',marginBottom:12}}>{error}</div>}
+          <button onClick={handleLogin} disabled={busy} style={{width:'100%',background:'rgba(196,163,90,0.15)',border:'1px solid #8a7340',color:'#c4a35a',padding:'10px',borderRadius:6,cursor:'pointer',fontSize:14,marginBottom:12}}>
+            {busy?'Signing in...':'Sign In'}
+          </button>
+          <div style={{display:'flex',justifyContent:'space-between',fontSize:12}}>
+            <span onClick={()=>{setMode('forgot');setError('')}} style={{color:'#7a7568',cursor:'pointer',textDecoration:'underline'}}>Forgot password?</span>
+            <span onClick={onRequestAccount} style={{color:'#9b82c4',cursor:'pointer',textDecoration:'underline'}}>Request account</span>
+          </div>
+          <div style={{borderTop:'1px solid rgba(196,163,90,0.08)',marginTop:16,paddingTop:16,textAlign:'center'}}>
+            <span style={{fontSize:12,color:'#7a7568'}}>Just browsing? </span>
+            <span onClick={()=>{setMode('viewer');setError('')}} style={{fontSize:12,color:'#c4a35a',cursor:'pointer',textDecoration:'underline'}}>View with family password</span>
+          </div>
+        </>}
+
+        {mode==='forgot'&&<>
+          <div style={{fontSize:14,color:'#d4cfc0',marginBottom:12}}>Enter your email to receive a password reset link.</div>
+          <div style={{marginBottom:16}}>
+            <input value={email} onChange={e=>{setEmail(e.target.value);setError('');setInfo('')}} placeholder="your@email.com" style={inp}/>
+          </div>
+          {error&&<div style={{fontSize:12,color:'#c05050',marginBottom:12}}>{error}</div>}
+          {info&&<div style={{fontSize:12,color:'#6b9e72',marginBottom:12}}>{info}</div>}
+          <button onClick={handleForgot} disabled={busy} style={{width:'100%',background:'rgba(107,158,114,0.15)',border:'1px solid #6b9e72',color:'#6b9e72',padding:'10px',borderRadius:6,cursor:'pointer',fontSize:14,marginBottom:12}}>
+            {busy?'Sending...':'Send Reset Email'}
+          </button>
+          <span onClick={()=>{setMode('login');setError('');setInfo('')}} style={{fontSize:12,color:'#7a7568',cursor:'pointer',textDecoration:'underline'}}>Back to sign in</span>
+        </>}
+
+        {mode==='viewer'&&<>
+          <div style={{fontSize:14,color:'#d4cfc0',marginBottom:12}}>Enter the family password to view the tree.</div>
+          <div style={{marginBottom:16}}>
+            <input type="password" value={viewerPwd} onChange={e=>{setViewerPwd(e.target.value);setError('')}} placeholder="Family password" style={inp}
+              onKeyDown={e=>{if(e.key==='Enter')handleViewer()}}/>
+          </div>
+          {error&&<div style={{fontSize:12,color:'#c05050',marginBottom:12}}>{error}</div>}
+          <button onClick={handleViewer} disabled={busy} style={{width:'100%',background:'rgba(196,163,90,0.15)',border:'1px solid #8a7340',color:'#c4a35a',padding:'10px',borderRadius:6,cursor:'pointer',fontSize:14,marginBottom:12}}>
+            {busy?'Checking...':'View Tree'}
+          </button>
+          <span onClick={()=>{setMode('login');setError('')}} style={{fontSize:12,color:'#7a7568',cursor:'pointer',textDecoration:'underline'}}>Back to sign in</span>
+        </>}
+
+        {onCancel&&<div style={{textAlign:'center',marginTop:12}}>
+          <span onClick={onCancel} style={{fontSize:12,color:'#7a7568',cursor:'pointer'}}>Cancel</span>
+        </div>}
+      </div>
+    </div>
+  );
+}
+
+/* ───── REQUEST ACCOUNT MODAL ───── */
+function RequestAccountModal({flat, onDone, onCancel}) {
+  const [name, setName] = useState('');
+  const [email, setEmail] = useState('');
+  const [phone, setPhone] = useState('');
+  const [personSearch, setPersonSearch] = useState('');
+  const [selectedPerson, setSelectedPerson] = useState(null);
+  const [error, setError] = useState('');
+  const [done, setDone] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const inp={width:'100%',background:'#1a1a14',border:'1px solid rgba(196,163,90,0.12)',color:'#d4cfc0',padding:'8px 12px',borderRadius:6,fontSize:14,outline:'none',fontFamily:'inherit'};
+
+  const personMatches = useMemo(()=>{
+    if(personSearch.length<2)return[];
+    const q=personSearch.toLowerCase();
+    return flat.filter(n=>(n.dn||'').toLowerCase().includes(q)||(n.nk||'').toLowerCase().includes(q)).slice(0,8);
+  },[personSearch,flat]);
+
+  const handleSubmit = async () => {
+    if (!name.trim()) { setError('Enter your name'); return; }
+    if (!email.trim()) { setError('Enter your email'); return; }
+    if (!selectedPerson) { setError('Please identify yourself in the tree'); return; }
+    setBusy(true); setError('');
+    try {
+      await sbFetch('access_requests', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: name.trim(), email: email.trim(), phone: phone.trim(),
+          person_id: selectedPerson.id, person_name: selectedPerson.dn,
+          status: 'pending'
+        }),
+        headers: { 'Prefer': 'return=minimal' }
+      });
+      setDone(true);
+    } catch (e) { setError(e.message); }
+    setBusy(false);
+  };
+
+  if (done) return(
+    <div style={{position:'fixed',inset:0,zIndex:300,display:'flex',alignItems:'center',justifyContent:'center'}}>
+      <div style={{position:'absolute',inset:0,background:'rgba(0,0,0,0.8)'}}/>
+      <div style={{position:'relative',background:'#141410',border:'1px solid rgba(196,163,90,0.12)',borderRadius:12,width:Math.min(400,window.innerWidth-32),padding:28,zIndex:301,textAlign:'center'}}>
+        <div style={{fontSize:48,marginBottom:12}}>✓</div>
+        <div style={{fontSize:18,color:'#c4a35a',marginBottom:8}}>Request Submitted</div>
+        <div style={{fontSize:13,color:'#7a7568',lineHeight:1.6,marginBottom:20}}>A family admin will review your request and you'll receive an email at {email} once approved.</div>
+        <button onClick={onDone} style={{background:'rgba(196,163,90,0.15)',border:'1px solid #8a7340',color:'#c4a35a',padding:'10px 24px',borderRadius:6,cursor:'pointer'}}>Done</button>
+      </div>
+    </div>
+  );
+
+  return(
+    <div style={{position:'fixed',inset:0,zIndex:300,display:'flex',alignItems:'center',justifyContent:'center'}}>
+      <div onClick={onCancel} style={{position:'absolute',inset:0,background:'rgba(0,0,0,0.8)'}}/>
+      <div style={{position:'relative',background:'#141410',border:'1px solid rgba(196,163,90,0.12)',borderRadius:12,width:Math.min(440,window.innerWidth-32),padding:28,zIndex:301}}>
+        <div style={{fontSize:20,color:'#c4a35a',fontWeight:300,marginBottom:4}}>Request Edit Access</div>
+        <div style={{fontSize:12,color:'#7a7568',marginBottom:20,lineHeight:1.6}}>
+          Identify yourself in the family tree and provide your contact info. An admin will review your request.
         </div>
         <div style={{marginBottom:12}}>
-          <label style={{fontSize:11,color:DM,display:'block',marginBottom:3}}>Your Name</label>
-          <input value={name} onChange={e=>setName(e.target.value)} placeholder="e.g. Steve Chennankara" style={inp}
-            onKeyDown={e=>{if(e.key==='Enter')handleSubmit()}}/>
+          <label style={{fontSize:11,color:'#7a7568',display:'block',marginBottom:3}}>Your Name</label>
+          <input value={name} onChange={e=>setName(e.target.value)} placeholder="Full name" style={inp}/>
         </div>
-        <div style={{marginBottom:16}}>
-          <label style={{fontSize:11,color:DM,display:'block',marginBottom:3}}>Edit Password</label>
-          <input type="password" value={pwd} onChange={e=>{setPwd(e.target.value);setError('')}} placeholder="Enter password" style={inp}
-            onKeyDown={e=>{if(e.key==='Enter')handleSubmit()}}/>
+        <div style={{marginBottom:12}}>
+          <label style={{fontSize:11,color:'#7a7568',display:'block',marginBottom:3}}>Email</label>
+          <input value={email} onChange={e=>setEmail(e.target.value)} placeholder="your@email.com" style={inp}/>
         </div>
-        {error && <div style={{fontSize:12,color:'#c05050',marginBottom:12}}>{error}</div>}
+        <div style={{marginBottom:12}}>
+          <label style={{fontSize:11,color:'#7a7568',display:'block',marginBottom:3}}>Phone (optional)</label>
+          <input value={phone} onChange={e=>setPhone(e.target.value)} placeholder="+1 234 567 8900" style={inp}/>
+        </div>
+        <div style={{marginBottom:16,position:'relative'}}>
+          <label style={{fontSize:11,color:'#7a7568',display:'block',marginBottom:3}}>Find yourself in the tree</label>
+          {selectedPerson?
+            <div style={{display:'flex',alignItems:'center',gap:8,padding:'8px 12px',background:'rgba(107,158,114,0.08)',border:'1px solid #6b9e72',borderRadius:6}}>
+              <span style={{width:6,height:6,borderRadius:'50%',background:selectedPerson.g==='M'?'#6b9e72':'#9b82c4'}}/>
+              <span style={{color:'#d4cfc0',fontSize:14}}>{selectedPerson.dn}</span>
+              <span onClick={()=>{setSelectedPerson(null);setPersonSearch('')}} style={{marginLeft:'auto',color:'#7a7568',cursor:'pointer',fontSize:12}}>✕ Change</span>
+            </div>
+          :
+            <>
+              <input value={personSearch} onChange={e=>setPersonSearch(e.target.value)} placeholder="Search by name..." style={inp}/>
+              {personMatches.length>0&&<div style={{position:'absolute',top:'100%',left:0,right:0,background:'#141410',border:'1px solid rgba(196,163,90,0.25)',borderRadius:'0 0 6px 6px',maxHeight:200,overflowY:'auto',zIndex:10}}>
+                {personMatches.map(m=><div key={m.id} onClick={()=>{setSelectedPerson(m);setPersonSearch('')}}
+                  style={{padding:'6px 12px',cursor:'pointer',fontSize:13,display:'flex',alignItems:'center',gap:6}}
+                  onMouseEnter={e=>e.currentTarget.style.background='rgba(255,255,255,0.04)'}
+                  onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
+                  <span style={{width:6,height:6,borderRadius:'50%',background:m.g==='M'?'#6b9e72':'#9b82c4'}}/><span>{m.dn}</span>
+                </div>)}
+              </div>}
+            </>
+          }
+        </div>
+        {error&&<div style={{fontSize:12,color:'#c05050',marginBottom:12}}>{error}</div>}
         <div style={{display:'flex',gap:8,justifyContent:'flex-end'}}>
-          <button onClick={onCancel} style={{background:'transparent',border:'1px solid '+BR,color:DM,padding:'8px 20px',borderRadius:6,cursor:'pointer',fontSize:13}}>Cancel</button>
-          <button onClick={handleSubmit} style={{background:'rgba(196,163,90,0.15)',border:'1px solid '+GD,color:GC,padding:'8px 20px',borderRadius:6,cursor:'pointer',fontSize:13}}>Unlock Editing</button>
+          <button onClick={onCancel} style={{background:'transparent',border:'1px solid rgba(196,163,90,0.12)',color:'#7a7568',padding:'8px 20px',borderRadius:6,cursor:'pointer',fontSize:13}}>Cancel</button>
+          <button onClick={handleSubmit} disabled={busy} style={{background:'rgba(196,163,90,0.15)',border:'1px solid #8a7340',color:'#c4a35a',padding:'8px 20px',borderRadius:6,cursor:'pointer',fontSize:13}}>
+            {busy?'Submitting...':'Submit Request'}
+          </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+/* ───── SUBMIT UPDATE REQUEST (Tier 2 family members) ───── */
+async function submitUpdateRequest(personId, personName, changes, requesterName, requesterEmail) {
+  await sbFetch('update_requests', {
+    method: 'POST',
+    body: JSON.stringify({
+      person_id: personId, person_name: personName,
+      requester_name: requesterName, requester_email: requesterEmail,
+      request_type: 'update', changes, status: 'pending'
+    }),
+    headers: { 'Prefer': 'return=minimal' }
+  });
+}
+
+/* ───── ADMIN PANEL ───── */
+function AdminPanel({onClose}) {
+  const [tab, setTab] = useState('updates'); // 'updates' | 'accounts' | 'users' | 'log'
+  const [updateReqs, setUpdateReqs] = useState([]);
+  const [accessReqs, setAccessReqs] = useState([]);
+  const [allUsers, setAllUsers] = useState([]);
+  const [editLog, setEditLog] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [actionMsg, setActionMsg] = useState('');
+  const btnS2={background:'rgba(196,163,90,0.08)',border:'1px solid rgba(196,163,90,0.2)',color:'#c4a35a',padding:'6px 14px',borderRadius:5,fontSize:12,cursor:'pointer'};
+
+  useEffect(()=>{
+    (async()=>{
+      try {
+        const h = { 'Authorization': 'Bearer ' + authSession.access_token };
+        const [ur, ar, us, el] = await Promise.all([
+          sbFetch('update_requests?order=created_at.desc&limit=50', {headers:h}),
+          sbFetch('access_requests?order=created_at.desc&limit=50', {headers:h}),
+          sbFetch('users?order=name', {headers:h}),
+          sbFetch('edit_log?order=created_at.desc&limit=50', {headers:h}),
+        ]);
+        setUpdateReqs(ur); setAccessReqs(ar); setAllUsers(us); setEditLog(el);
+      } catch(e) { console.error('Admin load error:', e); }
+      setLoading(false);
+    })();
+  },[]);
+
+  const approveUpdate = async (req) => {
+    try {
+      const h = { 'Authorization': 'Bearer ' + authSession.access_token };
+      // Apply changes to persons table
+      await sbFetch(`persons?id=eq.${req.person_id}`, {
+        method: 'PATCH', headers: {...h, 'Prefer':'return=minimal'},
+        body: JSON.stringify(req.changes)
+      });
+      // Mark request as approved
+      await sbFetch(`update_requests?id=eq.${req.id}`, {
+        method: 'PATCH', headers: h,
+        body: JSON.stringify({ status: 'approved', resolved_by: authUser.id, resolved_at: new Date().toISOString() })
+      });
+      setUpdateReqs(prev=>prev.map(r=>r.id===req.id?{...r,status:'approved'}:r));
+      setActionMsg('Update approved and applied!');
+      setTimeout(()=>setActionMsg(''),3000);
+    } catch(e) { setActionMsg('Error: ' + e.message); }
+  };
+
+  const rejectUpdate = async (req, reason) => {
+    try {
+      const h = { 'Authorization': 'Bearer ' + authSession.access_token };
+      await sbFetch(`update_requests?id=eq.${req.id}`, {
+        method: 'PATCH', headers: h,
+        body: JSON.stringify({ status: 'rejected', admin_response: reason||'', resolved_by: authUser.id, resolved_at: new Date().toISOString() })
+      });
+      setUpdateReqs(prev=>prev.map(r=>r.id===req.id?{...r,status:'rejected'}:r));
+      setActionMsg('Request rejected');
+      setTimeout(()=>setActionMsg(''),3000);
+    } catch(e) { setActionMsg('Error: ' + e.message); }
+  };
+
+  const approveAccess = async (req) => {
+    try {
+      const h = { 'Authorization': 'Bearer ' + authSession.access_token };
+      // Mark as approved (admin creates account separately via Supabase dashboard for now)
+      await sbFetch(`access_requests?id=eq.${req.id}`, {
+        method: 'PATCH', headers: h,
+        body: JSON.stringify({ status: 'approved', resolved_by: authUser.id, resolved_at: new Date().toISOString() })
+      });
+      setAccessReqs(prev=>prev.map(r=>r.id===req.id?{...r,status:'approved'}:r));
+      setActionMsg('Access request approved! Create their account in Supabase Auth dashboard.');
+      setTimeout(()=>setActionMsg(''),5000);
+    } catch(e) { setActionMsg('Error: ' + e.message); }
+  };
+
+  const changeUserRole = async (userId, newRole) => {
+    try {
+      const h = { 'Authorization': 'Bearer ' + authSession.access_token };
+      await sbFetch(`users?id=eq.${userId}`, {
+        method: 'PATCH', headers: h,
+        body: JSON.stringify({ role: newRole })
+      });
+      setAllUsers(prev=>prev.map(u=>u.id===userId?{...u,role:newRole}:u));
+      setActionMsg('Role updated!');
+      setTimeout(()=>setActionMsg(''),3000);
+    } catch(e) { setActionMsg('Error: ' + e.message); }
+  };
+
+  const statusBadge = (s) => {
+    const colors = {pending:'#c4a35a',approved:'#6b9e72',rejected:'#c05050',clarification:'#9b82c4'};
+    return <span style={{fontSize:10,background:colors[s]+'22',color:colors[s],padding:'2px 8px',borderRadius:10,textTransform:'uppercase',letterSpacing:1}}>{s}</span>;
+  };
+
+  const tabBtn = (id,label,count) => (
+    <button key={id} onClick={()=>setTab(id)} style={{
+      background:tab===id?'rgba(196,163,90,0.12)':'transparent',
+      border:tab===id?'1px solid #8a7340':'1px solid transparent',
+      color:tab===id?'#c4a35a':'#7a7568',padding:'6px 14px',borderRadius:5,fontSize:12,cursor:'pointer'
+    }}>{label}{count>0&&<span style={{marginLeft:4,fontSize:10,background:'#c4a35a22',color:'#c4a35a',padding:'1px 6px',borderRadius:8}}>{count}</span>}</button>
+  );
+
+  const pendingUpdates = updateReqs.filter(r=>r.status==='pending').length;
+  const pendingAccess = accessReqs.filter(r=>r.status==='pending').length;
+
+  return(
+    <div style={{maxWidth:1200,margin:'0 auto',padding:'0 16px 60px'}}>
+      <div style={{display:'flex',gap:8,marginBottom:16,flexWrap:'wrap',alignItems:'center'}}>
+        {tabBtn('updates','Update Requests',pendingUpdates)}
+        {tabBtn('accounts','Account Requests',pendingAccess)}
+        {isSuperAdmin()&&tabBtn('users','Manage Users',0)}
+        {tabBtn('log','Edit Log',0)}
+        {actionMsg&&<span style={{fontSize:12,color:'#6b9e72',marginLeft:16}}>{actionMsg}</span>}
+      </div>
+
+      {loading&&<div style={{color:'#7a7568',fontSize:13}}>Loading...</div>}
+
+      {!loading&&tab==='updates'&&<div>
+        {updateReqs.length===0&&<div style={{color:'#7a7568',fontSize:13}}>No update requests yet.</div>}
+        {updateReqs.map(r=><div key={r.id} style={{background:'#141410',border:'1px solid rgba(196,163,90,0.08)',borderRadius:8,padding:16,marginBottom:8}}>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
+            <div>
+              <span style={{color:'#d4cfc0',fontSize:14,fontWeight:500}}>{r.person_name||r.person_id}</span>
+              <span style={{color:'#7a7568',fontSize:12,marginLeft:8}}>by {r.requester_name} ({r.requester_email})</span>
+            </div>
+            {statusBadge(r.status)}
+          </div>
+          <div style={{fontSize:12,color:'#7a7568',marginBottom:8}}>{new Date(r.created_at).toLocaleString()}</div>
+          {r.changes&&<div style={{fontSize:12,color:'#d4cfc0',background:'#0a0a08',padding:8,borderRadius:4,marginBottom:8,maxHeight:150,overflowY:'auto'}}>
+            {Object.entries(r.changes).filter(([k,v])=>v).map(([k,v])=><div key={k}><strong style={{color:'#8a7340'}}>{k}:</strong> {String(v)}</div>)}
+          </div>}
+          {r.status==='pending'&&<div style={{display:'flex',gap:8}}>
+            <button onClick={()=>approveUpdate(r)} style={{...btnS2,borderColor:'#6b9e72',color:'#6b9e72'}}>✓ Approve</button>
+            <button onClick={()=>{const reason=prompt('Reason for rejection (optional):');rejectUpdate(r,reason)}} style={{...btnS2,borderColor:'#c05050',color:'#c05050'}}>✕ Reject</button>
+            <a href={`mailto:${r.requester_email}?subject=About your family tree update request&body=Hi ${r.requester_name},%0A%0ARegarding your update request for ${r.person_name}:%0A%0A`}
+              style={{...btnS2,borderColor:'#9b82c4',color:'#9b82c4',textDecoration:'none'}}>✉ Reply</a>
+          </div>}
+        </div>)}
+      </div>}
+
+      {!loading&&tab==='accounts'&&<div>
+        {accessReqs.length===0&&<div style={{color:'#7a7568',fontSize:13}}>No account requests yet.</div>}
+        {accessReqs.map(r=><div key={r.id} style={{background:'#141410',border:'1px solid rgba(196,163,90,0.08)',borderRadius:8,padding:16,marginBottom:8}}>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
+            <div>
+              <span style={{color:'#d4cfc0',fontSize:14,fontWeight:500}}>{r.name}</span>
+              <span style={{color:'#7a7568',fontSize:12,marginLeft:8}}>claims to be {r.person_name}</span>
+            </div>
+            {statusBadge(r.status)}
+          </div>
+          <div style={{fontSize:12,color:'#7a7568'}}>Email: {r.email}{r.phone&&' · Phone: '+r.phone} · {new Date(r.created_at).toLocaleString()}</div>
+          {r.status==='pending'&&<div style={{display:'flex',gap:8,marginTop:8}}>
+            <button onClick={()=>approveAccess(r)} style={{...btnS2,borderColor:'#6b9e72',color:'#6b9e72'}}>✓ Approve</button>
+            <button onClick={()=>{
+              sbFetch(`access_requests?id=eq.${r.id}`, {
+                method:'PATCH', headers:{'Authorization':'Bearer '+authSession.access_token},
+                body:JSON.stringify({status:'rejected',resolved_by:authUser.id,resolved_at:new Date().toISOString()})
+              }).then(()=>setAccessReqs(prev=>prev.map(x=>x.id===r.id?{...x,status:'rejected'}:x)));
+            }} style={{...btnS2,borderColor:'#c05050',color:'#c05050'}}>✕ Reject</button>
+          </div>}
+        </div>)}
+      </div>}
+
+      {!loading&&tab==='users'&&isSuperAdmin()&&<div>
+        {allUsers.map(u=><div key={u.id} style={{background:'#141410',border:'1px solid rgba(196,163,90,0.08)',borderRadius:8,padding:12,marginBottom:6,display:'flex',alignItems:'center',gap:12}}>
+          <span style={{color:'#d4cfc0',fontSize:14,flex:1}}>{u.name||u.email}</span>
+          <span style={{fontSize:11,color:'#7a7568'}}>{u.email}</span>
+          {u.role==='super_admin'?
+            <span style={{fontSize:11,color:'#c4a35a',padding:'3px 10px',background:'rgba(196,163,90,0.1)',borderRadius:10}}>Super Admin</span>
+          :
+            <select value={u.role} onChange={e=>changeUserRole(u.id,e.target.value)}
+              style={{background:'#0a0a08',border:'1px solid rgba(196,163,90,0.2)',color:'#d4cfc0',padding:'4px 8px',borderRadius:4,fontSize:12}}>
+              <option value="editor">Editor</option>
+              <option value="admin">Admin</option>
+            </select>
+          }
+        </div>)}
+      </div>}
+
+      {!loading&&tab==='log'&&<div>
+        {editLog.length===0&&<div style={{color:'#7a7568',fontSize:13}}>No edits logged yet.</div>}
+        {editLog.map(e=><div key={e.id} style={{fontSize:12,color:'#7a7568',padding:'6px 0',borderBottom:'1px solid rgba(196,163,90,0.05)'}}>
+          <span style={{color:'#8a7340'}}>{e.action}</span> on <span style={{color:'#d4cfc0'}}>{e.person_id||'—'}</span>
+          {e.edited_by&&<span> by {e.edited_by}</span>}
+          <span style={{float:'right'}}>{new Date(e.created_at).toLocaleString()}</span>
+        </div>)}
+      </div>}
     </div>
   );
 }
@@ -1342,21 +1791,45 @@ function App(){
   const [adding,setAdding]=useState(null);
   const [spouseEditing,setSpouseEditing]=useState(null);
   const [msg,setMsg]=useState('');
-  const [showAuth,setShowAuth]=useState(false);
+  const [showLogin,setShowLogin]=useState(false);
+  const [showRequestAccount,setShowRequestAccount]=useState(false);
   const [showMigrate,setShowMigrate]=useState(false);
   const [pendingAction,setPendingAction]=useState(null);
-  const [editUser,setEditUser]=useState('');
+  const [user,setUser]=useState(null); // authUser object or {role:'viewer'}
+  const [activeTab,setActiveTab]=useState('tree'); // 'tree' | 'admin'
   const flat=useMemo(()=>tree?flattenAll(tree):[],[tree]);
 
-  // Gate: if not authenticated, show password prompt, then run the action
+  // Auth gate: require login for edit actions
   const requireAuth = useCallback((action) => {
-    if (editSessionActive) {
+    if (user && canEdit()) {
       action();
+    } else if (user && user.role === 'viewer') {
+      // Viewers can't edit — show message
+      setMsg('Sign in with an account to edit');
+      setTimeout(()=>setMsg(''),3000);
     } else {
       setPendingAction(() => action);
-      setShowAuth(true);
+      setShowLogin(true);
     }
-  }, []);
+  }, [user]);
+
+  const handleLoginSuccess = (u) => {
+    setUser(u);
+    setShowLogin(false);
+    if (u.role !== 'viewer') {
+      setMsg('Signed in as ' + (u.name || u.email));
+    }
+    setTimeout(()=>setMsg(''),3000);
+    if (pendingAction) { pendingAction(); setPendingAction(null); }
+  };
+
+  const handleSignOut = async () => {
+    await signOut();
+    setUser(null);
+    setActiveTab('tree');
+    setMsg('Signed out');
+    setTimeout(()=>setMsg(''),2000);
+  };
 
   // Load from Supabase first, fall back to GEDCOM file
   useEffect(()=>{
@@ -1463,7 +1936,7 @@ function App(){
     });
     setEditing(null);
     // Save to Supabase
-    savePerson(data, editUser||editSessionUser).then(()=>{
+    savePerson(data, user?.name||user?.email||"").then(()=>{
       setMsg('Saved to database!');
     }).catch(e=>{
       console.error('Save error:',e);
@@ -1480,7 +1953,7 @@ function App(){
     setAdding(null);
     setSel(newNode);
     // Save to Supabase
-    addPersonToDB(data, parentId, editUser||editSessionUser).then(()=>{
+    addPersonToDB(data, parentId, user?.name||user?.email||"").then(()=>{
       setMsg('Added to database!');
     }).catch(e=>{
       console.error('Add error:',e);
@@ -1506,7 +1979,7 @@ function App(){
     if(adding===id)setAdding(null);
     setExp(p=>{const s=new Set(p); s.delete(id); return s;});
     // Delete from Supabase
-    deletePersonFromDB(id, editUser||editSessionUser).then(()=>{
+    deletePersonFromDB(id, user?.name||user?.email||"").then(()=>{
       setMsg('Deleted from database');
     }).catch(e=>{
       console.error('Delete error:',e);
@@ -1524,7 +1997,7 @@ function App(){
     setTree(prev=>updateNode(prev,parentId,(existing)=>({...existing,sp:{...(existing.sp||{}),...spouseData}})));
     setSpouseEditing(null);
     // Save to Supabase
-    saveSpouseToDB(parentId, spouseData, editUser||editSessionUser).then(()=>{
+    saveSpouseToDB(parentId, spouseData, user?.name||user?.email||"").then(()=>{
       setMsg('Spouse saved to database!');
     }).catch(e=>{
       console.error('Spouse save error:',e);
@@ -1546,7 +2019,7 @@ function App(){
     if(spouseEditing?.parentId===parentId)setSpouseEditing(null);
     // Delete from Supabase
     if(spouseId){
-      deleteSpouseFromDB(parentId, spouseId, editUser||editSessionUser).catch(e=>{
+      deleteSpouseFromDB(parentId, spouseId, user?.name||user?.email||"").catch(e=>{
         console.error('Spouse delete error:',e);
       });
     }
@@ -1580,9 +2053,24 @@ function App(){
       <div style={{position:'sticky',top:0,zIndex:50,background:`linear-gradient(180deg,${BG} 80%,transparent)`,padding:'16px 16px 24px'}}>
         <div style={{maxWidth:1200,margin:'0 auto'}}>
           <div style={{display:'flex',alignItems:'baseline',gap:12,marginBottom:4}}>
-            <span style={{fontSize:28,color:GC,fontWeight:300,letterSpacing:1}}>Chennamkara</span>
+            <span style={{fontSize:28,color:GC,fontWeight:300,letterSpacing:1,cursor:'pointer'}} onClick={()=>setActiveTab('tree')}>Chennamkara</span>
             <span style={{fontSize:11,color:DM,letterSpacing:3,textTransform:'uppercase'}}>Family Tree</span>
-            {msg&&<span style={{fontSize:12,color:'#6b9e72',marginLeft:16,animation:'fadeIn 0.3s'}}>{msg}</span>}
+            {user&&isAdmin()&&<>
+              <span onClick={()=>setActiveTab('tree')} style={{fontSize:12,color:activeTab==='tree'?GC:DM,cursor:'pointer',padding:'2px 8px',borderRadius:4,background:activeTab==='tree'?'rgba(196,163,90,0.1)':'transparent'}}>🌳 Tree</span>
+              <span onClick={()=>setActiveTab('admin')} style={{fontSize:12,color:activeTab==='admin'?GC:DM,cursor:'pointer',padding:'2px 8px',borderRadius:4,background:activeTab==='admin'?'rgba(196,163,90,0.1)':'transparent'}}>👤 Admin</span>
+            </>}
+            <span style={{flex:1}}/>
+            {user?
+              <span style={{display:'flex',alignItems:'center',gap:8,fontSize:12}}>
+                <span style={{width:6,height:6,borderRadius:'50%',background:user.role==='viewer'?DM:MC}}/>
+                <span style={{color:TX}}>{user.name||user.email||'Viewer'}</span>
+                <span style={{fontSize:10,color:DM,textTransform:'uppercase'}}>{user.role==='viewer'?'viewing':user.role}</span>
+                {user.role!=='viewer'&&<span onClick={handleSignOut} style={{color:DM,cursor:'pointer',textDecoration:'underline',marginLeft:4}}>Sign out</span>}
+              </span>
+            :
+              <span onClick={()=>setShowLogin(true)} style={{fontSize:12,color:GC,cursor:'pointer',padding:'4px 12px',border:'1px solid '+GD,borderRadius:5}}>🔒 Sign In</span>
+            }
+            {msg&&<span style={{fontSize:12,color:'#6b9e72',marginLeft:8,animation:'fadeIn 0.3s'}}>{msg}</span>}
           </div>
           <div style={{display:'flex',gap:20,fontSize:12,color:DM,marginBottom:12}}>
             <span><strong style={{color:GD}}>{total}</strong> people</span>
@@ -1610,6 +2098,7 @@ function App(){
           </div>
         </div>
       </div>
+      {activeTab==='tree'&&<>
       <div style={{maxWidth:1200,margin:'0 auto',padding:'0 16px 60px'}}>
         <TreeNode node={tree} exp={exp} onTog={toggle} onSel={(node)=>setSel(findNodeById(tree,node.id)||node)} onEdit={(node)=>requireAuth(()=>setEditing(findNodeById(tree,node.id)||node))} onAdd={(id)=>requireAuth(()=>setAdding(id))} onDel={(id)=>requireAuth(()=>handleDelete(id))} onEditSpouse={(node)=>requireAuth(()=>setSpouseEditing({parentId:node.id,spouse:{...(node.sp||{}),dn:(node.sp&&node.sp.dn)||''}}))} onDelSpouse={(id)=>requireAuth(()=>handleDeleteSpouse(id))} hl={hl}/>
       </div>
@@ -1617,13 +2106,16 @@ function App(){
       {editing&&<EditForm node={findNodeById(tree,editing.id)||editing} onSave={handleSaveEdit} onCancel={()=>setEditing(null)} isNew={false}/>}
       {spouseEditing&&<EditForm node={spouseEditing.spouse||empty()} onSave={handleSaveSpouse} onCancel={()=>setSpouseEditing(null)} isNew={false}/>}
       {adding&&<EditForm node={empty()} onSave={handleAdd} onCancel={()=>setAdding(null)} isNew={true} parentId={adding} parentName={flat.find(n=>n.id===adding)?._n}/>}
-      {showAuth&&<PasswordGate onSuccess={(name)=>{setShowAuth(false);setEditUser(name);setMsg('Edit mode: '+name);setTimeout(()=>setMsg(''),3000);if(pendingAction){pendingAction();setPendingAction(null)}}} onCancel={()=>{setShowAuth(false);setPendingAction(null)}}/>}
+      </>}
+      {activeTab==='admin'&&user&&isAdmin()&&<AdminPanel/>}
+      {showLogin&&<LoginModal onSuccess={handleLoginSuccess} onCancel={()=>{setShowLogin(false);setPendingAction(null)}} onRequestAccount={()=>{setShowLogin(false);setShowRequestAccount(true)}}/>}
+      {showRequestAccount&&<RequestAccountModal flat={flat} onDone={()=>setShowRequestAccount(false)} onCancel={()=>setShowRequestAccount(false)}/>}
       {showMigrate&&<MigrateDialog onDone={()=>setShowMigrate(false)} onCancel={()=>setShowMigrate(false)}/>}
-      {editSessionActive&&<div style={{position:'fixed',bottom:16,right:16,background:CD,border:'1px solid '+BR,borderRadius:8,padding:'8px 14px',fontSize:11,color:DM,zIndex:80,display:'flex',alignItems:'center',gap:8}}>
+      {user&&user.role!=='viewer'&&<div style={{position:'fixed',bottom:16,right:16,background:CD,border:'1px solid '+BR,borderRadius:8,padding:'8px 14px',fontSize:11,color:DM,zIndex:80,display:'flex',alignItems:'center',gap:8}}>
         <span style={{width:6,height:6,borderRadius:'50%',background:MC}}/>
-        <span>Editing as <strong style={{color:TX}}>{editUser||editSessionUser}</strong></span>
+        <span>Signed in as <strong style={{color:TX}}>{user.name||user.email}</strong></span>
         <span style={{color:GD}}>·</span>
-        <span>Export GEDCOM or edit — changes save to database automatically</span>
+        <span>{isAdmin()?'Admin':'Editor'} — changes save to database</span>
       </div>}
     </div>
   );
