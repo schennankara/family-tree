@@ -1364,14 +1364,16 @@ function RequestAccountModal({flat, onDone, onCancel}) {
 }
 
 /* ───── SUBMIT UPDATE REQUEST (Tier 2 family members) ───── */
-async function submitUpdateRequest(personId, personName, changes, requesterName, requesterEmail) {
+async function submitUpdateRequest(personId, personName, changes, requesterName, requesterEmail, previousValues) {
+  const payload = {
+    person_id: personId, person_name: personName,
+    requester_name: requesterName, requester_email: requesterEmail,
+    request_type: 'update', changes, status: 'pending'
+  };
+  if (previousValues) payload.changes = { ...changes, _previous: previousValues };
   await sbFetch('update_requests', {
     method: 'POST',
-    body: JSON.stringify({
-      person_id: personId, person_name: personName,
-      requester_name: requesterName, requester_email: requesterEmail,
-      request_type: 'update', changes, status: 'pending'
-    }),
+    body: JSON.stringify(payload),
     headers: { 'Prefer': 'return=minimal' }
   });
 }
@@ -1405,7 +1407,8 @@ function ViewerIdentityModal({submitData, flat, onDone, onCancel}) {
         submitData.personName,
         changesWithContext,
         selectedPerson.dn,
-        email.trim()
+        email.trim(),
+        submitData.previous || null
       );
       setDone(true);
     } catch (e) {
@@ -1537,7 +1540,6 @@ function AdminPanel({onClose}) {
         fb:'facebook', ig:'instagram', li:'linkedin', ws:'website',
         pp:'profile_photo', loc:'location', prof:'profession', emp:'employer',
         pgl:'photo_gallery_link', dl:'documents_link',
-        mdate:'marriage_date', mplace:'marriage_place',
         // These are already correct DB names — pass through
         first_name:'first_name', middle_name:'middle_name', last_name:'last_name',
         display_name:'display_name', nickname:'nickname', gender:'gender',
@@ -1551,7 +1553,7 @@ function AdminPanel({onClose}) {
       };
 
       // Convert changes to DB column names, stripping unknown/internal fields
-      const skipFields = new Set(['_action','_context','id','ch','sp','fams','famc','_fams','_famc','_p','_n','_matchType','_spouseOf','gen']);
+      const skipFields = new Set(['_action','_context','_previous','id','ch','sp','fams','famc','_fams','_famc','_p','_n','_matchType','_spouseOf','gen','mdate','mplace','marriage_date','marriage_place','bo','birth_order']);
       const dbChanges = {};
       for (const [k, v] of Object.entries(req.changes)) {
         if (skipFields.has(k)) continue;
@@ -1694,9 +1696,37 @@ function AdminPanel({onClose}) {
           {r.changes?._context&&<div style={{fontSize:12,color:'#d4cfc0',background:'rgba(155,130,196,0.08)',border:'1px solid rgba(155,130,196,0.15)',padding:'6px 10px',borderRadius:4,marginBottom:8,fontStyle:'italic'}}>
             "{r.changes._context}"
           </div>}
-          {r.changes&&<div style={{fontSize:12,color:'#d4cfc0',background:'#0a0a08',padding:8,borderRadius:4,marginBottom:8,maxHeight:150,overflowY:'auto'}}>
-            {Object.entries(r.changes).filter(([k,v])=>v&&k!=='_action'&&k!=='_context'&&k!=='id'&&k!=='ch'&&k!=='sp').map(([k,v])=><div key={k}><strong style={{color:'#8a7340'}}>{getLabel(k)}:</strong> {String(v)}</div>)}
-          </div>}
+          {r.changes&&(()=>{
+            const prev = r.changes._previous || {};
+            const skipDisplay = new Set(['_action','_context','_previous','id','ch','sp','fams','famc','_fams','_famc','_p','_n','_matchType','_spouseOf','gen']);
+            const entries = Object.entries(r.changes).filter(([k])=>!skipDisplay.has(k));
+            // Filter to only changed fields (where new !== old)
+            const diffs = entries.filter(([k,v])=>{
+              const oldVal = prev[k];
+              const newVal = v;
+              // Show if value changed or is new
+              return String(newVal||'') !== String(oldVal||'');
+            });
+            return diffs.length > 0 ? (
+              <div style={{fontSize:12,background:'#0a0a08',padding:10,borderRadius:4,marginBottom:8,maxHeight:200,overflowY:'auto'}}>
+                {diffs.map(([k,v])=>{
+                  const oldVal = prev[k];
+                  const newVal = v;
+                  const hasOld = oldVal && String(oldVal).trim();
+                  return(
+                    <div key={k} style={{padding:'3px 0',borderBottom:'1px solid rgba(196,163,90,0.05)'}}>
+                      <strong style={{color:'#8a7340'}}>{getLabel(k)}:</strong>{' '}
+                      {hasOld&&<><span style={{color:'#c05050',textDecoration:'line-through',opacity:0.7}}>{String(oldVal)}</span><span style={{color:'#7a7568'}}> → </span></>}
+                      <span style={{color:'#6b9e72'}}>{String(newVal)}</span>
+                      {!hasOld&&<span style={{color:'#7a7568',fontSize:10,marginLeft:4}}>(new)</span>}
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <div style={{fontSize:12,color:'#7a7568',marginBottom:8,fontStyle:'italic'}}>No field changes detected</div>
+            );
+          })()}
           {r.status==='rejected'&&r.admin_response&&<div style={{fontSize:12,color:'#c05050',background:'rgba(192,80,80,0.08)',padding:'6px 10px',borderRadius:4,marginBottom:8}}>
             <strong>Rejection reason:</strong> {r.admin_response}
           </div>}
@@ -2126,9 +2156,14 @@ function App(){
 
   const handleSaveEdit=(data)=>{
     if (isViewer()) {
-      // Viewer: collect identity then send to request queue
       const node = findNodeById(tree, data.id);
-      setViewerSubmitData({ personId: data.id, personName: node?.dn || data.dn || data.id, changes: data, type: 'edit' });
+      // Capture current values for diff display
+      const prev = node ? {fn:node.fn,mn:node.mn,ln:node.ln,dn:node.dn,nk:node.nk,md:node.md,g:node.g,
+        dob:node.dob,dod:node.dod,dec:node.dec,em:node.em,ph:node.ph,a1:node.a1,a2:node.a2,ci:node.ci,
+        st:node.st,zp:node.zp,co:node.co,fb:node.fb,ig:node.ig,li:node.li,ws:node.ws,pp:node.pp,
+        bio:node.bio,loc:node.loc,prof:node.prof,emp:node.emp,notes:node.notes,
+        mdate:node.mdate,mplace:node.mplace} : {};
+      setViewerSubmitData({ personId: data.id, personName: node?.dn || data.dn || data.id, changes: data, previous: prev, type: 'edit' });
       setShowViewerIdentity(true);
       setEditing(null);
       return;
@@ -2209,7 +2244,10 @@ function App(){
     const parentId=spouseEditing.parentId;
     if (isViewer()) {
       const parentNode = findNodeById(tree, parentId);
-      setViewerSubmitData({ personId: parentId, personName: parentNode?.dn || parentId, changes: {...data, _action: 'edit_spouse'}, type: 'spouse' });
+      const prev = parentNode?.sp ? {fn:parentNode.sp.fn,mn:parentNode.sp.mn,ln:parentNode.sp.ln,dn:parentNode.sp.dn,
+        dob:parentNode.sp.dob,dod:parentNode.sp.dod,em:parentNode.sp.em,ph:parentNode.sp.ph,
+        prof:parentNode.sp.prof,loc:parentNode.sp.loc,mdate:parentNode.mdate,mplace:parentNode.mplace} : {};
+      setViewerSubmitData({ personId: parentId, personName: parentNode?.dn || parentId, changes: {...data, _action: 'edit_spouse'}, previous: prev, type: 'spouse' });
       setShowViewerIdentity(true);
       setSpouseEditing(null);
       return;
