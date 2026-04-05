@@ -14,9 +14,20 @@
       width: 100%;
       min-height: 100%;
       background: #0a0a08;
+      color-scheme: dark;
     }
     body {
       font-family: system-ui, -apple-system, sans-serif;
+    }
+    input, textarea, select {
+      color: #d4cfc0 !important;
+      background: #1a1a14 !important;
+      -webkit-text-fill-color: #d4cfc0;
+    }
+    input::placeholder, textarea::placeholder {
+      color: #5a5548 !important;
+      -webkit-text-fill-color: #5a5548;
+      opacity: 1;
     }
   </style>
 </head>
@@ -1274,7 +1285,16 @@ function RequestAccountModal({flat, onDone, onCancel}) {
   const personMatches = useMemo(()=>{
     if(personSearch.length<2)return[];
     const q=personSearch.toLowerCase();
-    return flat.filter(n=>(n.dn||'').toLowerCase().includes(q)||(n.nk||'').toLowerCase().includes(q)).slice(0,8);
+    const results=[];
+    flat.forEach(n=>{
+      if((n.dn||'').toLowerCase().includes(q)||(n.nk||'').toLowerCase().includes(q)){
+        results.push({...n, _mt:'person'});
+      }
+      if(n.sp?.dn && (n.sp.dn||'').toLowerCase().includes(q)){
+        results.push({id:n.sp.id||n.id+'_sp', dn:n.sp.dn, g:n.sp.g||'F', _mt:'spouse', _spOf:n.dn});
+      }
+    });
+    return results.slice(0,10);
   },[personSearch,flat]);
 
   const handleSubmit = async () => {
@@ -1346,6 +1366,7 @@ function RequestAccountModal({flat, onDone, onCancel}) {
                   onMouseEnter={e=>e.currentTarget.style.background='rgba(255,255,255,0.04)'}
                   onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
                   <span style={{width:6,height:6,borderRadius:'50%',background:m.g==='M'?'#6b9e72':'#9b82c4'}}/><span>{m.dn}</span>
+                  {m._mt==='spouse'&&<span style={{fontSize:10,color:'#7a7568',fontStyle:'italic',marginLeft:4}}>⚭ spouse of {m._spOf}</span>}
                 </div>)}
               </div>}
             </>
@@ -1392,7 +1413,16 @@ function ViewerIdentityModal({submitData, flat, onDone, onCancel}) {
   const personMatches = useMemo(()=>{
     if(personSearch.length<2)return[];
     const q=personSearch.toLowerCase();
-    return flat.filter(n=>(n.dn||'').toLowerCase().includes(q)||(n.nk||'').toLowerCase().includes(q)).slice(0,8);
+    const results=[];
+    flat.forEach(n=>{
+      if((n.dn||'').toLowerCase().includes(q)||(n.nk||'').toLowerCase().includes(q)){
+        results.push({...n, _mt:'person'});
+      }
+      if(n.sp?.dn && (n.sp.dn||'').toLowerCase().includes(q)){
+        results.push({id:n.sp.id||n.id+'_sp', dn:n.sp.dn, g:n.sp.g||'F', _mt:'spouse', _spOf:n.dn});
+      }
+    });
+    return results.slice(0,10);
   },[personSearch,flat]);
 
   const handleSubmit = async () => {
@@ -1456,6 +1486,7 @@ function ViewerIdentityModal({submitData, flat, onDone, onCancel}) {
                   onMouseEnter={e=>e.currentTarget.style.background='rgba(255,255,255,0.04)'}
                   onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
                   <span style={{width:6,height:6,borderRadius:'50%',background:m.g==='M'?'#6b9e72':'#9b82c4'}}/><span>{m.dn}</span>
+                  {m._mt==='spouse'&&<span style={{fontSize:10,color:'#7a7568',fontStyle:'italic',marginLeft:4}}>⚭ spouse of {m._spOf}</span>}
                 </div>)}
               </div>}
             </>
@@ -1700,12 +1731,14 @@ function AdminPanel({onClose}) {
             const prev = r.changes._previous || {};
             const skipDisplay = new Set(['_action','_context','_previous','id','ch','sp','fams','famc','_fams','_famc','_p','_n','_matchType','_spouseOf','gen']);
             const entries = Object.entries(r.changes).filter(([k])=>!skipDisplay.has(k));
-            // Filter to only changed fields (where new !== old)
+            // Filter to only changed fields (where new !== old, ignoring both-empty)
             const diffs = entries.filter(([k,v])=>{
-              const oldVal = prev[k];
-              const newVal = v;
-              // Show if value changed or is new
-              return String(newVal||'') !== String(oldVal||'');
+              const oldVal = String(prev[k]||'').trim();
+              const newVal = String(v||'').trim();
+              // Skip if both empty or unchanged
+              if (!oldVal && !newVal) return false;
+              if (oldVal === newVal) return false;
+              return true;
             });
             return diffs.length > 0 ? (
               <div style={{fontSize:12,background:'#0a0a08',padding:10,borderRadius:4,marginBottom:8,maxHeight:200,overflowY:'auto'}}>
@@ -2244,10 +2277,12 @@ function App(){
     const parentId=spouseEditing.parentId;
     if (isViewer()) {
       const parentNode = findNodeById(tree, parentId);
+      const spouseId = (spouseEditing.spouse&&spouseEditing.spouse.id) || data.id || ('@sp_'+Date.now()+'@');
+      const spouseName = parentNode?.sp?.dn || data.dn || 'Spouse';
       const prev = parentNode?.sp ? {fn:parentNode.sp.fn,mn:parentNode.sp.mn,ln:parentNode.sp.ln,dn:parentNode.sp.dn,
         dob:parentNode.sp.dob,dod:parentNode.sp.dod,em:parentNode.sp.em,ph:parentNode.sp.ph,
-        prof:parentNode.sp.prof,loc:parentNode.sp.loc,mdate:parentNode.mdate,mplace:parentNode.mplace} : {};
-      setViewerSubmitData({ personId: parentId, personName: parentNode?.dn || parentId, changes: {...data, _action: 'edit_spouse'}, previous: prev, type: 'spouse' });
+        prof:parentNode.sp.prof,loc:parentNode.sp.loc} : {};
+      setViewerSubmitData({ personId: spouseId, personName: spouseName + ' (spouse of ' + (parentNode?.dn||'') + ')', changes: {...data, id: spouseId, _action: 'edit_spouse'}, previous: prev, type: 'spouse' });
       setShowViewerIdentity(true);
       setSpouseEditing(null);
       return;
