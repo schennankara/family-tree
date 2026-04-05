@@ -43,7 +43,9 @@ async function sbFetch(path, opts = {}) {
     const err = await resp.text();
     throw new Error(`Supabase ${resp.status}: ${err}`);
   }
-  return resp.json();
+  const text = await resp.text();
+  if (!text) return [];
+  try { return JSON.parse(text); } catch(e) { return []; }
 }
 
 /* ───── LOAD FROM SUPABASE ───── */
