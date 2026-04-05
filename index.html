@@ -1171,10 +1171,9 @@ function canEditPerson(personId) {
 
 /* ───── LOGIN MODAL ───── */
 function LoginModal({onSuccess, onCancel, onRequestAccount}) {
-  const [mode, setMode] = useState('login'); // 'login' | 'forgot' | 'viewer'
+  const [mode, setMode] = useState('login'); // 'login' | 'forgot'
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [viewerPwd, setViewerPwd] = useState('');
   const [error, setError] = useState('');
   const [info, setInfo] = useState('');
   const [busy, setBusy] = useState(false);
@@ -1207,27 +1206,13 @@ function LoginModal({onSuccess, onCancel, onRequestAccount}) {
     setBusy(false);
   };
 
-  const handleViewer = async () => {
-    if (!viewerPwd) { setError('Enter the family password'); return; }
-    setBusy(true); setError('');
-    try {
-      const settings = await sbFetch("settings?key=eq.viewer_password&select=value");
-      if (settings[0]?.value === viewerPwd) {
-        onSuccess({ role: 'viewer', name: 'Viewer' });
-      } else {
-        setError('Incorrect family password');
-      }
-    } catch (e) { setError('Could not verify password'); }
-    setBusy(false);
-  };
-
   return(
     <div style={{position:'fixed',inset:0,zIndex:300,display:'flex',alignItems:'center',justifyContent:'center'}}>
       <div style={{position:'absolute',inset:0,background:'rgba(0,0,0,0.8)'}}/>
       <div style={{position:'relative',background:'#141410',border:'1px solid rgba(196,163,90,0.12)',borderRadius:12,width:Math.min(400,window.innerWidth-32),padding:28,zIndex:301}}>
         <div style={{textAlign:'center',marginBottom:20}}>
           <div style={{fontSize:28,color:'#c4a35a',fontWeight:300,letterSpacing:1}}>Chennamkara</div>
-          <div style={{fontSize:11,color:'#7a7568',letterSpacing:3,textTransform:'uppercase'}}>Family Tree</div>
+          <div style={{fontSize:11,color:'#7a7568',letterSpacing:3,textTransform:'uppercase'}}>Sign In</div>
         </div>
 
         {mode==='login'&&<>
@@ -1249,10 +1234,6 @@ function LoginModal({onSuccess, onCancel, onRequestAccount}) {
             <span onClick={()=>{setMode('forgot');setError('')}} style={{color:'#7a7568',cursor:'pointer',textDecoration:'underline'}}>Forgot password?</span>
             <span onClick={onRequestAccount} style={{color:'#9b82c4',cursor:'pointer',textDecoration:'underline'}}>Request account</span>
           </div>
-          <div style={{borderTop:'1px solid rgba(196,163,90,0.08)',marginTop:16,paddingTop:16,textAlign:'center'}}>
-            <span style={{fontSize:12,color:'#7a7568'}}>Just browsing? </span>
-            <span onClick={()=>{setMode('viewer');setError('')}} style={{fontSize:12,color:'#c4a35a',cursor:'pointer',textDecoration:'underline'}}>View with family password</span>
-          </div>
         </>}
 
         {mode==='forgot'&&<>
@@ -1266,19 +1247,6 @@ function LoginModal({onSuccess, onCancel, onRequestAccount}) {
             {busy?'Sending...':'Send Reset Email'}
           </button>
           <span onClick={()=>{setMode('login');setError('');setInfo('')}} style={{fontSize:12,color:'#7a7568',cursor:'pointer',textDecoration:'underline'}}>Back to sign in</span>
-        </>}
-
-        {mode==='viewer'&&<>
-          <div style={{fontSize:14,color:'#d4cfc0',marginBottom:12}}>Enter the family password to view the tree.</div>
-          <div style={{marginBottom:16}}>
-            <input type="password" value={viewerPwd} onChange={e=>{setViewerPwd(e.target.value);setError('')}} placeholder="Family password" style={inp}
-              onKeyDown={e=>{if(e.key==='Enter')handleViewer()}}/>
-          </div>
-          {error&&<div style={{fontSize:12,color:'#c05050',marginBottom:12}}>{error}</div>}
-          <button onClick={handleViewer} disabled={busy} style={{width:'100%',background:'rgba(196,163,90,0.15)',border:'1px solid #8a7340',color:'#c4a35a',padding:'10px',borderRadius:6,cursor:'pointer',fontSize:14,marginBottom:12}}>
-            {busy?'Checking...':'View Tree'}
-          </button>
-          <span onClick={()=>{setMode('login');setError('')}} style={{fontSize:12,color:'#7a7568',cursor:'pointer',textDecoration:'underline'}}>Back to sign in</span>
         </>}
 
         {onCancel&&<div style={{textAlign:'center',marginTop:12}}>
@@ -1797,6 +1765,10 @@ function App(){
   const [pendingAction,setPendingAction]=useState(null);
   const [user,setUser]=useState(null); // authUser object or {role:'viewer'}
   const [activeTab,setActiveTab]=useState('tree'); // 'tree' | 'admin'
+  const [viewerGate,setViewerGate]=useState(true); // true = locked, must enter family password
+  const [gatePassword,setGatePassword]=useState('');
+  const [gateError,setGateError]=useState('');
+  const [gateChecking,setGateChecking]=useState(false);
   const flat=useMemo(()=>tree?flattenAll(tree):[],[tree]);
 
   // Auth gate: require login for edit actions
@@ -1804,8 +1776,8 @@ function App(){
     if (user && canEdit()) {
       action();
     } else if (user && user.role === 'viewer') {
-      // Viewers can't edit — show message
-      setMsg('Sign in with an account to edit');
+      // Viewers see a message prompting them to sign in or request
+      setMsg('Sign in or request an account to make edits');
       setTimeout(()=>setMsg(''),3000);
     } else {
       setPendingAction(() => action);
@@ -1816,6 +1788,7 @@ function App(){
   const handleLoginSuccess = (u) => {
     setUser(u);
     setShowLogin(false);
+    setViewerGate(false); // signed-in users bypass the gate
     if (u.role !== 'viewer') {
       setMsg('Signed in as ' + (u.name || u.email));
     }
@@ -1827,8 +1800,26 @@ function App(){
     await signOut();
     setUser(null);
     setActiveTab('tree');
+    setViewerGate(true); // re-lock on sign out
     setMsg('Signed out');
     setTimeout(()=>setMsg(''),2000);
+  };
+
+  const handleViewerGate = async () => {
+    if (!gatePassword) { setGateError('Enter the family password'); return; }
+    setGateChecking(true); setGateError('');
+    try {
+      const settings = await sbFetch("settings?key=eq.viewer_password&select=value");
+      if (settings[0]?.value === gatePassword) {
+        setViewerGate(false);
+        setUser({ role: 'viewer', name: 'Viewer' });
+      } else {
+        setGateError('Incorrect password. Ask a family member for access.');
+      }
+    } catch (e) {
+      setGateError('Could not verify. Try again.');
+    }
+    setGateChecking(false);
   };
 
   // Load from Supabase first, fall back to GEDCOM file
@@ -2029,11 +2020,38 @@ function App(){
 
   const total=tree?cnt(tree):0;
   const btnS={background:CD,border:`1px solid ${BR}`,color:DM,padding:'6px 12px',borderRadius:5,fontSize:12,cursor:'pointer',whiteSpace:'nowrap'};
+  const gateInp={width:'100%',background:'#1a1a14',border:'1px solid '+BR,color:TX,padding:'10px 14px',borderRadius:6,fontSize:15,outline:'none',fontFamily:'inherit',textAlign:'center',letterSpacing:1};
+
+  // ─── VIEWER GATE: Must enter family password to see anything ───
+  if(viewerGate) return(
+    <div style={{background:BG,minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',flexDirection:'column',gap:16}}>
+      <style>{'@keyframes spin{to{transform:rotate(360deg)}}'}</style>
+      <span style={{fontSize:36,color:GC,fontWeight:300,letterSpacing:2}}>Chennamkara</span>
+      <span style={{fontSize:11,color:DM,letterSpacing:4,textTransform:'uppercase',marginBottom:8}}>Family Tree</span>
+      <div style={{width:Math.min(340,window.innerWidth-48),textAlign:'center'}}>
+        <div style={{fontSize:13,color:DM,marginBottom:16,lineHeight:1.6}}>Enter the family password to view the tree</div>
+        <input type="password" value={gatePassword} onChange={e=>{setGatePassword(e.target.value);setGateError('')}}
+          placeholder="Family password" style={gateInp}
+          onKeyDown={e=>{if(e.key==='Enter')handleViewerGate()}}/>
+        {gateError&&<div style={{fontSize:12,color:'#c05050',marginTop:8}}>{gateError}</div>}
+        <button onClick={handleViewerGate} disabled={gateChecking}
+          style={{width:'100%',marginTop:12,background:'rgba(196,163,90,0.15)',border:'1px solid '+GD,color:GC,padding:'10px',borderRadius:6,cursor:'pointer',fontSize:14}}>
+          {gateChecking?'Checking...':'Enter'}
+        </button>
+        <div style={{marginTop:20,borderTop:'1px solid '+BR,paddingTop:16}}>
+          <span style={{fontSize:12,color:DM}}>Have an account? </span>
+          <span onClick={()=>{setShowLogin(true)}} style={{fontSize:12,color:GC,cursor:'pointer',textDecoration:'underline'}}>Sign in</span>
+        </div>
+      </div>
+      {showLogin&&<LoginModal onSuccess={handleLoginSuccess} onCancel={()=>setShowLogin(false)} onRequestAccount={()=>{setShowLogin(false);setShowRequestAccount(true)}}/>}
+      {showRequestAccount&&<RequestAccountModal flat={flat} onDone={()=>setShowRequestAccount(false)} onCancel={()=>setShowRequestAccount(false)}/>}
+    </div>
+  );
 
   if(loading) return(
     <div style={{background:BG,minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',flexDirection:'column',gap:16}}>
       <span style={{fontSize:28,color:GC,fontWeight:300,letterSpacing:1}}>Chennamkara</span>
-      <span style={{fontSize:13,color:DM}}>Loading family tree from source...</span>
+      <span style={{fontSize:13,color:DM}}>Loading family tree...</span>
       <div style={{width:40,height:40,border:'2px solid '+BR,borderTopColor:GC,borderRadius:'50%',animation:'spin 1s linear infinite'}}/>
       <style>{'@keyframes spin{to{transform:rotate(360deg)}}'}</style>
     </div>
