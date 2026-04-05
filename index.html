@@ -1527,35 +1527,52 @@ function AdminPanel({onClose}) {
       const h = { 'Authorization': 'Bearer ' + authSession.access_token };
       const action = req.changes?._action || 'update';
 
-      // Strip internal fields before applying to DB
-      const dbChanges = { ...req.changes };
-      delete dbChanges._action;
-      delete dbChanges._context;
-      delete dbChanges.id;
-      delete dbChanges.ch;
-      delete dbChanges.sp;
+      // Map short field names (from edit form) to database column names
+      const fieldMap = {
+        fn:'first_name', mn:'middle_name', ln:'last_name', dn:'display_name',
+        nk:'nickname', md:'maiden_name', g:'gender', dob:'date_of_birth',
+        dod:'date_of_death', dec:'is_deceased', bo:'birth_order',
+        em:'email', ph:'phone', a1:'address1', a2:'address2',
+        ci:'city', st:'state', zp:'zip', co:'country',
+        fb:'facebook', ig:'instagram', li:'linkedin', ws:'website',
+        pp:'profile_photo', loc:'location', prof:'profession', emp:'employer',
+        pgl:'photo_gallery_link', dl:'documents_link',
+        mdate:'marriage_date', mplace:'marriage_place',
+        // These are already correct DB names — pass through
+        first_name:'first_name', middle_name:'middle_name', last_name:'last_name',
+        display_name:'display_name', nickname:'nickname', gender:'gender',
+        date_of_birth:'date_of_birth', date_of_death:'date_of_death',
+        email:'email', phone:'phone', profession:'profession', employer:'employer',
+        location:'location', profile_photo:'profile_photo', bio:'bio',
+        notes:'notes', stories:'stories',
+        address1:'address1', address2:'address2', city:'city', state:'state',
+        zip:'zip', country:'country', facebook:'facebook', instagram:'instagram',
+        linkedin:'linkedin', website:'website',
+      };
+
+      // Convert changes to DB column names, stripping unknown/internal fields
+      const skipFields = new Set(['_action','_context','id','ch','sp','fams','famc','_fams','_famc','_p','_n','_matchType','_spouseOf','gen']);
+      const dbChanges = {};
+      for (const [k, v] of Object.entries(req.changes)) {
+        if (skipFields.has(k)) continue;
+        const dbCol = fieldMap[k];
+        if (dbCol) {
+          dbChanges[dbCol] = (k === 'dec') ? !!v : (v || '');
+        }
+        // If key is already a valid DB column name and not in fieldMap, skip it
+      }
 
       if (action === 'delete') {
-        // Delete the person
         await sbFetch(`persons?id=eq.${req.person_id}`, { method: 'DELETE', headers: h });
       } else if (action === 'add_child') {
-        // Insert new person
-        const newId = dbChanges.id || ('@new_' + Date.now() + '@');
-        delete dbChanges.id;
+        const newId = req.changes.id || ('@new_' + Date.now() + '@');
+        dbChanges.id = newId;
         await sbFetch('persons', {
           method: 'POST', headers: {...h, 'Prefer':'return=minimal'},
-          body: JSON.stringify({ id: newId, ...dbChanges })
+          body: JSON.stringify(dbChanges)
         });
-      } else if (action === 'edit_spouse') {
-        // Update or create spouse — apply to persons table
-        if (Object.keys(dbChanges).length > 0) {
-          await sbFetch(`persons?id=eq.${req.person_id}`, {
-            method: 'PATCH', headers: {...h, 'Prefer':'return=minimal'},
-            body: JSON.stringify(dbChanges)
-          });
-        }
       } else {
-        // Regular edit — apply changes to persons table
+        // Regular edit or edit_spouse — patch the person
         if (Object.keys(dbChanges).length > 0) {
           await sbFetch(`persons?id=eq.${req.person_id}`, {
             method: 'PATCH', headers: {...h, 'Prefer':'return=minimal'},
@@ -1621,7 +1638,7 @@ function AdminPanel({onClose}) {
   };
 
   const tabBtn = (id,label,count) => (
-    <button key={id} onClick={()=>setTab(id)} style={{
+    <button key={id} onClick={()=>switchTab(id)} style={{
       background:tab===id?'rgba(196,163,90,0.12)':'transparent',
       border:tab===id?'1px solid #8a7340':'1px solid transparent',
       color:tab===id?'#c4a35a':'#7a7568',padding:'6px 14px',borderRadius:5,fontSize:12,cursor:'pointer'
@@ -1629,7 +1646,12 @@ function AdminPanel({onClose}) {
   );
 
   const pendingUpdates = updateReqs.filter(r=>r.status==='pending').length;
+  const approvedUpdates = updateReqs.filter(r=>r.status==='approved').length;
+  const rejectedUpdates = updateReqs.filter(r=>r.status==='rejected').length;
   const pendingAccess = accessReqs.filter(r=>r.status==='pending').length;
+  const [statusFilter, setStatusFilter] = useState('pending');
+
+  const switchTab = (t) => { setTab(t); setActionMsg(''); setStatusFilter('pending'); };
 
   return(
     <div style={{maxWidth:1200,margin:'0 auto',padding:'0 16px 60px'}}>
@@ -1638,14 +1660,23 @@ function AdminPanel({onClose}) {
         {tabBtn('accounts','Account Requests',pendingAccess)}
         {isSuperAdmin()&&tabBtn('users','Manage Users',0)}
         {tabBtn('log','Edit Log',0)}
-        {actionMsg&&<span style={{fontSize:12,color:'#6b9e72',marginLeft:16}}>{actionMsg}</span>}
+        {actionMsg&&<span style={{fontSize:12,color:actionMsg.startsWith('Error')?'#c05050':'#6b9e72',marginLeft:16}}>{actionMsg}</span>}
       </div>
 
       {loading&&<div style={{color:'#7a7568',fontSize:13}}>Loading...</div>}
 
       {!loading&&tab==='updates'&&<div>
-        {updateReqs.length===0&&<div style={{color:'#7a7568',fontSize:13}}>No update requests yet.</div>}
-        {updateReqs.map(r=><div key={r.id} style={{background:'#141410',border:'1px solid rgba(196,163,90,0.08)',borderRadius:8,padding:16,marginBottom:8}}>
+        <div style={{display:'flex',gap:6,marginBottom:12}}>
+          {[['pending','Pending',pendingUpdates],['approved','Approved',approvedUpdates],['rejected','Rejected',rejectedUpdates]].map(([s,l,c])=>
+            <button key={s} onClick={()=>setStatusFilter(s)} style={{
+              background:statusFilter===s?'rgba(196,163,90,0.1)':'transparent',
+              border:statusFilter===s?'1px solid rgba(196,163,90,0.3)':'1px solid transparent',
+              color:statusFilter===s?'#c4a35a':'#7a7568',padding:'4px 12px',borderRadius:4,fontSize:11,cursor:'pointer',textTransform:'uppercase',letterSpacing:1
+            }}>{l}{c>0&&<span style={{marginLeft:4,fontSize:10,opacity:0.7}}>({c})</span>}</button>
+          )}
+        </div>
+        {updateReqs.filter(r=>r.status===statusFilter).length===0&&<div style={{color:'#7a7568',fontSize:13}}>No {statusFilter} requests.</div>}
+        {updateReqs.filter(r=>r.status===statusFilter).map(r=><div key={r.id} style={{background:'#141410',border:'1px solid rgba(196,163,90,0.08)',borderRadius:8,padding:16,marginBottom:8}}>
           <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
             <div>
               <span style={{color:'#d4cfc0',fontSize:14,fontWeight:500}}>{r.person_name||r.person_id}</span>
@@ -1666,9 +1697,15 @@ function AdminPanel({onClose}) {
           {r.changes&&<div style={{fontSize:12,color:'#d4cfc0',background:'#0a0a08',padding:8,borderRadius:4,marginBottom:8,maxHeight:150,overflowY:'auto'}}>
             {Object.entries(r.changes).filter(([k,v])=>v&&k!=='_action'&&k!=='_context'&&k!=='id'&&k!=='ch'&&k!=='sp').map(([k,v])=><div key={k}><strong style={{color:'#8a7340'}}>{getLabel(k)}:</strong> {String(v)}</div>)}
           </div>}
+          {r.status==='rejected'&&r.admin_response&&<div style={{fontSize:12,color:'#c05050',background:'rgba(192,80,80,0.08)',padding:'6px 10px',borderRadius:4,marginBottom:8}}>
+            <strong>Rejection reason:</strong> {r.admin_response}
+          </div>}
+          {r.resolved_at&&<div style={{fontSize:11,color:'#7a7568',marginBottom:8}}>
+            {r.status==='approved'?'Approved':'Rejected'} on {new Date(r.resolved_at).toLocaleString()}
+          </div>}
           {r.status==='pending'&&<div style={{display:'flex',gap:8}}>
             <button onClick={()=>approveUpdate(r)} style={{...btnS2,borderColor:'#6b9e72',color:'#6b9e72'}}>✓ Approve</button>
-            <button onClick={()=>{const reason=prompt('Reason for rejection (optional):');rejectUpdate(r,reason)}} style={{...btnS2,borderColor:'#c05050',color:'#c05050'}}>✕ Reject</button>
+            <button onClick={()=>{const reason=prompt('Reason for rejection (optional):');if(reason!==null)rejectUpdate(r,reason)}} style={{...btnS2,borderColor:'#c05050',color:'#c05050'}}>✕ Reject</button>
             <a href={`mailto:${r.requester_email}?subject=About your family tree update request&body=Hi ${r.requester_name},%0A%0ARegarding your update request for ${r.person_name}:%0A%0A`}
               style={{...btnS2,borderColor:'#9b82c4',color:'#9b82c4',textDecoration:'none'}}>✉ Reply</a>
           </div>}
@@ -2282,6 +2319,7 @@ function App(){
                 <span style={{width:6,height:6,borderRadius:'50%',background:user.role==='viewer'?DM:MC}}/>
                 <span style={{color:TX}}>{user.name||user.email||'Viewer'}</span>
                 <span style={{fontSize:10,color:DM,textTransform:'uppercase'}}>{user.role==='viewer'?'viewing':user.role}</span>
+                {user.role==='viewer'&&<span onClick={()=>setShowLogin(true)} style={{color:GC,cursor:'pointer',textDecoration:'underline',marginLeft:4}}>Sign in</span>}
                 {user.role!=='viewer'&&<span onClick={handleSignOut} style={{color:DM,cursor:'pointer',textDecoration:'underline',marginLeft:4}}>Sign out</span>}
               </span>
             :
