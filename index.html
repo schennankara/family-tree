@@ -1377,17 +1377,24 @@ async function submitUpdateRequest(personId, personName, changes, requesterName,
 }
 
 /* ───── VIEWER IDENTITY MODAL (collects name + email before submitting request) ───── */
-function ViewerIdentityModal({submitData, onDone, onCancel}) {
-  const [name, setName] = useState('');
+function ViewerIdentityModal({submitData, flat, onDone, onCancel}) {
   const [email, setEmail] = useState('');
   const [context, setContext] = useState('');
+  const [personSearch, setPersonSearch] = useState('');
+  const [selectedPerson, setSelectedPerson] = useState(null);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState(false);
   const inp={width:'100%',background:'#1a1a14',border:'1px solid rgba(196,163,90,0.12)',color:'#d4cfc0',padding:'8px 12px',borderRadius:6,fontSize:14,outline:'none',fontFamily:'inherit'};
 
+  const personMatches = useMemo(()=>{
+    if(personSearch.length<2)return[];
+    const q=personSearch.toLowerCase();
+    return flat.filter(n=>(n.dn||'').toLowerCase().includes(q)||(n.nk||'').toLowerCase().includes(q)).slice(0,8);
+  },[personSearch,flat]);
+
   const handleSubmit = async () => {
-    if (!name.trim()) { setError('Enter your name so the admin knows who submitted this'); return; }
+    if (!selectedPerson) { setError('Please identify yourself in the tree'); return; }
     if (!email.trim()) { setError('Enter your email so the admin can follow up'); return; }
     setBusy(true); setError('');
     try {
@@ -1397,7 +1404,7 @@ function ViewerIdentityModal({submitData, onDone, onCancel}) {
         submitData.personId,
         submitData.personName,
         changesWithContext,
-        name.trim(),
+        selectedPerson.dn,
         email.trim()
       );
       setDone(true);
@@ -1429,12 +1436,29 @@ function ViewerIdentityModal({submitData, onDone, onCancel}) {
         <div style={{fontSize:12,color:'#7a7568',marginBottom:16,lineHeight:1.6}}>
           Your proposed changes to <strong style={{color:'#d4cfc0'}}>{submitData.personName}</strong> will be sent to the family admin for review. Please identify yourself:
         </div>
-        <div style={{marginBottom:12}}>
-          <label style={{fontSize:11,color:'#7a7568',display:'block',marginBottom:3}}>Your Name</label>
-          <input value={name} onChange={e=>setName(e.target.value)} placeholder="Full name" style={inp}
-            onKeyDown={e=>{if(e.key==='Enter')handleSubmit()}}/>
+        <div style={{marginBottom:12,position:'relative'}}>
+          <label style={{fontSize:11,color:'#7a7568',display:'block',marginBottom:3}}>Who are you in the tree?</label>
+          {selectedPerson?
+            <div style={{display:'flex',alignItems:'center',gap:8,padding:'8px 12px',background:'rgba(107,158,114,0.08)',border:'1px solid #6b9e72',borderRadius:6}}>
+              <span style={{width:6,height:6,borderRadius:'50%',background:selectedPerson.g==='M'?'#6b9e72':'#9b82c4'}}/>
+              <span style={{color:'#d4cfc0',fontSize:14}}>{selectedPerson.dn}</span>
+              <span onClick={()=>{setSelectedPerson(null);setPersonSearch('')}} style={{marginLeft:'auto',color:'#7a7568',cursor:'pointer',fontSize:12}}>✕ Change</span>
+            </div>
+          :
+            <>
+              <input value={personSearch} onChange={e=>setPersonSearch(e.target.value)} placeholder="Search by name..." style={inp}/>
+              {personMatches.length>0&&<div style={{position:'absolute',top:'100%',left:0,right:0,background:'#141410',border:'1px solid rgba(196,163,90,0.25)',borderRadius:'0 0 6px 6px',maxHeight:200,overflowY:'auto',zIndex:10}}>
+                {personMatches.map(m=><div key={m.id} onClick={()=>{setSelectedPerson(m);setPersonSearch('')}}
+                  style={{padding:'6px 12px',cursor:'pointer',fontSize:13,display:'flex',alignItems:'center',gap:6}}
+                  onMouseEnter={e=>e.currentTarget.style.background='rgba(255,255,255,0.04)'}
+                  onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
+                  <span style={{width:6,height:6,borderRadius:'50%',background:m.g==='M'?'#6b9e72':'#9b82c4'}}/><span>{m.dn}</span>
+                </div>)}
+              </div>}
+            </>
+          }
         </div>
-        <div style={{marginBottom:16}}>
+        <div style={{marginBottom:12}}>
           <label style={{fontSize:11,color:'#7a7568',display:'block',marginBottom:3}}>Your Email</label>
           <input value={email} onChange={e=>{setEmail(e.target.value);setError('')}} placeholder="your@email.com" style={inp}
             onKeyDown={e=>{if(e.key==='Enter')handleSubmit()}}/>
@@ -1482,14 +1506,64 @@ function AdminPanel({onClose}) {
     })();
   },[]);
 
+  // Field label mapping for human-readable display
+  const fieldLabels = {
+    fn:'First Name',mn:'Middle Name',ln:'Last Name',dn:'Display Name',nk:'Nickname',md:'Maiden Name',
+    g:'Gender',dob:'Date of Birth',dod:'Date of Death',dec:'Deceased',bo:'Birth Order',
+    em:'Email',ph:'Phone',a1:'Address 1',a2:'Address 2',ci:'City',st:'State',zp:'Zip',co:'Country',
+    fb:'Facebook',ig:'Instagram',li:'LinkedIn',ws:'Website',pp:'Profile Photo',bio:'Bio',loc:'Location',
+    prof:'Profession',emp:'Employer',stories:'Stories',notes:'Notes',pgl:'Photo Gallery',dl:'Documents',
+    mdate:'Marriage Date',mplace:'Marriage Place',
+    _action:'Action Type',_context:'Context/Explanation',
+    first_name:'First Name',middle_name:'Middle Name',last_name:'Last Name',display_name:'Display Name',
+    nickname:'Nickname',date_of_birth:'Date of Birth',date_of_death:'Date of Death',
+    email:'Email',phone:'Phone',profession:'Profession',employer:'Employer',location:'Location',
+    profile_photo:'Profile Photo',
+  };
+  const getLabel = (k) => fieldLabels[k] || k;
+
   const approveUpdate = async (req) => {
     try {
       const h = { 'Authorization': 'Bearer ' + authSession.access_token };
-      // Apply changes to persons table
-      await sbFetch(`persons?id=eq.${req.person_id}`, {
-        method: 'PATCH', headers: {...h, 'Prefer':'return=minimal'},
-        body: JSON.stringify(req.changes)
-      });
+      const action = req.changes?._action || 'update';
+
+      // Strip internal fields before applying to DB
+      const dbChanges = { ...req.changes };
+      delete dbChanges._action;
+      delete dbChanges._context;
+      delete dbChanges.id;
+      delete dbChanges.ch;
+      delete dbChanges.sp;
+
+      if (action === 'delete') {
+        // Delete the person
+        await sbFetch(`persons?id=eq.${req.person_id}`, { method: 'DELETE', headers: h });
+      } else if (action === 'add_child') {
+        // Insert new person
+        const newId = dbChanges.id || ('@new_' + Date.now() + '@');
+        delete dbChanges.id;
+        await sbFetch('persons', {
+          method: 'POST', headers: {...h, 'Prefer':'return=minimal'},
+          body: JSON.stringify({ id: newId, ...dbChanges })
+        });
+      } else if (action === 'edit_spouse') {
+        // Update or create spouse — apply to persons table
+        if (Object.keys(dbChanges).length > 0) {
+          await sbFetch(`persons?id=eq.${req.person_id}`, {
+            method: 'PATCH', headers: {...h, 'Prefer':'return=minimal'},
+            body: JSON.stringify(dbChanges)
+          });
+        }
+      } else {
+        // Regular edit — apply changes to persons table
+        if (Object.keys(dbChanges).length > 0) {
+          await sbFetch(`persons?id=eq.${req.person_id}`, {
+            method: 'PATCH', headers: {...h, 'Prefer':'return=minimal'},
+            body: JSON.stringify(dbChanges)
+          });
+        }
+      }
+
       // Mark request as approved
       await sbFetch(`update_requests?id=eq.${req.id}`, {
         method: 'PATCH', headers: h,
@@ -1580,8 +1654,17 @@ function AdminPanel({onClose}) {
             {statusBadge(r.status)}
           </div>
           <div style={{fontSize:12,color:'#7a7568',marginBottom:8}}>{new Date(r.created_at).toLocaleString()}</div>
+          {r.changes?._action&&<div style={{marginBottom:8}}>
+            <span style={{fontSize:11,padding:'3px 10px',borderRadius:10,letterSpacing:1,textTransform:'uppercase',
+              background:r.changes._action==='delete'?'rgba(192,80,80,0.15)':r.changes._action==='add_child'?'rgba(107,158,114,0.15)':'rgba(196,163,90,0.15)',
+              color:r.changes._action==='delete'?'#c05050':r.changes._action==='add_child'?'#6b9e72':'#c4a35a',
+            }}>{r.changes._action==='edit_spouse'?'Edit Spouse':r.changes._action==='add_child'?'Add Child':r.changes._action==='delete'?'Delete Person':'Edit Person'}</span>
+          </div>}
+          {r.changes?._context&&<div style={{fontSize:12,color:'#d4cfc0',background:'rgba(155,130,196,0.08)',border:'1px solid rgba(155,130,196,0.15)',padding:'6px 10px',borderRadius:4,marginBottom:8,fontStyle:'italic'}}>
+            "{r.changes._context}"
+          </div>}
           {r.changes&&<div style={{fontSize:12,color:'#d4cfc0',background:'#0a0a08',padding:8,borderRadius:4,marginBottom:8,maxHeight:150,overflowY:'auto'}}>
-            {Object.entries(r.changes).filter(([k,v])=>v).map(([k,v])=><div key={k}><strong style={{color:'#8a7340'}}>{k}:</strong> {String(v)}</div>)}
+            {Object.entries(r.changes).filter(([k,v])=>v&&k!=='_action'&&k!=='_context'&&k!=='id'&&k!=='ch'&&k!=='sp').map(([k,v])=><div key={k}><strong style={{color:'#8a7340'}}>{getLabel(k)}:</strong> {String(v)}</div>)}
           </div>}
           {r.status==='pending'&&<div style={{display:'flex',gap:8}}>
             <button onClick={()=>approveUpdate(r)} style={{...btnS2,borderColor:'#6b9e72',color:'#6b9e72'}}>✓ Approve</button>
@@ -2244,7 +2327,7 @@ function App(){
       {activeTab==='admin'&&user&&isAdmin()&&<AdminPanel/>}
       {showLogin&&<LoginModal onSuccess={handleLoginSuccess} onCancel={()=>{setShowLogin(false);setPendingAction(null)}} onRequestAccount={()=>{setShowLogin(false);setShowRequestAccount(true)}}/>}
       {showRequestAccount&&<RequestAccountModal flat={flat} onDone={()=>setShowRequestAccount(false)} onCancel={()=>setShowRequestAccount(false)}/>}
-      {showViewerIdentity&&viewerSubmitData&&<ViewerIdentityModal submitData={viewerSubmitData} onDone={()=>{setShowViewerIdentity(false);setViewerSubmitData(null);setMsg('Update request submitted!')}} onCancel={()=>{setShowViewerIdentity(false);setViewerSubmitData(null)}}/>}
+      {showViewerIdentity&&viewerSubmitData&&<ViewerIdentityModal submitData={viewerSubmitData} flat={flat} onDone={()=>{setShowViewerIdentity(false);setViewerSubmitData(null);setMsg('Update request submitted!')}} onCancel={()=>{setShowViewerIdentity(false);setViewerSubmitData(null)}}/>}
       {showMigrate&&<MigrateDialog onDone={()=>setShowMigrate(false)} onCancel={()=>setShowMigrate(false)}/>}
       {user&&user.role!=='viewer'&&<div style={{position:'fixed',bottom:16,right:16,background:CD,border:'1px solid '+BR,borderRadius:8,padding:'8px 14px',fontSize:11,color:DM,zIndex:80,display:'flex',alignItems:'center',gap:8}}>
         <span style={{width:6,height:6,borderRadius:'50%',background:MC}}/>
