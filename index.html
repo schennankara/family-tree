@@ -1214,6 +1214,15 @@ function isEditor() { return authUser && authUser.role === 'editor'; }
 // Check if an editor can directly edit a target person
 // Allowed: self, spouse, siblings, parents, parents-in-law, and all descendants
 function canEditorDirectEdit(targetId, tree) {
+  console.log('🧪 DIRECT EDIT CHECK', {
+    authUser,
+    myId: authUser?.person_id,
+    targetId,
+    role: authUser?.role,
+    isEditor: isEditor?.(),
+    isAdmin: isAdmin?.()
+  });
+
   if (!authUser?.person_id || !tree) return false;
   if (isAdmin()) return true;
   if (!isEditor()) return false;
