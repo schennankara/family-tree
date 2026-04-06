@@ -2245,16 +2245,19 @@ function App(){
     if (isViewer()) {
       const node = findNodeById(tree, data.id);
       // Compute diff: only fields that actually changed
-      const skipKeys = new Set(['id','ch','sp','gen','_fams','_famc','_p','_n','_matchType','_spouseOf']);
+      const skipKeys = new Set(['id','ch','sp','gen','_fams','_famc','_p','_n','_matchType','_spouseOf','dn']);
       const changedFields = {};
       const prevFields = {};
       for (const [k, v] of Object.entries(data)) {
         if (skipKeys.has(k)) continue;
-        const oldVal = String(node?.[k]||'').trim();
-        const newVal = String(v||'').trim();
+        const oldRaw = node?.[k];
+        const newRaw = v;
+        // Normalize both to strings for comparison, treating undefined/null/0/false as ''
+        const oldVal = (oldRaw === undefined || oldRaw === null || oldRaw === false || oldRaw === 0) ? '' : String(oldRaw).trim();
+        const newVal = (newRaw === undefined || newRaw === null || newRaw === false || newRaw === 0) ? '' : String(newRaw).trim();
         if (oldVal !== newVal && (oldVal || newVal)) {
           changedFields[k] = v;
-          prevFields[k] = node?.[k] || '';
+          prevFields[k] = oldRaw || '';
         }
       }
       if (Object.keys(changedFields).length === 0) {
@@ -2348,16 +2351,18 @@ function App(){
       const spouseName = parentNode?.sp?.dn || data.dn || 'Spouse';
       const existingSp = parentNode?.sp || {};
       // Compute diff
-      const skipKeys = new Set(['id','ch','sp','gen','_fams','_famc','_p','_n','_matchType','_spouseOf']);
+      const skipKeys = new Set(['id','ch','sp','gen','_fams','_famc','_p','_n','_matchType','_spouseOf','dn']);
       const changedFields = { _action: 'edit_spouse' };
       const prevFields = {};
       for (const [k, v] of Object.entries(data)) {
         if (skipKeys.has(k)) continue;
-        const oldVal = String(existingSp[k]||'').trim();
-        const newVal = String(v||'').trim();
+        const oldRaw = existingSp[k];
+        const newRaw = v;
+        const oldVal = (oldRaw === undefined || oldRaw === null || oldRaw === false || oldRaw === 0) ? '' : String(oldRaw).trim();
+        const newVal = (newRaw === undefined || newRaw === null || newRaw === false || newRaw === 0) ? '' : String(newRaw).trim();
         if (oldVal !== newVal && (oldVal || newVal)) {
           changedFields[k] = v;
-          prevFields[k] = existingSp[k] || '';
+          prevFields[k] = oldRaw || '';
         }
       }
       setViewerSubmitData({ personId: spouseId, personName: spouseName + ' (spouse of ' + (parentNode?.dn||'') + ')', changes: {...changedFields, id: spouseId}, previous: prevFields, type: 'spouse' });
