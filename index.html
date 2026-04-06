@@ -178,6 +178,19 @@ async function savePerson(person, editUser) {
     body: JSON.stringify(row),
     headers: { 'Prefer': 'resolution=merge-duplicates,return=representation' }
   });
+  // Save marriage date/place to families table if provided
+  if (person.mdate || person.mplace) {
+    try {
+      const fams = await sbFetch(`families?select=*&or=(husband_id.eq.${person.id},wife_id.eq.${person.id})`);
+      if (fams.length > 0) {
+        await sbFetch(`families?id=eq.${fams[0].id}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ marriage_date: person.mdate||'', marriage_place: person.mplace||'' }),
+          headers: { 'Prefer': 'return=minimal' }
+        });
+      }
+    } catch(e) { console.warn('Marriage save failed:', e); }
+  }
   // Log edit
   try {
     await sbFetch('edit_log', {
@@ -1107,9 +1120,29 @@ async function sbAuthFetch(path, opts = {}) {
   return data;
 }
 
-// Auth state
-let authSession = null; // { access_token, user: {id, email} }
-let authUser = null;    // { id, name, email, role, person_id } from users table
+// Auth state — persisted in sessionStorage
+let authSession = null;
+let authUser = null;
+
+// Restore session on load
+try {
+  const stored = sessionStorage.getItem('ftls_session');
+  if (stored) {
+    const parsed = JSON.parse(stored);
+    authSession = parsed.session;
+    authUser = parsed.user;
+  }
+} catch(e) {}
+
+function persistAuth() {
+  try {
+    if (authSession && authUser) {
+      sessionStorage.setItem('ftls_session', JSON.stringify({ session: authSession, user: authUser }));
+    } else {
+      sessionStorage.removeItem('ftls_session');
+    }
+  } catch(e) {}
+}
 
 async function signIn(email, password) {
   const data = await sbAuthFetch('/token?grant_type=password', {
@@ -1122,6 +1155,7 @@ async function signIn(email, password) {
     headers: { 'Authorization': 'Bearer ' + data.access_token }
   });
   authUser = users[0] || null;
+  persistAuth();
   return { session: data, user: authUser };
 }
 
@@ -1131,6 +1165,7 @@ async function signOut() {
   }
   authSession = null;
   authUser = null;
+  persistAuth();
 }
 
 async function resetPassword(email) {
@@ -1514,7 +1549,7 @@ function ViewerIdentityModal({submitData, flat, onDone, onCancel}) {
   );
 }
 
-function AdminPanel({onClose}) {
+function AdminPanel({onClose, onReloadTree}) {
   const [tab, setTab] = useState('updates'); // 'updates' | 'accounts' | 'users' | 'log'
   const [updateReqs, setUpdateReqs] = useState([]);
   const [accessReqs, setAccessReqs] = useState([]);
@@ -1614,6 +1649,21 @@ function AdminPanel({onClose}) {
         }
       }
 
+      // Save marriage date/place to families table if present in changes
+      const mdate = req.changes.mdate || req.changes.marriage_date;
+      const mplace = req.changes.mplace || req.changes.marriage_place;
+      if (mdate || mplace) {
+        try {
+          const fams = await sbFetch(`families?select=*&or=(husband_id.eq.${req.person_id},wife_id.eq.${req.person_id})`, {headers:h});
+          if (fams.length > 0) {
+            await sbFetch(`families?id=eq.${fams[0].id}`, {
+              method: 'PATCH', headers: {...h, 'Prefer':'return=minimal'},
+              body: JSON.stringify({ marriage_date: mdate||fams[0].marriage_date||'', marriage_place: mplace||fams[0].marriage_place||'' })
+            });
+          }
+        } catch(e) { console.warn('Marriage approve save failed:', e); }
+      }
+
       // Mark request as approved
       await sbFetch(`update_requests?id=eq.${req.id}`, {
         method: 'PATCH', headers: h,
@@ -1621,6 +1671,7 @@ function AdminPanel({onClose}) {
       });
       setUpdateReqs(prev=>prev.map(r=>r.id===req.id?{...r,status:'approved'}:r));
       setActionMsg('Update approved and applied!');
+      if (onReloadTree) onReloadTree();
       setTimeout(()=>setActionMsg(''),3000);
     } catch(e) { setActionMsg('Error: ' + e.message); }
   };
@@ -2027,9 +2078,9 @@ function App(){
   const [showRequestAccount,setShowRequestAccount]=useState(false);
   const [showMigrate,setShowMigrate]=useState(false);
   const [pendingAction,setPendingAction]=useState(null);
-  const [user,setUser]=useState(null); // authUser object or {role:'viewer'}
-  const [activeTab,setActiveTab]=useState('tree'); // 'tree' | 'admin'
-  const [viewerGate,setViewerGate]=useState(true); // true = locked, must enter family password
+  const [user,setUser]=useState(()=>authUser||null); // restore from session
+  const [activeTab,setActiveTab]=useState('tree');
+  const [viewerGate,setViewerGate]=useState(()=>!authUser); // false if already signed in
   const [gatePassword,setGatePassword]=useState('');
   const [gateError,setGateError]=useState('');
   const [gateChecking,setGateChecking]=useState(false);
@@ -2084,30 +2135,33 @@ function App(){
     setGateChecking(false);
   };
 
-  // Load from Supabase first, fall back to GEDCOM file
-  useEffect(()=>{
-    (async()=>{
-      // Try Supabase
-      let parsed = await loadFromSupabase();
-      let source = 'Supabase';
-      // Fallback to GEDCOM file
-      if(!parsed){
-        parsed = await loadSourceGedcom();
-        source = 'GEDCOM file';
-      }
-      if(parsed){
-        setTree(parsed);
-        const s=new Set();
-        const add=(n,d)=>{if(d<2&&n.ch?.length){s.add(n.id);n.ch.forEach(c=>add(c,d+1))}};
-        add(parsed,0);
-        setExp(s);
+  // Reusable tree loader
+  const reloadTree = useCallback(async (silent=false) => {
+    let parsed = await loadFromSupabase();
+    let source = 'Supabase';
+    if(!parsed){
+      parsed = await loadSourceGedcom();
+      source = 'GEDCOM file';
+    }
+    if(parsed){
+      setTree(parsed);
+      const s=new Set();
+      const add=(n,d)=>{if(d<2&&n.ch?.length){s.add(n.id);n.ch.forEach(c=>add(c,d+1))}};
+      add(parsed,0);
+      setExp(s);
+      if(!silent){
         setMsg('Loaded '+cnt(parsed)+' people from '+source);
         setTimeout(()=>setMsg(''),3000);
-      } else {
-        setMsg('Failed to load family tree');
       }
-      setLoading(false);
-    })();
+    } else if(!silent) {
+      setMsg('Failed to load family tree');
+    }
+    return parsed;
+  },[]);
+
+  // Load on mount
+  useEffect(()=>{
+    reloadTree().then(()=>setLoading(false));
   },[]);
 
   const findNodeById=useCallback((root,id)=>{
@@ -2190,13 +2244,26 @@ function App(){
   const handleSaveEdit=(data)=>{
     if (isViewer()) {
       const node = findNodeById(tree, data.id);
-      // Capture current values for diff display
-      const prev = node ? {fn:node.fn,mn:node.mn,ln:node.ln,dn:node.dn,nk:node.nk,md:node.md,g:node.g,
-        dob:node.dob,dod:node.dod,dec:node.dec,em:node.em,ph:node.ph,a1:node.a1,a2:node.a2,ci:node.ci,
-        st:node.st,zp:node.zp,co:node.co,fb:node.fb,ig:node.ig,li:node.li,ws:node.ws,pp:node.pp,
-        bio:node.bio,loc:node.loc,prof:node.prof,emp:node.emp,notes:node.notes,
-        mdate:node.mdate,mplace:node.mplace} : {};
-      setViewerSubmitData({ personId: data.id, personName: node?.dn || data.dn || data.id, changes: data, previous: prev, type: 'edit' });
+      // Compute diff: only fields that actually changed
+      const skipKeys = new Set(['id','ch','sp','gen','_fams','_famc','_p','_n','_matchType','_spouseOf']);
+      const changedFields = {};
+      const prevFields = {};
+      for (const [k, v] of Object.entries(data)) {
+        if (skipKeys.has(k)) continue;
+        const oldVal = String(node?.[k]||'').trim();
+        const newVal = String(v||'').trim();
+        if (oldVal !== newVal && (oldVal || newVal)) {
+          changedFields[k] = v;
+          prevFields[k] = node?.[k] || '';
+        }
+      }
+      if (Object.keys(changedFields).length === 0) {
+        setMsg('No changes detected');
+        setTimeout(()=>setMsg(''),2000);
+        setEditing(null);
+        return;
+      }
+      setViewerSubmitData({ personId: data.id, personName: node?.dn || data.dn || data.id, changes: changedFields, previous: prevFields, type: 'edit' });
       setShowViewerIdentity(true);
       setEditing(null);
       return;
@@ -2279,10 +2346,21 @@ function App(){
       const parentNode = findNodeById(tree, parentId);
       const spouseId = (spouseEditing.spouse&&spouseEditing.spouse.id) || data.id || ('@sp_'+Date.now()+'@');
       const spouseName = parentNode?.sp?.dn || data.dn || 'Spouse';
-      const prev = parentNode?.sp ? {fn:parentNode.sp.fn,mn:parentNode.sp.mn,ln:parentNode.sp.ln,dn:parentNode.sp.dn,
-        dob:parentNode.sp.dob,dod:parentNode.sp.dod,em:parentNode.sp.em,ph:parentNode.sp.ph,
-        prof:parentNode.sp.prof,loc:parentNode.sp.loc} : {};
-      setViewerSubmitData({ personId: spouseId, personName: spouseName + ' (spouse of ' + (parentNode?.dn||'') + ')', changes: {...data, id: spouseId, _action: 'edit_spouse'}, previous: prev, type: 'spouse' });
+      const existingSp = parentNode?.sp || {};
+      // Compute diff
+      const skipKeys = new Set(['id','ch','sp','gen','_fams','_famc','_p','_n','_matchType','_spouseOf']);
+      const changedFields = { _action: 'edit_spouse' };
+      const prevFields = {};
+      for (const [k, v] of Object.entries(data)) {
+        if (skipKeys.has(k)) continue;
+        const oldVal = String(existingSp[k]||'').trim();
+        const newVal = String(v||'').trim();
+        if (oldVal !== newVal && (oldVal || newVal)) {
+          changedFields[k] = v;
+          prevFields[k] = existingSp[k] || '';
+        }
+      }
+      setViewerSubmitData({ personId: spouseId, personName: spouseName + ' (spouse of ' + (parentNode?.dn||'') + ')', changes: {...changedFields, id: spouseId}, previous: prevFields, type: 'spouse' });
       setShowViewerIdentity(true);
       setSpouseEditing(null);
       return;
@@ -2435,7 +2513,7 @@ function App(){
       {spouseEditing&&<EditForm node={spouseEditing.spouse||empty()} onSave={handleSaveSpouse} onCancel={()=>setSpouseEditing(null)} isNew={false}/>}
       {adding&&<EditForm node={empty()} onSave={handleAdd} onCancel={()=>setAdding(null)} isNew={true} parentId={adding} parentName={flat.find(n=>n.id===adding)?._n}/>}
       </>}
-      {activeTab==='admin'&&user&&isAdmin()&&<AdminPanel/>}
+      {activeTab==='admin'&&user&&isAdmin()&&<AdminPanel onReloadTree={()=>reloadTree(true)}/>}
       {showLogin&&<LoginModal onSuccess={handleLoginSuccess} onCancel={()=>{setShowLogin(false);setPendingAction(null)}} onRequestAccount={()=>{setShowLogin(false);setShowRequestAccount(true)}}/>}
       {showRequestAccount&&<RequestAccountModal flat={flat} onDone={()=>setShowRequestAccount(false)} onCancel={()=>setShowRequestAccount(false)}/>}
       {showViewerIdentity&&viewerSubmitData&&<ViewerIdentityModal submitData={viewerSubmitData} flat={flat} onDone={()=>{setShowViewerIdentity(false);setViewerSubmitData(null);setMsg('Update request submitted!')}} onCancel={()=>{setShowViewerIdentity(false);setViewerSubmitData(null)}}/>}
