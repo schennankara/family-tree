@@ -1596,6 +1596,16 @@ function AdminPanel({onClose, onReloadTree}) {
       const h = { 'Authorization': 'Bearer ' + authSession.access_token };
       const action = req.changes?._action || 'update';
 
+      // Take snapshot before making changes (for undo)
+      if (req.person_id && action !== 'add_child') {
+        try {
+          await sbFetch('rpc/snapshot_person', {
+            method: 'POST', headers: h,
+            body: JSON.stringify({ p_person_id: req.person_id, p_reason: 'before_approve_request_' + req.id })
+          });
+        } catch(e) { console.warn('Snapshot failed:', e); }
+      }
+
       // Map short field names (from edit form) to database column names
       const fieldMap = {
         fn:'first_name', mn:'middle_name', ln:'last_name', dn:'display_name',
@@ -1692,13 +1702,38 @@ function AdminPanel({onClose, onReloadTree}) {
   const approveAccess = async (req) => {
     try {
       const h = { 'Authorization': 'Bearer ' + authSession.access_token };
-      // Mark as approved (admin creates account separately via Supabase dashboard for now)
+      setActionMsg('Creating account for ' + req.name + '...');
+      
+      // Create the user account via Postgres function
+      const result = await sbFetch('rpc/create_family_user', {
+        method: 'POST', headers: h,
+        body: JSON.stringify({
+          p_email: req.email,
+          p_name: req.name,
+          p_person_id: req.person_id || null,
+          p_role: 'editor'
+        })
+      });
+      
+      // Trigger password reset email so user can set their own password
+      try {
+        await sbAuthFetch('/recover', {
+          method: 'POST',
+          body: JSON.stringify({ email: req.email })
+        });
+      } catch(e) { console.warn('Password reset email may not have sent:', e); }
+      
+      // Mark request as approved
       await sbFetch(`access_requests?id=eq.${req.id}`, {
         method: 'PATCH', headers: h,
         body: JSON.stringify({ status: 'approved', resolved_by: authUser.id, resolved_at: new Date().toISOString() })
       });
+      
       setAccessReqs(prev=>prev.map(r=>r.id===req.id?{...r,status:'approved'}:r));
-      setActionMsg('Access request approved! Create their account in Supabase Auth dashboard.');
+      // Refresh users list
+      const updatedUsers = await sbFetch('users?order=name', {headers:h});
+      setAllUsers(updatedUsers);
+      setActionMsg('Account created for ' + req.name + '! Password reset email sent to ' + req.email);
       setTimeout(()=>setActionMsg(''),5000);
     } catch(e) { setActionMsg('Error: ' + e.message); }
   };
@@ -1867,11 +1902,40 @@ function AdminPanel({onClose, onReloadTree}) {
 
       {!loading&&tab==='log'&&<div>
         {editLog.length===0&&<div style={{color:'#7a7568',fontSize:13}}>No edits logged yet.</div>}
-        {editLog.map(e=><div key={e.id} style={{fontSize:12,color:'#7a7568',padding:'6px 0',borderBottom:'1px solid rgba(196,163,90,0.05)'}}>
-          <span style={{color:'#8a7340'}}>{e.action}</span> on <span style={{color:'#d4cfc0'}}>{e.person_id||'—'}</span>
-          {e.edited_by&&<span> by {e.edited_by}</span>}
-          <span style={{float:'right'}}>{new Date(e.created_at).toLocaleString()}</span>
-        </div>)}
+        {editLog.map(e=>{
+          const isSnapshot = e.action === 'snapshot';
+          const isRevert = e.action === 'revert';
+          const personName = e.changes?.person?.display_name || e.person_id || '—';
+          const reason = e.changes?.reason || '';
+          return(<div key={e.id} style={{fontSize:12,color:'#7a7568',padding:'8px 0',borderBottom:'1px solid rgba(196,163,90,0.05)',display:'flex',alignItems:'center',gap:8}}>
+            <span style={{width:8,height:8,borderRadius:'50%',flexShrink:0,
+              background:isSnapshot?'#9b82c4':isRevert?'#c4a35a':e.action==='delete'?'#c05050':'#6b9e72'}}/>
+            <div style={{flex:1}}>
+              <span style={{color:isSnapshot?'#9b82c4':isRevert?'#c4a35a':'#8a7340',fontWeight:500}}>
+                {isSnapshot?'📸 Snapshot':isRevert?'↩ Reverted':e.action}
+              </span>
+              {' '}<span style={{color:'#d4cfc0'}}>{isSnapshot?personName:e.person_id||'—'}</span>
+              {e.edited_by&&<span> by {e.edited_by}</span>}
+              {reason&&<span style={{color:'#7a7568',fontStyle:'italic'}}> ({reason})</span>}
+            </div>
+            <span style={{fontSize:11,color:'#5a5548',flexShrink:0}}>{new Date(e.created_at).toLocaleString()}</span>
+            {isSnapshot&&isSuperAdmin()&&<button onClick={async()=>{
+              if(!confirm('Revert '+personName+' to this snapshot? This will undo all changes made after this point.'))return;
+              try{
+                const h={'Authorization':'Bearer '+authSession.access_token};
+                await sbFetch('rpc/revert_to_snapshot',{method:'POST',headers:h,body:JSON.stringify({p_log_id:e.id})});
+                setActionMsg('Reverted '+personName+' to snapshot!');
+                if(onReloadTree)onReloadTree();
+                // Refresh log
+                const newLog=await sbFetch('edit_log?order=created_at.desc&limit=50',{headers:h});
+                setEditLog(newLog);
+                setTimeout(()=>setActionMsg(''),3000);
+              }catch(err){setActionMsg('Revert error: '+err.message)}
+            }} style={{background:'rgba(155,130,196,0.1)',border:'1px solid rgba(155,130,196,0.3)',color:'#9b82c4',padding:'3px 10px',borderRadius:4,cursor:'pointer',fontSize:11,flexShrink:0}}>
+              ↩ Revert
+            </button>}
+          </div>);
+        })}
       </div>}
     </div>
   );
