@@ -2476,6 +2476,18 @@ function App(){
   };
 
   const handleSaveEdit=(data)=>{
+    console.log('🧪 HANDLE SAVE EDIT', {
+    dataId: data?.id,
+    dataDn: data?.dn,
+    authPersonId: authUser?.person_id,
+    authName: authUser?.name,
+    editing,
+    selId: sel?.id,
+    selName: sel?.dn,
+    selSpouseId: sel?.sp?.id,
+    selSpouseName: sel?.sp?.dn
+  });
+
     if (needsApproval(data.id)) {
       const node = findNodeById(tree, data.id);
       // Compute diff: only fields that actually changed
