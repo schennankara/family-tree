@@ -1214,58 +1214,55 @@ function isEditor() { return authUser && authUser.role === 'editor'; }
 // Check if an editor can directly edit a target person
 // Allowed: self, spouse, siblings, parents, parents-in-law, and all descendants
 function canEditorDirectEdit(targetId, tree) {
-  console.log('🧪 DIRECT EDIT CHECK', {
-    authUser,
-    myId: authUser?.person_id,
-    targetId,
-    role: authUser?.role,
-    isEditor: isEditor?.(),
-    isAdmin: isAdmin?.()
-  });
-
   if (!authUser?.person_id || !tree) return false;
   if (isAdmin()) return true;
   if (!isEditor()) return false;
-  
+
   const myId = authUser.person_id;
   if (targetId === myId) return true; // self
-  
-  // Find my node and target node in the tree
-  const myNode = findNodeInTree(tree, myId);
-  const targetNode = findNodeInTree(tree, targetId);
-  if (!myNode) return false;
-  
-  // Check if target is my spouse
-  if (myNode.sp?.id === targetId) return true;
-  
-  // Check if target is a descendant of me (children, grandchildren, etc.)
-  if (isDescendant(myNode, targetId)) return true;
-  
-  // Find my parent node
-  const myParent = findParentOf(tree, myId);
-  if (myParent) {
-    // Check if target is my parent
-    if (myParent.id === targetId) return true;
-    // Check if target is my parent's spouse (other parent)
-    if (myParent.sp?.id === targetId) return true;
-    // Check if target is a sibling (same parent's child)
-    if (myParent.ch?.some(c => c.id === targetId)) return true;
-    // Check if target is a sibling's spouse
-    if (myParent.ch?.some(c => c.sp?.id === targetId)) return true;
-    // Check if target is a descendant of a sibling (nieces/nephews)
-    if (myParent.ch?.some(c => isDescendant(c, targetId))) return true;
+
+  const myFamilyNode = findFamilyNodeContaining(tree, myId);
+  if (!myFamilyNode) return false;
+
+  const spouseId = myFamilyNode.id === myId ? myFamilyNode.sp?.id : myFamilyNode.id;
+  if (spouseId === targetId) return true; // spouse
+
+  // descendants from my family unit
+  if (isDescendant(myFamilyNode, targetId)) return true;
+
+  // my parents / siblings side
+  const myParentFamily = findParentFamilyOf(tree, myId);
+  if (myParentFamily) {
+    if (myParentFamily.id === targetId) return true; // parent
+    if (myParentFamily.sp?.id === targetId) return true; // other parent
+    if (myParentFamily.ch?.some(c => c.id === targetId)) return true; // sibling
+    if (myParentFamily.ch?.some(c => c.sp?.id === targetId)) return true; // sibling spouse
+    if (myParentFamily.ch?.some(c => isDescendant(c, targetId))) return true; // sibling descendants
   }
-  
-  // Check parents-in-law (spouse's parents)
-  if (myNode.sp?.id) {
-    const spouseParent = findParentOf(tree, myNode.sp.id);
-    if (spouseParent) {
-      if (spouseParent.id === targetId) return true;
-      if (spouseParent.sp?.id === targetId) return true;
+
+  // spouse's parents / siblings side
+  if (spouseId) {
+    const spouseParentFamily = findParentFamilyOf(tree, spouseId);
+    if (spouseParentFamily) {
+      if (spouseParentFamily.id === targetId) return true; // parent-in-law
+      if (spouseParentFamily.sp?.id === targetId) return true; // other parent-in-law
+      if (spouseParentFamily.ch?.some(c => c.id === targetId)) return true; // spouse sibling
+      if (spouseParentFamily.ch?.some(c => c.sp?.id === targetId)) return true; // spouse sibling spouse
+      if (spouseParentFamily.ch?.some(c => isDescendant(c, targetId))) return true; // spouse-side descendants
     }
   }
-  
+
   return false;
+}
+
+function findFamilyNodeContaining(node, personId) {
+  if (!node) return null;
+  if (node.id === personId || node.sp?.id === personId) return node;
+  for (const c of node.ch || []) {
+    const found = findFamilyNodeContaining(c, personId);
+    if (found) return found;
+  }
+  return null;
 }
 
 function findNodeInTree(node, id) {
@@ -1284,6 +1281,16 @@ function findParentOf(node, childId) {
   if (node.ch?.some(c => c.id === childId)) return node;
   for (const c of node.ch || []) {
     const found = findParentOf(c, childId);
+    if (found) return found;
+  }
+  return null;
+}
+
+function findParentFamilyOf(node, personId) {
+  if (!node) return null;
+  if (node.ch?.some(c => c.id === personId || c.sp?.id === personId)) return node;
+  for (const c of node.ch || []) {
+    const found = findParentFamilyOf(c, personId);
     if (found) return found;
   }
   return null;
@@ -2475,19 +2482,22 @@ function App(){
     return false;
   };
 
-  const handleSaveEdit=(data)=>{
-    console.log('🧪 HANDLE SAVE EDIT', {
-    dataId: data?.id,
-    dataDn: data?.dn,
-    authPersonId: authUser?.person_id,
-    authName: authUser?.name,
-    editing,
-    selId: sel?.id,
-    selName: sel?.dn,
-    selSpouseId: sel?.sp?.id,
-    selSpouseName: sel?.sp?.dn
-  });
+  const startEditForNode = useCallback((node) => {
+    const resolved = findNodeById(tree, node.id) || node;
+    const loggedInPersonId = authUser?.person_id || user?.person_id;
+    if (resolved?.sp?.id && resolved.sp.id === loggedInPersonId && resolved.id !== loggedInPersonId) {
+      setSpouseEditing({ parentId: resolved.id, spouse: { ...(resolved.sp || {}), dn: (resolved.sp && resolved.sp.dn) || '' } });
+      return;
+    }
+    setEditing(resolved);
+  }, [tree, user]);
 
+  const openSpouseEditor = useCallback((node) => {
+    const resolved = findNodeById(tree, node.id) || node;
+    setSpouseEditing({ parentId: resolved.id, spouse: { ...(resolved.sp || {}), dn: (resolved.sp && resolved.sp.dn) || '' } });
+  }, [tree]);
+
+  const handleSaveEdit=(data)=>{
     if (needsApproval(data.id)) {
       const node = findNodeById(tree, data.id);
       // Compute diff: only fields that actually changed
@@ -2591,7 +2601,8 @@ function App(){
   const handleSaveSpouse=(data)=>{
     if(!spouseEditing?.parentId)return;
     const parentId=spouseEditing.parentId;
-    if (needsApproval(parentId)) {
+    const spouseIdForScope = (spouseEditing.spouse&&spouseEditing.spouse.id) || data.id || parentId;
+    if (needsApproval(spouseIdForScope)) {
       const parentNode = findNodeById(tree, parentId);
       const spouseId = (spouseEditing.spouse&&spouseEditing.spouse.id) || data.id || ('@sp_'+Date.now()+'@');
       const spouseName = parentNode?.sp?.dn || data.dn || 'Spouse';
@@ -2762,9 +2773,9 @@ function App(){
       </div>
       {activeTab==='tree'&&<>
       <div style={{maxWidth:1200,margin:'0 auto',padding:'0 16px 60px'}}>
-        <TreeNode node={tree} exp={exp} onTog={toggle} onSel={(node)=>setSel(findNodeById(tree,node.id)||node)} onEdit={(node)=>requireAuth(()=>setEditing(findNodeById(tree,node.id)||node))} onAdd={(id)=>requireAuth(()=>setAdding(id))} onDel={(id)=>requireAuth(()=>handleDelete(id))} onEditSpouse={(node)=>requireAuth(()=>setSpouseEditing({parentId:node.id,spouse:{...(node.sp||{}),dn:(node.sp&&node.sp.dn)||''}}))} onDelSpouse={(id)=>requireAuth(()=>handleDeleteSpouse(id))} hl={hl}/>
+        <TreeNode node={tree} exp={exp} onTog={toggle} onSel={(node)=>setSel(findNodeById(tree,node.id)||node)} onEdit={(node)=>requireAuth(()=>startEditForNode(node))} onAdd={(id)=>requireAuth(()=>setAdding(id))} onDel={(id)=>requireAuth(()=>handleDelete(id))} onEditSpouse={(node)=>requireAuth(()=>openSpouseEditor(node))} onDelSpouse={(id)=>requireAuth(()=>handleDeleteSpouse(id))} hl={hl}/>
       </div>
-      {sel&&!editing&&<Detail node={findNodeById(tree,sel.id)||sel} root={tree} onClose={()=>setSel(null)} onEdit={(node)=>requireAuth(()=>setEditing(findNodeById(tree,node.id)||node))} onEditSpouse={(node)=>requireAuth(()=>setSpouseEditing({parentId:node.id,spouse:{...(node.sp||{}),dn:(node.sp&&node.sp.dn)||''}}))} onDelSpouse={(id)=>requireAuth(()=>handleDeleteSpouse(id))}/>}
+      {sel&&!editing&&<Detail node={findNodeById(tree,sel.id)||sel} root={tree} onClose={()=>setSel(null)} onEdit={(node)=>requireAuth(()=>startEditForNode(node))} onEditSpouse={(node)=>requireAuth(()=>openSpouseEditor(node))} onDelSpouse={(id)=>requireAuth(()=>handleDeleteSpouse(id))}/>}
       {editing&&<EditForm node={findNodeById(tree,editing.id)||editing} onSave={handleSaveEdit} onCancel={()=>setEditing(null)} isNew={false}/>}
       {spouseEditing&&<EditForm node={spouseEditing.spouse||empty()} onSave={handleSaveSpouse} onCancel={()=>setSpouseEditing(null)} isNew={false}/>}
       {adding&&<EditForm node={empty()} onSave={handleAdd} onCancel={()=>setAdding(null)} isNew={true} parentId={adding} parentName={flat.find(n=>n.id===adding)?._n}/>}
