@@ -34,6 +34,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
+    const APP_VERSION = 'v2.4.0';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
 
@@ -1723,6 +1724,7 @@ function AdminPanel({onClose, onReloadTree}) {
   const [accessReqs, setAccessReqs] = useState([]);
   const [allUsers, setAllUsers] = useState([]);
   const [editLog, setEditLog] = useState([]);
+  const [expandedLog, setExpandedLog] = useState(null); // id of expanded log entry
   const [loading, setLoading] = useState(true);
   const [actionMsg, setActionMsg] = useState('');
   const btnS2={background:'rgba(196,163,90,0.08)',border:'1px solid rgba(196,163,90,0.2)',color:'#c4a35a',padding:'6px 14px',borderRadius:5,fontSize:12,cursor:'pointer'};
@@ -2073,35 +2075,75 @@ function AdminPanel({onClose, onReloadTree}) {
         {editLog.map(e=>{
           const isSnapshot = e.action === 'snapshot';
           const isRevert = e.action === 'revert';
+          const isUpdate = e.action === 'update';
           const personName = e.changes?.person?.display_name || e.person_id || '—';
           const reason = e.changes?.reason || '';
-          return(<div key={e.id} style={{fontSize:12,color:'#7a7568',padding:'8px 0',borderBottom:'1px solid rgba(196,163,90,0.05)',display:'flex',alignItems:'center',gap:8}}>
-            <span style={{width:8,height:8,borderRadius:'50%',flexShrink:0,
-              background:isSnapshot?'#9b82c4':isRevert?'#c4a35a':e.action==='delete'?'#c05050':'#6b9e72'}}/>
-            <div style={{flex:1}}>
-              <span style={{color:isSnapshot?'#9b82c4':isRevert?'#c4a35a':'#8a7340',fontWeight:500}}>
-                {isSnapshot?'📸 Snapshot':isRevert?'↩ Reverted':e.action}
-              </span>
-              {' '}<span style={{color:'#d4cfc0'}}>{isSnapshot?personName:e.person_id||'—'}</span>
-              {e.edited_by&&<span> by {e.edited_by}</span>}
-              {reason&&<span style={{color:'#7a7568',fontStyle:'italic'}}> ({reason})</span>}
+          const isOpen = expandedLog === e.id;
+          const canRevert = isSnapshot && isAdmin(); // admin + super_admin can revert
+
+          return(<div key={e.id} style={{background:isOpen?'rgba(196,163,90,0.03)':'transparent',borderRadius:6,marginBottom:4}}>
+            <div onClick={()=>setExpandedLog(isOpen?null:e.id)} style={{fontSize:12,color:'#7a7568',padding:'8px 10px',cursor:'pointer',display:'flex',alignItems:'center',gap:8,
+              borderBottom:isOpen?'none':'1px solid rgba(196,163,90,0.05)'}}>
+              <span style={{width:8,height:8,borderRadius:'50%',flexShrink:0,
+                background:isSnapshot?'#9b82c4':isRevert?'#c4a35a':e.action==='delete'?'#c05050':'#6b9e72'}}/>
+              <div style={{flex:1}}>
+                <span style={{color:isSnapshot?'#9b82c4':isRevert?'#c4a35a':'#8a7340',fontWeight:500}}>
+                  {isSnapshot?'📸 Snapshot':isRevert?'↩ Reverted':isUpdate?'✎ Updated':e.action}
+                </span>
+                {' '}<span style={{color:'#d4cfc0'}}>{isSnapshot?personName:e.person_id||'—'}</span>
+                {e.edited_by&&e.edited_by!=='system'&&<span> by {e.edited_by}</span>}
+                {reason&&<span style={{fontStyle:'italic'}}> ({reason})</span>}
+              </div>
+              <span style={{fontSize:11,color:'#5a5548',flexShrink:0}}>{new Date(e.created_at).toLocaleString()}</span>
+              <span style={{color:'#5a5548',fontSize:10,flexShrink:0}}>{isOpen?'▼':'▶'}</span>
             </div>
-            <span style={{fontSize:11,color:'#5a5548',flexShrink:0}}>{new Date(e.created_at).toLocaleString()}</span>
-            {isSnapshot&&isSuperAdmin()&&<button onClick={async()=>{
-              if(!confirm('Revert '+personName+' to this snapshot? This will undo all changes made after this point.'))return;
-              try{
-                const h={'Authorization':'Bearer '+authSession.access_token};
-                await sbFetch('rpc/revert_to_snapshot',{method:'POST',headers:h,body:JSON.stringify({p_log_id:e.id})});
-                setActionMsg('Reverted '+personName+' to snapshot!');
-                if(onReloadTree)onReloadTree();
-                // Refresh log
-                const newLog=await sbFetch('edit_log?order=created_at.desc&limit=50',{headers:h});
-                setEditLog(newLog);
-                setTimeout(()=>setActionMsg(''),3000);
-              }catch(err){setActionMsg('Revert error: '+err.message)}
-            }} style={{background:'rgba(155,130,196,0.1)',border:'1px solid rgba(155,130,196,0.3)',color:'#9b82c4',padding:'3px 10px',borderRadius:4,cursor:'pointer',fontSize:11,flexShrink:0}}>
-              ↩ Revert
-            </button>}
+
+            {isOpen&&<div style={{padding:'8px 10px 12px 28px',borderBottom:'1px solid rgba(196,163,90,0.05)'}}>
+              {isSnapshot&&e.changes?.person&&<div style={{fontSize:11,color:'#d4cfc0',background:'#0a0a08',padding:10,borderRadius:4,marginBottom:8,maxHeight:200,overflowY:'auto'}}>
+                <div style={{color:'#8a7340',fontWeight:500,marginBottom:6}}>Saved State:</div>
+                {Object.entries(e.changes.person).filter(([k,v])=>v&&k!=='id'&&!k.startsWith('created')&&!k.startsWith('updated')).map(([k,v])=>
+                  <div key={k}><span style={{color:'#7a7568'}}>{k}:</span> {String(v)}</div>
+                )}
+                {e.changes.families&&<div style={{marginTop:8}}>
+                  <div style={{color:'#8a7340',fontWeight:500,marginBottom:4}}>Family Data:</div>
+                  {(Array.isArray(e.changes.families)?e.changes.families:[]).map((f,i)=>
+                    <div key={i}>{f.marriage_date&&<span>Marriage: {f.marriage_date} </span>}{f.marriage_place&&<span>at {f.marriage_place}</span>}</div>
+                  )}
+                </div>}
+              </div>}
+
+              {isUpdate&&e.changes&&<div style={{fontSize:11,color:'#d4cfc0',background:'#0a0a08',padding:10,borderRadius:4,marginBottom:8,maxHeight:200,overflowY:'auto'}}>
+                <div style={{color:'#8a7340',fontWeight:500,marginBottom:6}}>Changes Applied:</div>
+                {Object.entries(e.changes).filter(([k,v])=>v&&k!=='id'&&!k.startsWith('updated')).map(([k,v])=>
+                  <div key={k}><span style={{color:'#7a7568'}}>{k}:</span> {String(v).substring(0,80)}</div>
+                )}
+              </div>}
+
+              {isRevert&&<div style={{fontSize:11,color:'#c4a35a',fontStyle:'italic'}}>
+                Reverted from snapshot #{e.changes?.reverted_from_snapshot}
+              </div>}
+
+              {!isSnapshot&&!isUpdate&&!isRevert&&e.changes&&<div style={{fontSize:11,color:'#d4cfc0',background:'#0a0a08',padding:10,borderRadius:4,marginBottom:8,maxHeight:150,overflowY:'auto'}}>
+                <pre style={{margin:0,whiteSpace:'pre-wrap',wordBreak:'break-all',fontFamily:'inherit'}}>{JSON.stringify(e.changes,null,2).substring(0,500)}</pre>
+              </div>}
+
+              {canRevert&&<button onClick={async(ev)=>{
+                ev.stopPropagation();
+                if(!confirm('Revert '+personName+' to this snapshot? This will undo all changes made after this point.'))return;
+                try{
+                  const h={'Authorization':'Bearer '+authSession.access_token};
+                  await sbFetch('rpc/revert_to_snapshot',{method:'POST',headers:h,body:JSON.stringify({p_log_id:e.id})});
+                  setActionMsg('Reverted '+personName+' to snapshot!');
+                  if(onReloadTree)onReloadTree();
+                  const newLog=await sbFetch('edit_log?order=created_at.desc&limit=50',{headers:h});
+                  setEditLog(newLog);
+                  setExpandedLog(null);
+                  setTimeout(()=>setActionMsg(''),3000);
+                }catch(err){setActionMsg('Revert error: '+err.message)}
+              }} style={{background:'rgba(155,130,196,0.1)',border:'1px solid rgba(155,130,196,0.3)',color:'#9b82c4',padding:'4px 14px',borderRadius:4,cursor:'pointer',fontSize:11,marginTop:4}}>
+                ↩ Revert to this snapshot
+              </button>}
+            </div>}
           </div>);
         })}
       </div>}
@@ -2546,12 +2588,24 @@ function App(){
       return next;
     });
     setEditing(null);
-    savePerson(data, user?.name||user?.email||"").then(()=>{
-      setMsg('Saved to database!');
-    }).catch(e=>{
-      console.error('Save error:', e, e?.message);
-      setMsg('DB save failed: ' + (e?.message || 'unknown error'));
-    });
+    // Snapshot before save (for undo), then save
+    (async()=>{
+      try {
+        if (authSession?.access_token) {
+          await sbFetch('rpc/snapshot_person', {
+            method:'POST',
+            headers:{'Authorization':'Bearer '+authSession.access_token},
+            body:JSON.stringify({p_person_id:data.id, p_reason:'before_direct_edit'})
+          });
+        }
+      } catch(e) { console.warn('Snapshot failed:', e); }
+      savePerson(data, user?.name||user?.email||"").then(()=>{
+        setMsg('Saved to database!');
+      }).catch(e=>{
+        console.error('Save error:', e, e?.message);
+        setMsg('DB save failed: ' + (e?.message || 'unknown error'));
+      });
+    })();
     setTimeout(()=>{revealNode(updatedNodeId,{select:false})},0);
     setTimeout(()=>setMsg(''),2000);
   };
@@ -2695,6 +2749,7 @@ function App(){
       <style>{'@keyframes spin{to{transform:rotate(360deg)}}'}</style>
       <span style={{fontSize:36,color:GC,fontWeight:300,letterSpacing:2}}>Chennamkara</span>
       <span style={{fontSize:11,color:DM,letterSpacing:4,textTransform:'uppercase',marginBottom:8}}>Family Tree</span>
+      <span style={{fontSize:9,color:'#3a3830',letterSpacing:1}}>{APP_VERSION}</span>
       <div style={{width:Math.min(340,window.innerWidth-48),textAlign:'center'}}>
         <div style={{fontSize:13,color:DM,marginBottom:16,lineHeight:1.6}}>Enter the family password to view the tree</div>
         <input type="password" value={gatePassword} onChange={e=>{setGatePassword(e.target.value);setGateError('')}}
@@ -2758,8 +2813,11 @@ function App(){
             }
             {msg&&<span style={{fontSize:12,color:'#6b9e72',marginLeft:8,animation:'fadeIn 0.3s'}}>{msg}</span>}
           </div>
-          <div style={{display:'flex',gap:20,fontSize:12,color:DM,marginBottom:12}}>
+          <div style={{display:'flex',gap:20,fontSize:12,color:DM,marginBottom:12,alignItems:'center'}}>
             <span><strong style={{color:GD}}>{total}</strong> people</span>
+            <span style={{color:'rgba(196,163,90,0.3)'}}>·</span>
+            <span style={{fontSize:10,color:'#5a5548',letterSpacing:1}}>{APP_VERSION}</span>
+            <span onClick={()=>{setMsg('Refreshing...');reloadTree(false)}} title="Refresh tree data from database" style={{cursor:'pointer',fontSize:13,color:DM,padding:'2px 6px',borderRadius:4,background:'rgba(196,163,90,0.06)',border:'1px solid rgba(196,163,90,0.1)'}}>↻ Refresh</span>
           </div>
           <div style={{display:'flex',gap:8,flexWrap:'wrap',alignItems:'center'}}>
             <div style={{position:'relative',flex:1,minWidth:180,maxWidth:360}}>
