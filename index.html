@@ -49,23 +49,18 @@ const SB_HEADERS = {
 
 async function sbFetch(path, opts = {}) {
   const url = SUPABASE_URL + '/rest/v1/' + path;
-  const mergedHeaders = { ...SB_HEADERS, ...(opts.headers || {}) };
-  if (authSession?.access_token && !(opts.headers && opts.headers.Authorization)) {
+  const mergedHeaders = { ...SB_HEADERS, ...(opts.headers||{}) };
+  if (authSession?.access_token && !mergedHeaders['Authorization']) {
     mergedHeaders['Authorization'] = 'Bearer ' + authSession.access_token;
   }
   const resp = await fetch(url, { ...opts, headers: mergedHeaders });
-  const text = await resp.text();
+  const bodyText = await resp.text();
   if (!resp.ok) {
-    console.error('Supabase request failed', {
-      path,
-      status: resp.status,
-      responseText: text,
-      usingAuthUser: !!authSession?.access_token
-    });
-    throw new Error(text || `Supabase ${resp.status}`);
+    console.error('Supabase request failed', { path, status: resp.status, bodyText });
+    throw new Error(bodyText || `Supabase ${resp.status}`);
   }
-  if (!text) return [];
-  try { return JSON.parse(text); } catch(e) { return []; }
+  if (!bodyText) return [];
+  try { return JSON.parse(bodyText); } catch(e) { return []; }
 }
 
 /* ───── LOAD FROM SUPABASE ───── */
@@ -1228,7 +1223,7 @@ function canEditorDirectEdit(targetId, tree) {
   if (!isEditor()) return false;
 
   const myId = authUser.person_id;
-  if (targetId === myId) return true;
+  if (targetId === myId) return true; // self
 
   const myFamilyNode = findFamilyNodeContaining(tree, myId);
   if (!myFamilyNode) return false;
@@ -1261,17 +1256,6 @@ function canEditorDirectEdit(targetId, tree) {
   return false;
 }
 
-function findNodeInTree(node, id) {
-  if (!node) return null;
-  if (node.id === id) return node;
-  if (node.sp?.id === id) return node.sp;
-  for (const c of node.ch || []) {
-    const found = findNodeInTree(c, id);
-    if (found) return found;
-  }
-  return null;
-}
-
 function findFamilyNodeContaining(node, personId) {
   if (!node) return null;
   if (node.id === personId || node.sp?.id === personId) return node;
@@ -1287,6 +1271,17 @@ function findParentFamilyOf(node, personId) {
   if (node.ch?.some(c => c.id === personId || c.sp?.id === personId)) return node;
   for (const c of node.ch || []) {
     const found = findParentFamilyOf(c, personId);
+    if (found) return found;
+  }
+  return null;
+}
+
+function findNodeInTree(node, id) {
+  if (!node) return null;
+  if (node.id === id) return node;
+  if (node.sp?.id === id) return node.sp;
+  for (const c of node.ch || []) {
+    const found = findNodeInTree(c, id);
     if (found) return found;
   }
   return null;
@@ -1310,22 +1305,6 @@ function isDescendant(node, targetId) {
     if (isDescendant(c, targetId)) return true;
   }
   return false;
-}
-
-function openEditForNode(tree, node, setEditing, setSpouseEditing) {
-  const liveNode = findNodeById(tree, node?.id) || node;
-  if (!liveNode) return;
-
-  const myId = authUser?.person_id;
-  if (myId && liveNode.sp?.id === myId) {
-    setSpouseEditing({
-      parentId: liveNode.id,
-      spouse: { ...(liveNode.sp || {}), dn: liveNode.sp?.dn || '' }
-    });
-    return;
-  }
-
-  setEditing(liveNode);
 }
 
 /* ───── LOGIN MODAL ───── */
@@ -2422,6 +2401,7 @@ function App(){
   const findNodeById=useCallback((root,id)=>{
     if(!root)return null;
     if(root.id===id)return root;
+    if(root.sp?.id===id)return root.sp;
     for(const c of root.ch||[]){
       const found=findNodeById(c,id);
       if(found)return found;
@@ -2444,6 +2424,16 @@ function App(){
     if(!root.ch)return root;
     return {...root,ch:root.ch.filter(c=>c.id!==targetId).map(c=>removeNode(c,targetId))};
   },[]);
+
+  const openEditForNode = useCallback((node)=>{
+    if(!node) return;
+    const familyNode = findFamilyNodeContaining(tree, node.id);
+    if (familyNode?.sp?.id === node.id) {
+      setSpouseEditing({ parentId: familyNode.id, spouse: { ...(familyNode.sp||{}), dn: familyNode.sp?.dn || node.dn || '' } });
+      return;
+    }
+    setEditing(findNodeById(tree,node.id)||node);
+  },[tree, findNodeById]);
 
   const toggle=useCallback(id=>{
     setExp(p=>{const n=new Set(p);n.has(id)?n.delete(id):n.add(id);return n});
@@ -2608,12 +2598,12 @@ function App(){
   const handleSaveSpouse=(data)=>{
     if(!spouseEditing?.parentId)return;
     const parentId=spouseEditing.parentId;
-    const spouseId = (spouseEditing.spouse&&spouseEditing.spouse.id) || data.id || ('@sp_'+Date.now()+'@');
+    const spouseId=(spouseEditing.spouse&&spouseEditing.spouse.id)||data.id||('@sp_'+Date.now()+'@');
+
     if (needsApproval(spouseId)) {
       const parentNode = findNodeById(tree, parentId);
       const spouseName = parentNode?.sp?.dn || data.dn || 'Spouse';
       const existingSp = parentNode?.sp || {};
-      // Compute diff
       const skipKeys = new Set(['id','ch','sp','gen','_fams','_famc','_p','_n','_matchType','_spouseOf','dn']);
       const changedFields = { _action: 'edit_spouse' };
       const prevFields = {};
@@ -2628,11 +2618,24 @@ function App(){
           prevFields[k] = oldRaw || '';
         }
       }
-      setViewerSubmitData({ personId: spouseId, personName: spouseName + ' (spouse of ' + (parentNode?.dn||'') + ')', changes: {...changedFields, id: spouseId}, previous: prevFields, type: 'spouse' });
+      if (Object.keys(changedFields).length === 1) {
+        setMsg('No spouse changes detected');
+        setTimeout(()=>setMsg(''),2000);
+        setSpouseEditing(null);
+        return;
+      }
+      setViewerSubmitData({
+        personId: spouseId,
+        personName: spouseName + ' (spouse of ' + (parentNode?.dn||'') + ')',
+        changes: {...changedFields, id: spouseId},
+        previous: prevFields,
+        type: 'spouse'
+      });
       setShowViewerIdentity(true);
       setSpouseEditing(null);
       return;
     }
+
     const spouseData={...data, id:spouseId};
     setTree(prev=>updateNode(prev,parentId,(existing)=>({...existing,sp:{...(existing.sp||{}),...spouseData}})));
     setSpouseEditing(null);
@@ -2642,7 +2645,7 @@ function App(){
       console.error('Spouse save error:', e, e?.message, e?.stack);
       setMsg('Spouse DB save failed: ' + (e?.message || 'unknown error'));
     });
-    setTimeout(()=>setMsg(''),2000);
+    setTimeout(()=>setMsg(''),2500);
   };
 
   const handleDeleteSpouse=(parentId)=>{
@@ -2778,9 +2781,9 @@ function App(){
       </div>
       {activeTab==='tree'&&<>
       <div style={{maxWidth:1200,margin:'0 auto',padding:'0 16px 60px'}}>
-        <TreeNode node={tree} exp={exp} onTog={toggle} onSel={(node)=>setSel(findNodeById(tree,node.id)||node)} onEdit={(node)=>requireAuth(()=>openEditForNode(tree,node,setEditing,setSpouseEditing))} onAdd={(id)=>requireAuth(()=>setAdding(id))} onDel={(id)=>requireAuth(()=>handleDelete(id))} onEditSpouse={(node)=>requireAuth(()=>setSpouseEditing({parentId:node.id,spouse:{...(node.sp||{}),dn:(node.sp&&node.sp.dn)||''}}))} onDelSpouse={(id)=>requireAuth(()=>handleDeleteSpouse(id))} hl={hl}/>
+        <TreeNode node={tree} exp={exp} onTog={toggle} onSel={(node)=>setSel(findNodeById(tree,node.id)||node)} onEdit={(node)=>requireAuth(()=>openEditForNode(node))} onAdd={(id)=>requireAuth(()=>setAdding(id))} onDel={(id)=>requireAuth(()=>handleDelete(id))} onEditSpouse={(node)=>requireAuth(()=>setSpouseEditing({parentId:node.id,spouse:{...(node.sp||{}),dn:(node.sp&&node.sp.dn)||''}}))} onDelSpouse={(id)=>requireAuth(()=>handleDeleteSpouse(id))} hl={hl}/>
       </div>
-      {sel&&!editing&&<Detail node={findNodeById(tree,sel.id)||sel} root={tree} onClose={()=>setSel(null)} onEdit={(node)=>requireAuth(()=>openEditForNode(tree,node,setEditing,setSpouseEditing))} onEditSpouse={(node)=>requireAuth(()=>setSpouseEditing({parentId:node.id,spouse:{...(node.sp||{}),dn:(node.sp&&node.sp.dn)||''}}))} onDelSpouse={(id)=>requireAuth(()=>handleDeleteSpouse(id))}/>}
+      {sel&&!editing&&<Detail node={findNodeById(tree,sel.id)||sel} root={tree} onClose={()=>setSel(null)} onEdit={(node)=>requireAuth(()=>openEditForNode(node))} onEditSpouse={(node)=>requireAuth(()=>setSpouseEditing({parentId:node.id,spouse:{...(node.sp||{}),dn:(node.sp&&node.sp.dn)||''}}))} onDelSpouse={(id)=>requireAuth(()=>handleDeleteSpouse(id))}/>}
       {editing&&<EditForm node={findNodeById(tree,editing.id)||editing} onSave={handleSaveEdit} onCancel={()=>setEditing(null)} isNew={false}/>}
       {spouseEditing&&<EditForm node={spouseEditing.spouse||empty()} onSave={handleSaveSpouse} onCancel={()=>setSpouseEditing(null)} isNew={false}/>}
       {adding&&<EditForm node={empty()} onSave={handleAdd} onCancel={()=>setAdding(null)} isNew={true} parentId={adding} parentName={flat.find(n=>n.id===adding)?._n}/>}
