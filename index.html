@@ -2633,7 +2633,6 @@ function App(){
       setSpouseEditing(null);
       return;
     }
-    const spouseId=(spouseEditing.spouse&&spouseEditing.spouse.id)||data.id||('@sp_'+Date.now()+'@');
     const spouseData={...data, id:spouseId};
     setTree(prev=>updateNode(prev,parentId,(existing)=>({...existing,sp:{...(existing.sp||{}),...spouseData}})));
     setSpouseEditing(null);
