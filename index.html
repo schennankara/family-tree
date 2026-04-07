@@ -34,7 +34,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v2.5.5';
+    const APP_VERSION = 'v2.5.6';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
 
@@ -193,40 +193,23 @@ async function savePerson(person, editUser) {
     updated_by: editUser||'',
   };
   console.log('savePerson called:', { id: person.id, nickname: row.nickname, display_name: row.display_name });
-  console.log('savePerson FULL ROW:', JSON.stringify(row));
-  // Check if person exists → PATCH (update), else POST (insert)
-  const existing = await sbFetch(`persons?id=eq."${person.id}"&select=id`);
-  console.log('savePerson existence check:', { id: person.id, found: existing.length, existing });
-  if (existing.length > 0) {
-    console.log('savePerson PATCH:', person.id, 'nickname=', row.nickname);
-    console.log('savePerson FULL ROW:', JSON.stringify(row));
-    await sbFetch(`persons?id=eq."${person.id}"`, {
-      method: 'PATCH',
-      body: JSON.stringify(row),
-      headers: { 'Prefer': 'return=minimal' }
-    });
-    // Verify the write actually landed
-    const verify = await sbFetch(`persons?id=eq."${person.id}"&select=id,nickname,first_name`);
-    console.log('savePerson VERIFY after PATCH:', verify[0]);
-    if (verify[0]?.nickname !== row.nickname) {
-      console.error('PATCH DID NOT PERSIST! DB has:', verify[0]?.nickname, 'Expected:', row.nickname);
-    }
-  } else {
-    row.id = person.id;
-    console.log('savePerson POST (new):', person.id);
-    await sbFetch('persons', {
-      method: 'POST',
-      body: JSON.stringify(row),
-      headers: { 'Prefer': 'return=minimal' }
-    });
-    console.log('savePerson POST succeeded for', person.id);
-  }
+  // Use upsert (POST with merge-duplicates) — avoids PATCH filter issues with @ in IDs
+  row.id = person.id;
+  await sbFetch('persons', {
+    method: 'POST',
+    body: JSON.stringify(row),
+    headers: { 'Prefer': 'return=minimal,resolution=merge-duplicates' }
+  });
+  console.log('savePerson upsert succeeded for', person.id);
+  // Verify
+  const verify = await sbFetch(`persons?id=eq.${person.id}&select=id,nickname,first_name`);
+  console.log('savePerson VERIFY:', verify[0]);
   // Save marriage date/place to families table if provided
   if (person.mdate || person.mplace) {
     try {
-      const fams = await sbFetch(`families?select=*&or=(husband_id.eq."${person.id}",wife_id.eq."${person.id}")`);
+      const fams = await sbFetch(`families?select=*&or=(husband_id.eq.${person.id},wife_id.eq.${person.id})`);
       if (fams.length > 0) {
-        await sbFetch(`families?id=eq."${fams[0].id}"`, {
+        await sbFetch(`families?id=eq.${fams[0].id}`, {
           method: 'PATCH',
           body: JSON.stringify({ marriage_date: person.mdate||'', marriage_place: person.mplace||'' }),
           headers: { 'Prefer': 'return=minimal' }
@@ -245,25 +228,16 @@ async function savePerson(person, editUser) {
 
 async function saveFamily(familyId, husbandId, wifeId, children, mdate, mplace) {
   const row = {
+    id: familyId,
     husband_id: husbandId||null, wife_id: wifeId||null,
     children: children||[],
     marriage_date: mdate||'', marriage_place: mplace||'',
   };
-  const existing = await sbFetch(`families?id=eq."${familyId}"&select=id`);
-  if (existing.length > 0) {
-    await sbFetch(`families?id=eq."${familyId}"`, {
-      method: 'PATCH',
-      body: JSON.stringify(row),
-      headers: { 'Prefer': 'return=minimal' }
-    });
-  } else {
-    row.id = familyId;
-    await sbFetch('families', {
-      method: 'POST',
-      body: JSON.stringify(row),
-      headers: { 'Prefer': 'return=minimal' }
-    });
-  }
+  await sbFetch('families', {
+    method: 'POST',
+    body: JSON.stringify(row),
+    headers: { 'Prefer': 'return=minimal,resolution=merge-duplicates' }
+  });
 }
 
 async function deletePersonFromDB(personId, editUser) {
@@ -271,20 +245,20 @@ async function deletePersonFromDB(personId, editUser) {
   const fams = await sbFetch(`families?select=*&children=cs.{${personId}}`);
   for (const f of fams) {
     const newChildren = (f.children||[]).filter(c=>c!==personId);
-    await sbFetch(`families?id=eq."${f.id}"`, {
+    await sbFetch(`families?id=eq.${f.id}`, {
       method: 'PATCH',
       body: JSON.stringify({ children: newChildren })
     });
   }
   // Remove families where this person is husband or wife (if no children)
-  const asFams = await sbFetch(`families?select=*&or=(husband_id.eq."${personId}",wife_id.eq."${personId}")`);
+  const asFams = await sbFetch(`families?select=*&or=(husband_id.eq.${personId},wife_id.eq.${personId})`);
   for (const f of asFams) {
     if (!f.children || f.children.length === 0) {
-      await sbFetch(`families?id=eq."${f.id}"`, { method: 'DELETE' });
+      await sbFetch(`families?id=eq.${f.id}`, { method: 'DELETE' });
     }
   }
   // Delete person
-  await sbFetch(`persons?id=eq."${personId}"`, { method: 'DELETE' });
+  await sbFetch(`persons?id=eq.${personId}`, { method: 'DELETE' });
   // Log
   try {
     await sbFetch('edit_log', {
@@ -299,18 +273,18 @@ async function addPersonToDB(person, parentId, editUser) {
   await savePerson(person, editUser);
   // Find or create family for the parent
   if (parentId) {
-    const parentFams = await sbFetch(`families?select=*&or=(husband_id.eq."${parentId}",wife_id.eq."${parentId}")`);
+    const parentFams = await sbFetch(`families?select=*&or=(husband_id.eq.${parentId},wife_id.eq.${parentId})`);
     if (parentFams.length > 0) {
       // Add to first family's children
       const fam = parentFams[0];
       const newChildren = [...(fam.children||[]), person.id];
-      await sbFetch(`families?id=eq."${fam.id}"`, {
+      await sbFetch(`families?id=eq.${fam.id}`, {
         method: 'PATCH',
         body: JSON.stringify({ children: newChildren })
       });
     } else {
       // Create new family with parent + child
-      const parent = await sbFetch(`persons?id=eq."${parentId}"&select=gender`);
+      const parent = await sbFetch(`persons?id=eq.${parentId}&select=gender`);
       const pGender = parent[0]?.gender || 'M';
       await saveFamily(
         '@F' + Date.now() + '@',
@@ -326,13 +300,13 @@ async function saveSpouseToDB(parentId, spouse, editUser) {
   // Save spouse person record
   await savePerson(spouse, editUser);
   // Find parent's family or create one
-  const parentFams = await sbFetch(`families?select=*&or=(husband_id.eq."${parentId}",wife_id.eq."${parentId}")`);
-  const parent = await sbFetch(`persons?id=eq."${parentId}"&select=gender`);
+  const parentFams = await sbFetch(`families?select=*&or=(husband_id.eq.${parentId},wife_id.eq.${parentId})`);
+  const parent = await sbFetch(`persons?id=eq.${parentId}&select=gender`);
   const pGender = parent[0]?.gender || 'M';
   if (parentFams.length > 0) {
     const fam = parentFams[0];
     const patch = pGender === 'M' ? { wife_id: spouse.id } : { husband_id: spouse.id };
-    await sbFetch(`families?id=eq."${fam.id}"`, { method: 'PATCH', body: JSON.stringify(patch) });
+    await sbFetch(`families?id=eq.${fam.id}`, { method: 'PATCH', body: JSON.stringify(patch) });
   } else {
     await saveFamily(
       '@F' + Date.now() + '@',
@@ -345,12 +319,12 @@ async function saveSpouseToDB(parentId, spouse, editUser) {
 
 async function deleteSpouseFromDB(parentId, spouseId, editUser) {
   // Remove spouse from family, don't delete the person record
-  const fams = await sbFetch(`families?select=*&or=(husband_id.eq."${parentId}",wife_id.eq."${parentId}")`);
+  const fams = await sbFetch(`families?select=*&or=(husband_id.eq.${parentId},wife_id.eq.${parentId})`);
   for (const f of fams) {
     if (f.husband_id === spouseId) {
-      await sbFetch(`families?id=eq."${f.id}"`, { method: 'PATCH', body: JSON.stringify({ husband_id: null }) });
+      await sbFetch(`families?id=eq.${f.id}`, { method: 'PATCH', body: JSON.stringify({ husband_id: null }) });
     } else if (f.wife_id === spouseId) {
-      await sbFetch(`families?id=eq."${f.id}"`, { method: 'PATCH', body: JSON.stringify({ wife_id: null }) });
+      await sbFetch(`families?id=eq.${f.id}`, { method: 'PATCH', body: JSON.stringify({ wife_id: null }) });
     }
   }
 }
@@ -1221,7 +1195,7 @@ async function signIn(email, password) {
   });
   authSession = data;
   // Fetch user profile from users table
-  const users = await sbFetch(`users?id=eq."${data.user.id}"&select=*`, {
+  const users = await sbFetch(`users?id=eq.${data.user.id}&select=*`, {
     headers: { 'Authorization': 'Bearer ' + data.access_token }
   });
   authUser = users[0] || null;
@@ -1916,7 +1890,7 @@ function AdminPanel({onClose, onReloadTree}) {
       }
 
       if (action === 'delete') {
-        await sbFetch(`persons?id=eq."${req.person_id}"`, { method: 'DELETE', headers: h });
+        await sbFetch(`persons?id=eq.${req.person_id}`, { method: 'DELETE', headers: h });
       } else if (action === 'add_child') {
         const newId = req.changes.id || ('@I' + Date.now() + '@');
         dbChanges.id = newId;
@@ -1927,7 +1901,7 @@ function AdminPanel({onClose, onReloadTree}) {
       } else {
         // Regular edit or edit_spouse — patch the person
         if (Object.keys(dbChanges).length > 0) {
-          await sbFetch(`persons?id=eq."${req.person_id}"`, {
+          await sbFetch(`persons?id=eq.${req.person_id}`, {
             method: 'PATCH', headers: {...h, 'Prefer':'return=minimal'},
             body: JSON.stringify(dbChanges)
           });
@@ -1939,9 +1913,9 @@ function AdminPanel({onClose, onReloadTree}) {
       const mplace = req.changes.mplace || req.changes.marriage_place;
       if (mdate || mplace) {
         try {
-          const fams = await sbFetch(`families?select=*&or=(husband_id.eq."${req.person_id}",wife_id.eq."${req.person_id}")`, {headers:h});
+          const fams = await sbFetch(`families?select=*&or=(husband_id.eq.${req.person_id},wife_id.eq.${req.person_id})`, {headers:h});
           if (fams.length > 0) {
-            await sbFetch(`families?id=eq."${fams[0].id}"`, {
+            await sbFetch(`families?id=eq.${fams[0].id}`, {
               method: 'PATCH', headers: {...h, 'Prefer':'return=minimal'},
               body: JSON.stringify({ marriage_date: mdate||fams[0].marriage_date||'', marriage_place: mplace||fams[0].marriage_place||'' })
             });
@@ -1950,7 +1924,7 @@ function AdminPanel({onClose, onReloadTree}) {
       }
 
       // Mark request as approved
-      await sbFetch(`update_requests?id=eq."${req.id}"`, {
+      await sbFetch(`update_requests?id=eq.${req.id}`, {
         method: 'PATCH', headers: h,
         body: JSON.stringify({ status: 'approved', resolved_by: authUser.id, resolved_at: new Date().toISOString() })
       });
@@ -1964,7 +1938,7 @@ function AdminPanel({onClose, onReloadTree}) {
   const rejectUpdate = async (req, reason) => {
     try {
       const h = { 'Authorization': 'Bearer ' + authSession.access_token };
-      await sbFetch(`update_requests?id=eq."${req.id}"`, {
+      await sbFetch(`update_requests?id=eq.${req.id}`, {
         method: 'PATCH', headers: h,
         body: JSON.stringify({ status: 'rejected', admin_response: reason||'', resolved_by: authUser.id, resolved_at: new Date().toISOString() })
       });
@@ -1990,7 +1964,7 @@ function AdminPanel({onClose, onReloadTree}) {
       } catch(e) { console.warn('Password reset email may not have sent:', e); }
       
       // Step 3: Mark request as approved
-      await sbFetch(`access_requests?id=eq."${req.id}"`, {
+      await sbFetch(`access_requests?id=eq.${req.id}`, {
         method: 'PATCH', headers: h,
         body: JSON.stringify({ status: 'approved', resolved_by: authUser.id, resolved_at: new Date().toISOString() })
       });
@@ -2009,7 +1983,7 @@ function AdminPanel({onClose, onReloadTree}) {
   const changeUserRole = async (userId, newRole) => {
     try {
       const h = { 'Authorization': 'Bearer ' + authSession.access_token };
-      await sbFetch(`users?id=eq."${userId}"`, {
+      await sbFetch(`users?id=eq.${userId}`, {
         method: 'PATCH', headers: h,
         body: JSON.stringify({ role: newRole })
       });
@@ -2143,7 +2117,7 @@ function AdminPanel({onClose, onReloadTree}) {
           {r.status==='pending'&&<div style={{display:'flex',gap:8,marginTop:8}}>
             <button onClick={()=>approveAccess(r)} style={{...btnS2,borderColor:'#6b9e72',color:'#6b9e72'}}>✓ Approve</button>
             <button onClick={()=>{
-              sbFetch(`access_requests?id=eq."${r.id}"`, {
+              sbFetch(`access_requests?id=eq.${r.id}`, {
                 method:'PATCH', headers:{'Authorization':'Bearer '+authSession.access_token},
                 body:JSON.stringify({status:'rejected',resolved_by:authUser.id,resolved_at:new Date().toISOString()})
               }).then(()=>setAccessReqs(prev=>prev.map(x=>x.id===r.id?{...x,status:'rejected'}:x)));
