@@ -34,7 +34,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v2.5.7';
+    const APP_VERSION = 'v2.4.0';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
 
@@ -193,12 +193,15 @@ async function savePerson(person, editUser) {
     photo_gallery_link: person.pgl||'', documents_link: person.dl||'',
     updated_by: editUser||'',
   };
-  console.log('savePerson called:', { id: person.id, nickname: row.nickname, display_name: row.display_name });
-  console.log('savePerson FULL ROW:', JSON.stringify(row));
+  
+  // Fetch current state for diff
+  let oldRow = null;
+  try {
+    const cur = await sbFetch(`persons?id=eq.${person.id}&select=*`);
+    if (cur.length > 0) oldRow = cur[0];
+  } catch(e) {}
   
   // Use UPSERT: POST with on_conflict=id merges into existing row
-  // This avoids the PATCH URL filter issue with @ characters in GEDCOM IDs
-  // Use anon key for the write to avoid RLS role mismatch with authenticated users
   await sbFetch('persons?on_conflict=id', {
     method: 'POST',
     body: JSON.stringify(row),
@@ -207,11 +210,22 @@ async function savePerson(person, editUser) {
       'Authorization': 'Bearer ' + SUPABASE_KEY 
     }
   });
-  console.log('savePerson upsert succeeded for', person.id);
   
-  // Verify the write
-  const verify = await sbFetch(`persons?id=eq.${person.id}&select=id,nickname,first_name`);
-  console.log('savePerson VERIFY:', verify[0]);
+  // Compute diff: only fields that actually changed
+  const diff = {};
+  const prev = {};
+  const skipLog = new Set(['id','updated_by','updated_at','created_at']);
+  if (oldRow) {
+    for (const [k, v] of Object.entries(row)) {
+      if (skipLog.has(k)) continue;
+      const oldVal = (oldRow[k] === null || oldRow[k] === undefined) ? '' : String(oldRow[k]).trim();
+      const newVal = (v === null || v === undefined) ? '' : String(v).trim();
+      if (oldVal !== newVal) {
+        diff[k] = v;
+        prev[k] = oldRow[k] || '';
+      }
+    }
+  }
   // Save marriage date/place to families table if provided
   if (person.mdate || person.mplace) {
     try {
@@ -225,13 +239,25 @@ async function savePerson(person, editUser) {
       }
     } catch(e) { console.warn('Marriage save failed:', e); }
   }
-  // Log edit
-  try {
-    await sbFetch('edit_log', {
-      method: 'POST',
-      body: JSON.stringify({ person_id: person.id, action: 'update', edited_by: editUser||'', changes: row })
-    });
-  } catch(e) { console.warn('Edit log failed:', e); }
+  // Log edit — only log if something actually changed
+  if (Object.keys(diff).length > 0) {
+    try {
+      await sbFetch('edit_log', {
+        method: 'POST',
+        body: JSON.stringify({ 
+          person_id: person.id, 
+          action: oldRow ? 'update' : 'create', 
+          edited_by: editUser||'', 
+          changes: { 
+            person_name: row.display_name || row.first_name + ' ' + row.last_name,
+            changed_fields: diff, 
+            previous_values: prev 
+          } 
+        }),
+        headers: { 'Authorization': 'Bearer ' + SUPABASE_KEY }
+      });
+    } catch(e) { console.warn('Edit log failed:', e); }
+  }
 }
 
 async function saveFamily(familyId, husbandId, wifeId, children, mdate, mplace) {
@@ -2193,10 +2219,27 @@ function AdminPanel({onClose, onReloadTree}) {
               </div>}
 
               {isUpdate&&e.changes&&<div style={{fontSize:11,color:'#d4cfc0',background:'#0a0a08',padding:10,borderRadius:4,marginBottom:8,maxHeight:200,overflowY:'auto'}}>
-                <div style={{color:'#8a7340',fontWeight:500,marginBottom:6}}>Changes Applied:</div>
-                {Object.entries(e.changes).filter(([k,v])=>v&&k!=='id'&&!k.startsWith('updated')).map(([k,v])=>
-                  <div key={k}><span style={{color:'#7a7568'}}>{k}:</span> {String(v).substring(0,80)}</div>
-                )}
+                {e.changes.person_name&&<div style={{color:'#c4a35a',fontWeight:500,marginBottom:6}}>{e.changes.person_name}</div>}
+                {e.changes.changed_fields?
+                  <div>
+                    <div style={{color:'#8a7340',fontWeight:500,marginBottom:4}}>Changes:</div>
+                    {Object.entries(e.changes.changed_fields).filter(([k])=>k!=='id'&&!k.startsWith('updated')).map(([k,v])=>{
+                      const prevVal = e.changes.previous_values?.[k];
+                      return <div key={k} style={{padding:'2px 0'}}>
+                        <span style={{color:'#7a7568'}}>{k.replace(/_/g,' ')}:</span>{' '}
+                        {prevVal ? <><span style={{color:'#a05050',textDecoration:'line-through'}}>{String(prevVal).substring(0,60)}</span> → </> : ''}
+                        <span style={{color:'#6b9e72'}}>{String(v).substring(0,80)}</span>
+                      </div>;
+                    })}
+                  </div>
+                :
+                  <div>
+                    <div style={{color:'#8a7340',fontWeight:500,marginBottom:6}}>Changes Applied:</div>
+                    {Object.entries(e.changes).filter(([k,v])=>v&&k!=='id'&&!k.startsWith('updated')&&k!=='person_name').map(([k,v])=>
+                      <div key={k}><span style={{color:'#7a7568'}}>{k}:</span> {String(v).substring(0,80)}</div>
+                    )}
+                  </div>
+                }
               </div>}
 
               {isRevert&&<div style={{fontSize:11,color:'#c4a35a',fontStyle:'italic'}}>
@@ -2816,7 +2859,6 @@ function App(){
     }
     const spouseId=(spouseEditing.spouse&&spouseEditing.spouse.id)||data.id||('@I'+Date.now()+'@');
     const spouseData={...data, id:spouseId};
-    console.log('handleSaveSpouse:', { parentId, spouseId, spouseEditingId: spouseEditing?.spouse?.id, dataId: data.id, nickname: data.nk, dn: data.dn });
     setTree(prev=>updateNode(prev,parentId,(existing)=>({...existing,sp:{...(existing.sp||{}),...spouseData}})));
     // Keep personMap in sync
     setPersonMap(prev=>({...prev, [spouseId]: {...(prev[spouseId]||{}), ...spouseData}}));
