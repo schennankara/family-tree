@@ -34,7 +34,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v2.5.6';
+    const APP_VERSION = 'v2.5.7';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
 
@@ -178,6 +178,7 @@ function buildTreeFromDB(persons, families) {
 /* ───── SAVE TO SUPABASE ───── */
 async function savePerson(person, editUser) {
   const row = {
+    id: person.id,
     first_name: person.fn||'', middle_name: person.mn||'', last_name: person.ln||'',
     display_name: person.dn||'', nickname: person.nk||'', maiden_name: person.md||'',
     gender: person.g||'', date_of_birth: person.dob||'', date_of_death: person.dod||'',
@@ -193,15 +194,22 @@ async function savePerson(person, editUser) {
     updated_by: editUser||'',
   };
   console.log('savePerson called:', { id: person.id, nickname: row.nickname, display_name: row.display_name });
-  // Use upsert (POST with merge-duplicates) — avoids PATCH filter issues with @ in IDs
-  row.id = person.id;
-  await sbFetch('persons', {
+  console.log('savePerson FULL ROW:', JSON.stringify(row));
+  
+  // Use UPSERT: POST with on_conflict=id merges into existing row
+  // This avoids the PATCH URL filter issue with @ characters in GEDCOM IDs
+  // Use anon key for the write to avoid RLS role mismatch with authenticated users
+  await sbFetch('persons?on_conflict=id', {
     method: 'POST',
     body: JSON.stringify(row),
-    headers: { 'Prefer': 'return=minimal,resolution=merge-duplicates' }
+    headers: { 
+      'Prefer': 'return=minimal,resolution=merge-duplicates',
+      'Authorization': 'Bearer ' + SUPABASE_KEY 
+    }
   });
   console.log('savePerson upsert succeeded for', person.id);
-  // Verify
+  
+  // Verify the write
   const verify = await sbFetch(`persons?id=eq.${person.id}&select=id,nickname,first_name`);
   console.log('savePerson VERIFY:', verify[0]);
   // Save marriage date/place to families table if provided
@@ -236,7 +244,7 @@ async function saveFamily(familyId, husbandId, wifeId, children, mdate, mplace) 
   await sbFetch('families', {
     method: 'POST',
     body: JSON.stringify(row),
-    headers: { 'Prefer': 'return=minimal,resolution=merge-duplicates' }
+    headers: { 'Prefer': 'return=minimal,resolution=merge-duplicates', 'Authorization': 'Bearer ' + SUPABASE_KEY }
   });
 }
 
