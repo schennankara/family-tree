@@ -34,7 +34,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v2.5.3';
+    const APP_VERSION = 'v2.5.4';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
 
@@ -199,14 +199,17 @@ async function savePerson(person, editUser) {
   console.log('savePerson existence check:', { id: person.id, found: existing.length, existing });
   if (existing.length > 0) {
     console.log('savePerson PATCH:', person.id, 'nickname=', row.nickname);
-    const patchResult = await sbFetch(`persons?id=eq.${person.id}`, {
+    console.log('savePerson FULL ROW:', JSON.stringify(row));
+    await sbFetch(`persons?id=eq.${person.id}`, {
       method: 'PATCH',
       body: JSON.stringify(row),
-      headers: { 'Prefer': 'return=representation' }
+      headers: { 'Prefer': 'return=minimal' }
     });
-    console.log('savePerson PATCH result:', patchResult.length, 'rows updated', patchResult[0]?.nickname, patchResult[0]?.first_name);
-    if (patchResult.length === 0) {
-      console.error('savePerson PATCH matched 0 rows! ID filter may not be working. ID:', person.id);
+    // Verify the write actually landed
+    const verify = await sbFetch(`persons?id=eq.${person.id}&select=id,nickname,first_name`);
+    console.log('savePerson VERIFY after PATCH:', verify[0]);
+    if (verify[0]?.nickname !== row.nickname) {
+      console.error('PATCH DID NOT PERSIST! DB has:', verify[0]?.nickname, 'Expected:', row.nickname);
     }
   } else {
     row.id = person.id;
