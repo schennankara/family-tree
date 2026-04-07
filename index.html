@@ -290,7 +290,7 @@ async function addPersonToDB(person, parentId, editUser) {
       const parent = await sbFetch(`persons?id=eq.${parentId}&select=gender`);
       const pGender = parent[0]?.gender || 'M';
       await saveFamily(
-        '@F_new_' + Date.now() + '@',
+        '@F' + Date.now() + '@',
         pGender === 'M' ? parentId : null,
         pGender === 'F' ? parentId : null,
         [person.id], '', ''
@@ -312,7 +312,7 @@ async function saveSpouseToDB(parentId, spouse, editUser) {
     await sbFetch(`families?id=eq.${fam.id}`, { method: 'PATCH', body: JSON.stringify(patch) });
   } else {
     await saveFamily(
-      '@F_sp_' + Date.now() + '@',
+      '@F' + Date.now() + '@',
       pGender === 'M' ? parentId : spouse.id,
       pGender === 'F' ? parentId : spouse.id,
       [], '', ''
@@ -1813,7 +1813,7 @@ function AdminPanel({onClose, onReloadTree}) {
       if (action === 'delete') {
         await sbFetch(`persons?id=eq.${req.person_id}`, { method: 'DELETE', headers: h });
       } else if (action === 'add_child') {
-        const newId = req.changes.id || ('@new_' + Date.now() + '@');
+        const newId = req.changes.id || ('@I' + Date.now() + '@');
         dbChanges.id = newId;
         await sbFetch('persons', {
           method: 'POST', headers: {...h, 'Prefer':'return=minimal'},
@@ -2182,7 +2182,7 @@ const SECTIONS=[
   ]},
 ];
 
-const empty=()=>({id:'@new_'+Date.now()+'@',fn:'',mn:'',ln:'',dn:'',nk:'',md:'',g:'M',dob:'',dod:'',dec:false,bo:0,
+const empty=()=>({id:'@I'+Date.now()+'@',fn:'',mn:'',ln:'',dn:'',nk:'',md:'',g:'M',dob:'',dod:'',dec:false,bo:0,
   em:'',ph:'',a1:'',a2:'',ci:'',st:'',zp:'',co:'',fb:'',ig:'',li:'',ws:'',pp:'',bio:'',loc:'',prof:'',emp:'',
   stories:'',notes:'',pgl:'',dl:'',mdate:'',mplace:''});
 
@@ -2671,7 +2671,7 @@ function App(){
     const spouseTargetId=(spouseEditing.spouse&&spouseEditing.spouse.id) || data.id || parentId;
     if (needsApproval(spouseTargetId)) {
       const parentNode = findNodeById(tree, parentId);
-      const spouseId = (spouseEditing.spouse&&spouseEditing.spouse.id) || data.id || ('@sp_'+Date.now()+'@');
+      const spouseId = (spouseEditing.spouse&&spouseEditing.spouse.id) || data.id || ('@I'+Date.now()+'@');
       const spouseName = parentNode?.sp?.dn || data.dn || 'Spouse';
       const existingSp = parentNode?.sp || {};
       // Compute diff
@@ -2694,7 +2694,7 @@ function App(){
       setSpouseEditing(null);
       return;
     }
-    const spouseId=(spouseEditing.spouse&&spouseEditing.spouse.id)||data.id||('@sp_'+Date.now()+'@');
+    const spouseId=(spouseEditing.spouse&&spouseEditing.spouse.id)||data.id||('@I'+Date.now()+'@');
     const spouseData={...data, id:spouseId};
     setTree(prev=>updateNode(prev,parentId,(existing)=>({...existing,sp:{...(existing.sp||{}),...spouseData}})));
     setSpouseEditing(null);
