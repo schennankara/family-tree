@@ -34,7 +34,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v2.5.1';
+    const APP_VERSION = 'v2.5.3';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
 
@@ -193,17 +193,21 @@ async function savePerson(person, editUser) {
     updated_by: editUser||'',
   };
   console.log('savePerson called:', { id: person.id, nickname: row.nickname, display_name: row.display_name });
+  console.log('savePerson FULL ROW:', JSON.stringify(row));
   // Check if person exists → PATCH (update), else POST (insert)
   const existing = await sbFetch(`persons?id=eq.${person.id}&select=id`);
   console.log('savePerson existence check:', { id: person.id, found: existing.length, existing });
   if (existing.length > 0) {
     console.log('savePerson PATCH:', person.id, 'nickname=', row.nickname);
-    await sbFetch(`persons?id=eq.${person.id}`, {
+    const patchResult = await sbFetch(`persons?id=eq.${person.id}`, {
       method: 'PATCH',
       body: JSON.stringify(row),
-      headers: { 'Prefer': 'return=minimal' }
+      headers: { 'Prefer': 'return=representation' }
     });
-    console.log('savePerson PATCH succeeded for', person.id);
+    console.log('savePerson PATCH result:', patchResult.length, 'rows updated', patchResult[0]?.nickname, patchResult[0]?.first_name);
+    if (patchResult.length === 0) {
+      console.error('savePerson PATCH matched 0 rows! ID filter may not be working. ID:', person.id);
+    }
   } else {
     row.id = person.id;
     console.log('savePerson POST (new):', person.id);
