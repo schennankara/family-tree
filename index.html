@@ -34,7 +34,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v2.5.';
+    const APP_VERSION = 'v2.4.0';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
 
@@ -192,21 +192,27 @@ async function savePerson(person, editUser) {
     photo_gallery_link: person.pgl||'', documents_link: person.dl||'',
     updated_by: editUser||'',
   };
+  console.log('savePerson called:', { id: person.id, nickname: row.nickname, display_name: row.display_name });
   // Check if person exists → PATCH (update), else POST (insert)
   const existing = await sbFetch(`persons?id=eq.${encodeURIComponent(person.id)}&select=id`);
+  console.log('savePerson existence check:', { id: person.id, found: existing.length, existing });
   if (existing.length > 0) {
+    console.log('savePerson PATCH:', person.id, 'nickname=', row.nickname);
     await sbFetch(`persons?id=eq.${encodeURIComponent(person.id)}`, {
       method: 'PATCH',
       body: JSON.stringify(row),
       headers: { 'Prefer': 'return=minimal' }
     });
+    console.log('savePerson PATCH succeeded for', person.id);
   } else {
     row.id = person.id;
+    console.log('savePerson POST (new):', person.id);
     await sbFetch('persons', {
       method: 'POST',
       body: JSON.stringify(row),
       headers: { 'Prefer': 'return=minimal' }
     });
+    console.log('savePerson POST succeeded for', person.id);
   }
   // Save marriage date/place to families table if provided
   if (person.mdate || person.mplace) {
@@ -2668,10 +2674,6 @@ function App(){
 
   const openEditForNode = (node) => {
     if (!node) return;
-    if (authUser?.person_id && node.sp?.id === authUser.person_id) {
-      setSpouseEditing({ parentId: node.id, spouse: { ...(node.sp || {}), dn: (node.sp && node.sp.dn) || '' } });
-      return;
-    }
     setEditing(findNodeById(tree,node.id)||node);
   };
 
@@ -2825,6 +2827,7 @@ function App(){
     }
     const spouseId=(spouseEditing.spouse&&spouseEditing.spouse.id)||data.id||('@I'+Date.now()+'@');
     const spouseData={...data, id:spouseId};
+    console.log('handleSaveSpouse:', { parentId, spouseId, spouseEditingId: spouseEditing?.spouse?.id, dataId: data.id, nickname: data.nk, dn: data.dn });
     setTree(prev=>updateNode(prev,parentId,(existing)=>({...existing,sp:{...(existing.sp||{}),...spouseData}})));
     // Keep personMap in sync
     setPersonMap(prev=>({...prev, [spouseId]: {...(prev[spouseId]||{}), ...spouseData}}));
