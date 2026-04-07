@@ -49,12 +49,21 @@ const SB_HEADERS = {
 
 async function sbFetch(path, opts = {}) {
   const url = SUPABASE_URL + '/rest/v1/' + path;
-  const resp = await fetch(url, { ...opts, headers: { ...SB_HEADERS, ...(opts.headers||{}) } });
-  if (!resp.ok) {
-    const err = await resp.text();
-    throw new Error(`Supabase ${resp.status}: ${err}`);
+  const mergedHeaders = { ...SB_HEADERS, ...(opts.headers || {}) };
+  if (authSession?.access_token && !(opts.headers && opts.headers.Authorization)) {
+    mergedHeaders['Authorization'] = 'Bearer ' + authSession.access_token;
   }
+  const resp = await fetch(url, { ...opts, headers: mergedHeaders });
   const text = await resp.text();
+  if (!resp.ok) {
+    console.error('Supabase request failed', {
+      path,
+      status: resp.status,
+      responseText: text,
+      usingAuthUser: !!authSession?.access_token
+    });
+    throw new Error(text || `Supabase ${resp.status}`);
+  }
   if (!text) return [];
   try { return JSON.parse(text); } catch(e) { return []; }
 }
@@ -1217,45 +1226,38 @@ function canEditorDirectEdit(targetId, tree) {
   if (!authUser?.person_id || !tree) return false;
   if (isAdmin()) return true;
   if (!isEditor()) return false;
-  
+
   const myId = authUser.person_id;
-  if (targetId === myId) return true; // self
-  
-  // Find my node and target node in the tree
-  const myNode = findNodeInTree(tree, myId);
-  const targetNode = findNodeInTree(tree, targetId);
-  if (!myNode) return false;
-  
-  // Check if target is my spouse
-  if (myNode.sp?.id === targetId) return true;
-  
-  // Check if target is a descendant of me (children, grandchildren, etc.)
-  if (isDescendant(myNode, targetId)) return true;
-  
-  // Find my parent node
-  const myParent = findParentOf(tree, myId);
-  if (myParent) {
-    // Check if target is my parent
-    if (myParent.id === targetId) return true;
-    // Check if target is my parent's spouse (other parent)
-    if (myParent.sp?.id === targetId) return true;
-    // Check if target is a sibling (same parent's child)
-    if (myParent.ch?.some(c => c.id === targetId)) return true;
-    // Check if target is a sibling's spouse
-    if (myParent.ch?.some(c => c.sp?.id === targetId)) return true;
-    // Check if target is a descendant of a sibling (nieces/nephews)
-    if (myParent.ch?.some(c => isDescendant(c, targetId))) return true;
+  if (targetId === myId) return true;
+
+  const myFamilyNode = findFamilyNodeContaining(tree, myId);
+  if (!myFamilyNode) return false;
+
+  const spouseId = myFamilyNode.id === myId ? myFamilyNode.sp?.id : myFamilyNode.id;
+  if (spouseId === targetId) return true;
+
+  if (isDescendant(myFamilyNode, targetId)) return true;
+
+  const myParentFamily = findParentFamilyOf(tree, myId);
+  if (myParentFamily) {
+    if (myParentFamily.id === targetId) return true;
+    if (myParentFamily.sp?.id === targetId) return true;
+    if (myParentFamily.ch?.some(c => c.id === targetId)) return true;
+    if (myParentFamily.ch?.some(c => c.sp?.id === targetId)) return true;
+    if (myParentFamily.ch?.some(c => isDescendant(c, targetId))) return true;
   }
-  
-  // Check parents-in-law (spouse's parents)
-  if (myNode.sp?.id) {
-    const spouseParent = findParentOf(tree, myNode.sp.id);
-    if (spouseParent) {
-      if (spouseParent.id === targetId) return true;
-      if (spouseParent.sp?.id === targetId) return true;
+
+  if (spouseId) {
+    const spouseParentFamily = findParentFamilyOf(tree, spouseId);
+    if (spouseParentFamily) {
+      if (spouseParentFamily.id === targetId) return true;
+      if (spouseParentFamily.sp?.id === targetId) return true;
+      if (spouseParentFamily.ch?.some(c => c.id === targetId)) return true;
+      if (spouseParentFamily.ch?.some(c => c.sp?.id === targetId)) return true;
+      if (spouseParentFamily.ch?.some(c => isDescendant(c, targetId))) return true;
     }
   }
-  
+
   return false;
 }
 
@@ -1265,6 +1267,26 @@ function findNodeInTree(node, id) {
   if (node.sp?.id === id) return node.sp;
   for (const c of node.ch || []) {
     const found = findNodeInTree(c, id);
+    if (found) return found;
+  }
+  return null;
+}
+
+function findFamilyNodeContaining(node, personId) {
+  if (!node) return null;
+  if (node.id === personId || node.sp?.id === personId) return node;
+  for (const c of node.ch || []) {
+    const found = findFamilyNodeContaining(c, personId);
+    if (found) return found;
+  }
+  return null;
+}
+
+function findParentFamilyOf(node, personId) {
+  if (!node) return null;
+  if (node.ch?.some(c => c.id === personId || c.sp?.id === personId)) return node;
+  for (const c of node.ch || []) {
+    const found = findParentFamilyOf(c, personId);
     if (found) return found;
   }
   return null;
@@ -1288,6 +1310,22 @@ function isDescendant(node, targetId) {
     if (isDescendant(c, targetId)) return true;
   }
   return false;
+}
+
+function openEditForNode(tree, node, setEditing, setSpouseEditing) {
+  const liveNode = findNodeById(tree, node?.id) || node;
+  if (!liveNode) return;
+
+  const myId = authUser?.person_id;
+  if (myId && liveNode.sp?.id === myId) {
+    setSpouseEditing({
+      parentId: liveNode.id,
+      spouse: { ...(liveNode.sp || {}), dn: liveNode.sp?.dn || '' }
+    });
+    return;
+  }
+
+  setEditing(liveNode);
 }
 
 /* ───── LOGIN MODAL ───── */
@@ -2505,8 +2543,8 @@ function App(){
     savePerson(data, user?.name||user?.email||"").then(()=>{
       setMsg('Saved to database!');
     }).catch(e=>{
-      console.error('Save error:',e);
-      setMsg('Saved locally (DB sync failed)');
+      console.error('Save error:', e, e?.message, e?.stack);
+      setMsg('DB save failed: ' + (e?.message || 'unknown error'));
     });
     setTimeout(()=>{revealNode(updatedNodeId,{select:false})},0);
     setTimeout(()=>setMsg(''),2000);
@@ -2570,9 +2608,9 @@ function App(){
   const handleSaveSpouse=(data)=>{
     if(!spouseEditing?.parentId)return;
     const parentId=spouseEditing.parentId;
-    if (needsApproval(parentId)) {
+    const spouseId = (spouseEditing.spouse&&spouseEditing.spouse.id) || data.id || ('@sp_'+Date.now()+'@');
+    if (needsApproval(spouseId)) {
       const parentNode = findNodeById(tree, parentId);
-      const spouseId = (spouseEditing.spouse&&spouseEditing.spouse.id) || data.id || ('@sp_'+Date.now()+'@');
       const spouseName = parentNode?.sp?.dn || data.dn || 'Spouse';
       const existingSp = parentNode?.sp || {};
       // Compute diff
@@ -2602,8 +2640,8 @@ function App(){
     saveSpouseToDB(parentId, spouseData, user?.name||user?.email||"").then(()=>{
       setMsg('Spouse saved to database!');
     }).catch(e=>{
-      console.error('Spouse save error:',e);
-      setMsg('Spouse saved locally (DB sync failed)');
+      console.error('Spouse save error:', e, e?.message, e?.stack);
+      setMsg('Spouse DB save failed: ' + (e?.message || 'unknown error'));
     });
     setTimeout(()=>setMsg(''),2000);
   };
@@ -2741,9 +2779,9 @@ function App(){
       </div>
       {activeTab==='tree'&&<>
       <div style={{maxWidth:1200,margin:'0 auto',padding:'0 16px 60px'}}>
-        <TreeNode node={tree} exp={exp} onTog={toggle} onSel={(node)=>setSel(findNodeById(tree,node.id)||node)} onEdit={(node)=>requireAuth(()=>setEditing(findNodeById(tree,node.id)||node))} onAdd={(id)=>requireAuth(()=>setAdding(id))} onDel={(id)=>requireAuth(()=>handleDelete(id))} onEditSpouse={(node)=>requireAuth(()=>setSpouseEditing({parentId:node.id,spouse:{...(node.sp||{}),dn:(node.sp&&node.sp.dn)||''}}))} onDelSpouse={(id)=>requireAuth(()=>handleDeleteSpouse(id))} hl={hl}/>
+        <TreeNode node={tree} exp={exp} onTog={toggle} onSel={(node)=>setSel(findNodeById(tree,node.id)||node)} onEdit={(node)=>requireAuth(()=>openEditForNode(tree,node,setEditing,setSpouseEditing))} onAdd={(id)=>requireAuth(()=>setAdding(id))} onDel={(id)=>requireAuth(()=>handleDelete(id))} onEditSpouse={(node)=>requireAuth(()=>setSpouseEditing({parentId:node.id,spouse:{...(node.sp||{}),dn:(node.sp&&node.sp.dn)||''}}))} onDelSpouse={(id)=>requireAuth(()=>handleDeleteSpouse(id))} hl={hl}/>
       </div>
-      {sel&&!editing&&<Detail node={findNodeById(tree,sel.id)||sel} root={tree} onClose={()=>setSel(null)} onEdit={(node)=>requireAuth(()=>setEditing(findNodeById(tree,node.id)||node))} onEditSpouse={(node)=>requireAuth(()=>setSpouseEditing({parentId:node.id,spouse:{...(node.sp||{}),dn:(node.sp&&node.sp.dn)||''}}))} onDelSpouse={(id)=>requireAuth(()=>handleDeleteSpouse(id))}/>}
+      {sel&&!editing&&<Detail node={findNodeById(tree,sel.id)||sel} root={tree} onClose={()=>setSel(null)} onEdit={(node)=>requireAuth(()=>openEditForNode(tree,node,setEditing,setSpouseEditing))} onEditSpouse={(node)=>requireAuth(()=>setSpouseEditing({parentId:node.id,spouse:{...(node.sp||{}),dn:(node.sp&&node.sp.dn)||''}}))} onDelSpouse={(id)=>requireAuth(()=>handleDeleteSpouse(id))}/>}
       {editing&&<EditForm node={findNodeById(tree,editing.id)||editing} onSave={handleSaveEdit} onCancel={()=>setEditing(null)} isNew={false}/>}
       {spouseEditing&&<EditForm node={spouseEditing.spouse||empty()} onSave={handleSaveSpouse} onCancel={()=>setSpouseEditing(null)} isNew={false}/>}
       {adding&&<EditForm node={empty()} onSave={handleAdd} onCancel={()=>setAdding(null)} isNew={true} parentId={adding} parentName={flat.find(n=>n.id===adding)?._n}/>}
