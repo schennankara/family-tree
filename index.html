@@ -49,18 +49,23 @@ const SB_HEADERS = {
 
 async function sbFetch(path, opts = {}) {
   const url = SUPABASE_URL + '/rest/v1/' + path;
-  const mergedHeaders = { ...SB_HEADERS, ...(opts.headers||{}) };
-  if (authSession?.access_token && !mergedHeaders['Authorization']) {
-    mergedHeaders['Authorization'] = 'Bearer ' + authSession.access_token;
+  const headers = { ...SB_HEADERS, ...(opts.headers || {}) };
+  if (authSession?.access_token && !(opts.headers && opts.headers.Authorization)) {
+    headers.Authorization = 'Bearer ' + authSession.access_token;
   }
-  const resp = await fetch(url, { ...opts, headers: mergedHeaders });
-  const bodyText = await resp.text();
+  const resp = await fetch(url, { ...opts, headers });
+  const text = await resp.text();
   if (!resp.ok) {
-    console.error('Supabase request failed', { path, status: resp.status, bodyText });
-    throw new Error(bodyText || `Supabase ${resp.status}`);
+    console.error('Supabase request failed', {
+      path,
+      status: resp.status,
+      body: text,
+      usingSessionToken: !!authSession?.access_token
+    });
+    throw new Error(text || `Supabase ${resp.status}`);
   }
-  if (!bodyText) return [];
-  try { return JSON.parse(bodyText); } catch(e) { return []; }
+  if (!text) return [];
+  try { return JSON.parse(text); } catch(e) { return []; }
 }
 
 /* ───── LOAD FROM SUPABASE ───── */
@@ -1223,7 +1228,7 @@ function canEditorDirectEdit(targetId, tree) {
   if (!isEditor()) return false;
 
   const myId = authUser.person_id;
-  if (targetId === myId) return true; // self
+  if (targetId === myId) return true;
 
   const myFamilyNode = findFamilyNodeContaining(tree, myId);
   if (!myFamilyNode) return false;
@@ -1256,26 +1261,6 @@ function canEditorDirectEdit(targetId, tree) {
   return false;
 }
 
-function findFamilyNodeContaining(node, personId) {
-  if (!node) return null;
-  if (node.id === personId || node.sp?.id === personId) return node;
-  for (const c of node.ch || []) {
-    const found = findFamilyNodeContaining(c, personId);
-    if (found) return found;
-  }
-  return null;
-}
-
-function findParentFamilyOf(node, personId) {
-  if (!node) return null;
-  if (node.ch?.some(c => c.id === personId || c.sp?.id === personId)) return node;
-  for (const c of node.ch || []) {
-    const found = findParentFamilyOf(c, personId);
-    if (found) return found;
-  }
-  return null;
-}
-
 function findNodeInTree(node, id) {
   if (!node) return null;
   if (node.id === id) return node;
@@ -1287,14 +1272,28 @@ function findNodeInTree(node, id) {
   return null;
 }
 
+function findFamilyNodeContaining(node, personId) {
+  if (!node) return null;
+  if (node.id === personId || node.sp?.id === personId) return node;
+  for (const c of node.ch || []) {
+    const found = findFamilyNodeContaining(c, personId);
+    if (found) return found;
+  }
+  return null;
+}
+
 function findParentOf(node, childId) {
   if (!node) return null;
-  if (node.ch?.some(c => c.id === childId)) return node;
+  if (node.ch?.some(c => c.id === childId || c.sp?.id === childId)) return node;
   for (const c of node.ch || []) {
     const found = findParentOf(c, childId);
     if (found) return found;
   }
   return null;
+}
+
+function findParentFamilyOf(node, personId) {
+  return findParentOf(node, personId);
 }
 
 function isDescendant(node, targetId) {
@@ -2401,7 +2400,6 @@ function App(){
   const findNodeById=useCallback((root,id)=>{
     if(!root)return null;
     if(root.id===id)return root;
-    if(root.sp?.id===id)return root.sp;
     for(const c of root.ch||[]){
       const found=findNodeById(c,id);
       if(found)return found;
@@ -2424,16 +2422,6 @@ function App(){
     if(!root.ch)return root;
     return {...root,ch:root.ch.filter(c=>c.id!==targetId).map(c=>removeNode(c,targetId))};
   },[]);
-
-  const openEditForNode = useCallback((node)=>{
-    if(!node) return;
-    const familyNode = findFamilyNodeContaining(tree, node.id);
-    if (familyNode?.sp?.id === node.id) {
-      setSpouseEditing({ parentId: familyNode.id, spouse: { ...(familyNode.sp||{}), dn: familyNode.sp?.dn || node.dn || '' } });
-      return;
-    }
-    setEditing(findNodeById(tree,node.id)||node);
-  },[tree, findNodeById]);
 
   const toggle=useCallback(id=>{
     setExp(p=>{const n=new Set(p);n.has(id)?n.delete(id):n.add(id);return n});
@@ -2494,6 +2482,15 @@ function App(){
     return false;
   };
 
+  const openEditForNode = (node) => {
+    if (!node) return;
+    if (authUser?.person_id && node.sp?.id === authUser.person_id) {
+      setSpouseEditing({ parentId: node.id, spouse: { ...(node.sp || {}), dn: (node.sp && node.sp.dn) || '' } });
+      return;
+    }
+    setEditing(findNodeById(tree,node.id)||node);
+  };
+
   const handleSaveEdit=(data)=>{
     if (needsApproval(data.id)) {
       const node = findNodeById(tree, data.id);
@@ -2533,7 +2530,7 @@ function App(){
     savePerson(data, user?.name||user?.email||"").then(()=>{
       setMsg('Saved to database!');
     }).catch(e=>{
-      console.error('Save error:', e, e?.message, e?.stack);
+      console.error('Save error:', e, e?.message);
       setMsg('DB save failed: ' + (e?.message || 'unknown error'));
     });
     setTimeout(()=>{revealNode(updatedNodeId,{select:false})},0);
@@ -2598,12 +2595,13 @@ function App(){
   const handleSaveSpouse=(data)=>{
     if(!spouseEditing?.parentId)return;
     const parentId=spouseEditing.parentId;
-    const spouseId=(spouseEditing.spouse&&spouseEditing.spouse.id)||data.id||('@sp_'+Date.now()+'@');
-
-    if (needsApproval(spouseId)) {
+    const spouseTargetId=(spouseEditing.spouse&&spouseEditing.spouse.id) || data.id || parentId;
+    if (needsApproval(spouseTargetId)) {
       const parentNode = findNodeById(tree, parentId);
+      const spouseId = (spouseEditing.spouse&&spouseEditing.spouse.id) || data.id || ('@sp_'+Date.now()+'@');
       const spouseName = parentNode?.sp?.dn || data.dn || 'Spouse';
       const existingSp = parentNode?.sp || {};
+      // Compute diff
       const skipKeys = new Set(['id','ch','sp','gen','_fams','_famc','_p','_n','_matchType','_spouseOf','dn']);
       const changedFields = { _action: 'edit_spouse' };
       const prevFields = {};
@@ -2618,34 +2616,22 @@ function App(){
           prevFields[k] = oldRaw || '';
         }
       }
-      if (Object.keys(changedFields).length === 1) {
-        setMsg('No spouse changes detected');
-        setTimeout(()=>setMsg(''),2000);
-        setSpouseEditing(null);
-        return;
-      }
-      setViewerSubmitData({
-        personId: spouseId,
-        personName: spouseName + ' (spouse of ' + (parentNode?.dn||'') + ')',
-        changes: {...changedFields, id: spouseId},
-        previous: prevFields,
-        type: 'spouse'
-      });
+      setViewerSubmitData({ personId: spouseId, personName: spouseName + ' (spouse of ' + (parentNode?.dn||'') + ')', changes: {...changedFields, id: spouseId}, previous: prevFields, type: 'spouse' });
       setShowViewerIdentity(true);
       setSpouseEditing(null);
       return;
     }
-
+    const spouseId=(spouseEditing.spouse&&spouseEditing.spouse.id)||data.id||('@sp_'+Date.now()+'@');
     const spouseData={...data, id:spouseId};
     setTree(prev=>updateNode(prev,parentId,(existing)=>({...existing,sp:{...(existing.sp||{}),...spouseData}})));
     setSpouseEditing(null);
     saveSpouseToDB(parentId, spouseData, user?.name||user?.email||"").then(()=>{
       setMsg('Spouse saved to database!');
     }).catch(e=>{
-      console.error('Spouse save error:', e, e?.message, e?.stack);
+      console.error('Spouse save error:', e, e?.message);
       setMsg('Spouse DB save failed: ' + (e?.message || 'unknown error'));
     });
-    setTimeout(()=>setMsg(''),2500);
+    setTimeout(()=>setMsg(''),2000);
   };
 
   const handleDeleteSpouse=(parentId)=>{
