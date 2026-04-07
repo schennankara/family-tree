@@ -167,7 +167,6 @@ function buildTreeFromDB(persons, families) {
 /* ───── SAVE TO SUPABASE ───── */
 async function savePerson(person, editUser) {
   const row = {
-    id: person.id,
     first_name: person.fn||'', middle_name: person.mn||'', last_name: person.ln||'',
     display_name: person.dn||'', nickname: person.nk||'', maiden_name: person.md||'',
     gender: person.g||'', date_of_birth: person.dob||'', date_of_death: person.dod||'',
@@ -182,11 +181,22 @@ async function savePerson(person, editUser) {
     photo_gallery_link: person.pgl||'', documents_link: person.dl||'',
     updated_by: editUser||'',
   };
-  await sbFetch('persons?on_conflict=id', {
-    method: 'POST',
-    body: JSON.stringify(row),
-    headers: { 'Prefer': 'resolution=merge-duplicates,return=representation' }
-  });
+  // Check if person exists → PATCH (update), else POST (insert)
+  const existing = await sbFetch(`persons?id=eq.${encodeURIComponent(person.id)}&select=id`);
+  if (existing.length > 0) {
+    await sbFetch(`persons?id=eq.${encodeURIComponent(person.id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(row),
+      headers: { 'Prefer': 'return=minimal' }
+    });
+  } else {
+    row.id = person.id;
+    await sbFetch('persons', {
+      method: 'POST',
+      body: JSON.stringify(row),
+      headers: { 'Prefer': 'return=minimal' }
+    });
+  }
   // Save marriage date/place to families table if provided
   if (person.mdate || person.mplace) {
     try {
@@ -211,16 +221,25 @@ async function savePerson(person, editUser) {
 
 async function saveFamily(familyId, husbandId, wifeId, children, mdate, mplace) {
   const row = {
-    id: familyId,
     husband_id: husbandId||null, wife_id: wifeId||null,
     children: children||[],
     marriage_date: mdate||'', marriage_place: mplace||'',
   };
-  await sbFetch('families?on_conflict=id', {
-    method: 'POST',
-    body: JSON.stringify(row),
-    headers: { 'Prefer': 'resolution=merge-duplicates,return=representation' }
-  });
+  const existing = await sbFetch(`families?id=eq.${encodeURIComponent(familyId)}&select=id`);
+  if (existing.length > 0) {
+    await sbFetch(`families?id=eq.${encodeURIComponent(familyId)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(row),
+      headers: { 'Prefer': 'return=minimal' }
+    });
+  } else {
+    row.id = familyId;
+    await sbFetch('families', {
+      method: 'POST',
+      body: JSON.stringify(row),
+      headers: { 'Prefer': 'return=minimal' }
+    });
+  }
 }
 
 async function deletePersonFromDB(personId, editUser) {
