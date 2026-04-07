@@ -34,7 +34,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v2.4.0';
+    const APP_VERSION = 'v2.5.1';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
 
@@ -194,11 +194,11 @@ async function savePerson(person, editUser) {
   };
   console.log('savePerson called:', { id: person.id, nickname: row.nickname, display_name: row.display_name });
   // Check if person exists → PATCH (update), else POST (insert)
-  const existing = await sbFetch(`persons?id=eq.${encodeURIComponent(person.id)}&select=id`);
+  const existing = await sbFetch(`persons?id=eq.${person.id}&select=id`);
   console.log('savePerson existence check:', { id: person.id, found: existing.length, existing });
   if (existing.length > 0) {
     console.log('savePerson PATCH:', person.id, 'nickname=', row.nickname);
-    await sbFetch(`persons?id=eq.${encodeURIComponent(person.id)}`, {
+    await sbFetch(`persons?id=eq.${person.id}`, {
       method: 'PATCH',
       body: JSON.stringify(row),
       headers: { 'Prefer': 'return=minimal' }
@@ -242,9 +242,9 @@ async function saveFamily(familyId, husbandId, wifeId, children, mdate, mplace) 
     children: children||[],
     marriage_date: mdate||'', marriage_place: mplace||'',
   };
-  const existing = await sbFetch(`families?id=eq.${encodeURIComponent(familyId)}&select=id`);
+  const existing = await sbFetch(`families?id=eq.${familyId}&select=id`);
   if (existing.length > 0) {
-    await sbFetch(`families?id=eq.${encodeURIComponent(familyId)}`, {
+    await sbFetch(`families?id=eq.${familyId}`, {
       method: 'PATCH',
       body: JSON.stringify(row),
       headers: { 'Prefer': 'return=minimal' }
