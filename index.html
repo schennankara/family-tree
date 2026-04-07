@@ -34,7 +34,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v2.4.0';
+    const APP_VERSION = 'v2.4.1';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
 
@@ -1197,27 +1197,41 @@ async function signOut() {
   persistAuth();
 }
 
+const SITE_URL = 'https://schennankara.github.io/family-tree/';
+
 async function resetPassword(email) {
   await sbAuthFetch('/recover', {
     method: 'POST',
-    body: JSON.stringify({ email })
+    body: JSON.stringify({ email, redirect_to: SITE_URL })
   });
 }
 
-async function createUserAccount(email, password, name, personId, role) {
-  // Create auth user
-  const data = await sbAuthFetch('/admin/users', {
+async function createUserAccount(email, name, personId, role) {
+  // Generate a secure random temporary password (user will reset via email)
+  const tempPwd = 'Tmp!' + crypto.getRandomValues(new Uint8Array(16)).reduce((s,b)=>s+b.toString(36),'').slice(0,20);
+  
+  // Create auth user via public signup endpoint
+  const data = await sbAuthFetch('/signup', {
     method: 'POST',
-    headers: { 'Authorization': 'Bearer ' + authSession.access_token, 'apikey': SUPABASE_KEY },
-    body: JSON.stringify({ email, password, email_confirm: true })
+    body: JSON.stringify({ 
+      email, 
+      password: tempPwd,
+      data: { name }  // stored in auth.users.raw_user_meta_data
+    })
   });
-  // Insert into users table
+  
+  // /signup returns { id, ... } on success or { user: { id, ... } } depending on confirm setting
+  const userId = data.id || data.user?.id;
+  if (!userId) throw new Error('Signup did not return a user ID. The email may already be registered.');
+  
+  // Insert into public.users table
   await sbFetch('users', {
     method: 'POST',
     headers: { 'Authorization': 'Bearer ' + authSession.access_token, 'Prefer': 'return=minimal' },
-    body: JSON.stringify({ id: data.id, name, email, person_id: personId || null, role: role || 'editor' })
+    body: JSON.stringify({ id: userId, name, email, person_id: personId || null, role: role || 'editor' })
   });
-  return data;
+  
+  return { id: userId, email };
 }
 
 // Override sbFetch to use auth token when available
@@ -1874,26 +1888,17 @@ function AdminPanel({onClose, onReloadTree}) {
       const h = { 'Authorization': 'Bearer ' + authSession.access_token };
       setActionMsg('Creating account for ' + req.name + '...');
       
-      // Create the user account via Postgres function
-      const result = await sbFetch('rpc/create_family_user', {
-        method: 'POST', headers: h,
-        body: JSON.stringify({
-          p_email: req.email,
-          p_name: req.name,
-          p_person_id: req.person_id || null,
-          p_role: 'editor'
-        })
-      });
+      // Step 1: Create auth user + public.users row via signup
+      await createUserAccount(req.email, req.name, req.person_id || null, 'editor');
       
-      // Trigger password reset email so user can set their own password
+      // Step 2: Send password reset email so user can set their own password
+      let emailSent = false;
       try {
-        await sbAuthFetch('/recover', {
-          method: 'POST',
-          body: JSON.stringify({ email: req.email })
-        });
+        await resetPassword(req.email);
+        emailSent = true;
       } catch(e) { console.warn('Password reset email may not have sent:', e); }
       
-      // Mark request as approved
+      // Step 3: Mark request as approved
       await sbFetch(`access_requests?id=eq.${req.id}`, {
         method: 'PATCH', headers: h,
         body: JSON.stringify({ status: 'approved', resolved_by: authUser.id, resolved_at: new Date().toISOString() })
@@ -1903,8 +1908,10 @@ function AdminPanel({onClose, onReloadTree}) {
       // Refresh users list
       const updatedUsers = await sbFetch('users?order=name', {headers:h});
       setAllUsers(updatedUsers);
-      setActionMsg('Account created for ' + req.name + '! Password reset email sent to ' + req.email);
-      setTimeout(()=>setActionMsg(''),5000);
+      setActionMsg(emailSent 
+        ? 'Account created for ' + req.name + '! Password reset email sent to ' + req.email 
+        : 'Account created for ' + req.name + '! (Email may not have sent — verify Resend domain)');
+      setTimeout(()=>setActionMsg(''),8000);
     } catch(e) { setActionMsg('Error: ' + e.message); }
   };
 
@@ -2365,6 +2372,7 @@ function App(){
   // Detect password recovery token in URL on load
   useEffect(()=>{
     try {
+      // Check hash params first (Supabase implicit flow)
       const hash = window.location.hash;
       if (hash && hash.length > 1) {
         const params = new URLSearchParams(hash.substring(1));
@@ -2375,7 +2383,41 @@ function App(){
           setShowPasswordReset(true);
           setViewerGate(false);
           window.history.replaceState(null, '', window.location.pathname);
+          return;
         }
+      }
+      // Check query params (Supabase PKCE flow sends ?code=...&type=recovery)
+      const urlParams = new URLSearchParams(window.location.search);
+      const qType = urlParams.get('type');
+      const qCode = urlParams.get('code');
+      if (qType === 'recovery' && qCode) {
+        // Exchange the code for a session token
+        (async()=>{
+          try {
+            const data = await sbAuthFetch('/token?grant_type=pkce', {
+              method: 'POST',
+              body: JSON.stringify({ auth_code: qCode, code_verifier: sessionStorage.getItem('code_verifier') || '' })
+            });
+            if (data.access_token) {
+              setResetToken(data.access_token);
+              setShowPasswordReset(true);
+              setViewerGate(false);
+              window.history.replaceState(null, '', window.location.pathname);
+            }
+          } catch(e) {
+            // Fallback: if PKCE exchange fails, try using the code directly as a token
+            // Some Supabase configs pass access_token in query params too
+            const qToken = urlParams.get('access_token');
+            if (qToken) {
+              setResetToken(qToken);
+              setShowPasswordReset(true);
+              setViewerGate(false);
+              window.history.replaceState(null, '', window.location.pathname);
+            } else {
+              console.error('Recovery code exchange failed:', e);
+            }
+          }
+        })();
       }
     } catch(e) { console.error('Recovery detection error:', e); }
   },[]);
