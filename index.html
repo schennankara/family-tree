@@ -2571,17 +2571,18 @@ function TreeNode({node,exp,onTog,onSel,onEdit,onAdd,onDel,onEditSpouse,onDelSpo
 
 /* ───── DETAIL ───── */
 function Detail({node,onClose,onEdit,onEditSpouse,onDelSpouse,root}){
-  if(!node)return null;
   const [personMedia,setPersonMedia]=useState([]);
   const [mediaLoaded,setMediaLoaded]=useState(false);
   const [lightbox,setLightbox]=useState(null);
   
   useEffect(()=>{
-    if(node.id){
+    if(node?.id){
       setMediaLoaded(false);
       loadMedia(node.id).then(m=>{setPersonMedia(m||[]);setMediaLoaded(true)}).catch(()=>setMediaLoaded(true));
     }
-  },[node.id]);
+  },[node?.id]);
+
+  if(!node)return null;
 
   const R=({l,v})=>v?<div style={{display:'flex',justifyContent:'space-between',padding:'3px 0',fontSize:13}}><span style={{color:DM}}>{l}</span><span style={{color:TX}}>{v}</span></div>:null;
   const lineage=(findPath(root,node.id)||[]).map(n=>n.dn);
