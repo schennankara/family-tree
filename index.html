@@ -371,8 +371,21 @@ async function addPersonToDB(person, parentId, editUser) {
   if (parentId) {
     const parentFams = await sbFetch(`families?select=*&or=(husband_id.eq.${parentId},wife_id.eq.${parentId})`);
     if (parentFams.length > 0) {
-      // Add to first family's children
-      const fam = parentFams[0];
+      // Pick the best family: prefer one that has both husband AND wife (a complete couple)
+      // If multiple complete families exist (remarriage), prefer the one without children or with fewest
+      let bestFam = parentFams[0];
+      if (parentFams.length > 1) {
+        const complete = parentFams.filter(f => f.husband_id && f.wife_id);
+        if (complete.length > 0) {
+          // Among complete families, prefer one that already has children (active family)
+          // or if none have children, pick the first complete one
+          const withKids = complete.filter(f => (f.children||[]).length > 0);
+          bestFam = withKids.length > 0 ? withKids[0] : complete[0];
+        }
+        // If adding from the tree UI, the parent node's spouse gives us the exact family
+        // Check if person data hints at which family (via the tree structure)
+      }
+      const fam = bestFam;
       const newChildren = [...(fam.children||[]), person.id];
       await sbFetch(`families?id=eq.${fam.id}`, {
         method: 'PATCH',
@@ -400,7 +413,10 @@ async function saveSpouseToDB(parentId, spouse, editUser) {
   const parent = await sbFetch(`persons?id=eq.${parentId}&select=gender`);
   const pGender = parent[0]?.gender || 'M';
   if (parentFams.length > 0) {
-    const fam = parentFams[0];
+    // Prefer a family that's missing the spouse slot (incomplete family)
+    const spouseSlot = pGender === 'M' ? 'wife_id' : 'husband_id';
+    const incomplete = parentFams.find(f => !f[spouseSlot]);
+    const fam = incomplete || parentFams[0];
     const patch = pGender === 'M' ? { wife_id: spouse.id } : { husband_id: spouse.id };
     await sbFetch(`families?id=eq.${fam.id}`, { method: 'PATCH', body: JSON.stringify(patch) });
   } else {
@@ -1115,35 +1131,132 @@ async function mergeFieldsToDb(ftlsPerson, fieldsToApply, ext, editUser) {
 }
 
 // Export FTLS-only persons as a GEDCOM fragment for import into external tools
-function exportDiffGedcom(ftlsOnlyPersons, ftlsFamilyMap) {
-  // Collect families that involve FTLS-only persons
-  const personIds = new Set(ftlsOnlyPersons.map(p => p.id));
-  const relevantFamilies = {};
+// Smart export: only new families, existing families handled via FAMC/FAMS on persons
+function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds) {
+  const extIds = extFamilyIds || new Set();
+  const personIds = new Set(persons.map(p => p.id));
+  const pMap = {};
+  persons.forEach(p => { pMap[p.id] = p; });
+  const fMap = {};
   for (const [fid, fam] of Object.entries(ftlsFamilyMap)) {
     const hid = fam.husband_id || fam.husb || '';
     const wid = fam.wife_id || fam.wife || '';
     const kids = fam.children || [];
-    if (personIds.has(hid) || personIds.has(wid) || kids.some(k => personIds.has(k))) {
-      relevantFamilies[fid] = fam;
+    const involvesOur = personIds.has(hid) || personIds.has(wid) || kids.some(k => personIds.has(k));
+    if (involvesOur && !extIds.has(fid)) {
+      fMap[fid] = { id: fid, husband_id: hid, wife_id: wid, children: kids,
+        marriage_date: fam.marriage_date || fam.mdate || '',
+        marriage_place: fam.marriage_place || fam.mplace || '' };
     }
   }
-  
-  // Build a minimal personMap/familyMap for export
-  const pMap = {};
-  ftlsOnlyPersons.forEach(p => { pMap[p.id] = p; });
-  const fMap = {};
-  for (const [fid, fam] of Object.entries(relevantFamilies)) {
-    fMap[fid] = {
-      id: fid,
-      husband_id: fam.husband_id || fam.husb || '',
-      wife_id: fam.wife_id || fam.wife || '',
-      children: fam.children || [],
-      marriage_date: fam.marriage_date || fam.mdate || '',
-      marriage_place: fam.marriage_place || fam.mplace || '',
-    };
-  }
-  
   return exportTreeToGedcom(null, pMap, fMap);
+}
+
+// Merge FTLS additions into the original external GEDCOM text
+function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamilyMap, extFamilyIds) {
+  const lines = originalText.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  let trlrIdx = lines.length - 1;
+  for (let i = lines.length - 1; i >= 0; i--) { if (lines[i].trim() === '0 TRLR') { trlrIdx = i; break; } }
+  const before = lines.slice(0, trlrIdx);
+  const newLines = [];
+  const extIds = extFamilyIds || new Set();
+  const exportPIds = new Set(exportPersons.map(p => p.id));
+
+  // Add new INDI records
+  for (const p of exportPersons) {
+    const L = [`0 ${p.id} INDI`];
+    const givn = ((p.fn||'') + (p.mn ? ' '+p.mn : '')).trim();
+    const nm = p.ln ? `${givn} /${p.ln}/` : (givn || p.dn || '(Unknown)');
+    L.push(`1 NAME ${nm}`);
+    if (p.fn) L.push(`2 GIVN ${p.fn}`);
+    if (p.ln) L.push(`2 SURN ${p.ln}`);
+    if (p.nk) { L.push(`1 NAME ${p.nk} //`); L.push(`2 TYPE nick`); L.push(`2 GIVN ${p.nk}`); }
+    if (p.g) L.push(`1 SEX ${p.g}`);
+    if (p.dob || p.loc) { L.push('1 BIRT'); if (p.dob) L.push(`2 DATE ${p.dob}`); if (p.loc) L.push(`2 PLAC ${p.loc}`); }
+    if (p.dod || p.dec) { L.push('1 DEAT'); if (p.dod) L.push(`2 DATE ${p.dod}`); }
+    if (p.ph) L.push(`1 PHON ${p.ph}`);
+    if (p.em) L.push(`1 EMAI ${p.em}`);
+    for (const [fid, fam] of Object.entries(ftlsFamilyMap)) {
+      if ((fam.husband_id||fam.husb) === p.id || (fam.wife_id||fam.wife) === p.id) L.push(`1 FAMS ${fid}`);
+      if ((fam.children||[]).includes(p.id)) L.push(`1 FAMC ${fid}`);
+    }
+    newLines.push(...L);
+  }
+
+  // Add new FAM records (families not in external)
+  for (const [fid, fam] of Object.entries(ftlsFamilyMap)) {
+    if (extIds.has(fid)) continue;
+    const hid = fam.husband_id || fam.husb || '';
+    const wid = fam.wife_id || fam.wife || '';
+    const kids = fam.children || [];
+    if (exportPIds.has(hid) || exportPIds.has(wid) || kids.some(k => exportPIds.has(k))) {
+      const F = [`0 ${fid} FAM`];
+      if (hid) F.push(`1 HUSB ${hid}`);
+      if (wid) F.push(`1 WIFE ${wid}`);
+      const md = fam.marriage_date || fam.mdate || '';
+      const mp = fam.marriage_place || fam.mplace || '';
+      if (md || mp) { F.push('1 MARR'); if (md) F.push(`2 DATE ${md}`); if (mp) F.push(`2 PLAC ${mp}`); }
+      kids.forEach(c => F.push(`1 CHIL ${c}`));
+      newLines.push(...F);
+    }
+  }
+
+  // Patch existing FAMs: add CHIL lines for new children
+  for (const p of exportPersons) {
+    for (const [fid, fam] of Object.entries(ftlsFamilyMap)) {
+      if (!extIds.has(fid)) continue;
+      if (!(fam.children||[]).includes(p.id)) continue;
+      for (let i = 0; i < before.length; i++) {
+        if (before[i].trim() === `0 ${fid} FAM`) {
+          let j = i + 1;
+          while (j < before.length && !before[j].trim().startsWith('0 ')) j++;
+          if (!before.slice(i, j).some(l => l.includes(`1 CHIL ${p.id}`))) {
+            before.splice(j, 0, `1 CHIL ${p.id}`);
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  // Apply field-level updates to existing INDI records
+  const tagMap = { fn:'1>GIVN', ln:'1>SURN', dob:'BIRT>DATE', dod:'DEAT>DATE', loc:'BIRT>PLAC', ph:'PHON', em:'EMAI', prof:'OCCU', notes:'NOTE' };
+  for (const { personId, fields } of (exportFields || [])) {
+    for (let i = 0; i < before.length; i++) {
+      if (!before[i].trim().startsWith(`0 ${personId} INDI`)) continue;
+      let j = i + 1;
+      while (j < before.length && !before[j].trim().startsWith('0 ')) j++;
+      for (const { key, value } of fields) {
+        const tag = tagMap[key]; if (!tag || !value) continue;
+        if (tag.includes('>')) {
+          const [par, chi] = tag.split('>');
+          const parLvl = par === '1' ? 1 : 1;
+          const parTag = par === '1' ? 'NAME' : par;
+          let found = false;
+          for (let k = i+1; k < j; k++) {
+            if (par !== '1' && before[k].trim() === `1 ${parTag}`) {
+              for (let l = k+1; l < j && before[l].trim().startsWith('2 '); l++) {
+                if (before[l].trim().startsWith(`2 ${chi}`)) { before[l] = `2 ${chi} ${value}`; found = true; break; }
+              }
+              if (!found) { before.splice(k+1, 0, `2 ${chi} ${value}`); j++; found = true; }
+              break;
+            }
+            if (par === '1' && before[k].trim().startsWith(`2 ${chi}`)) { before[k] = `2 ${chi} ${value}`; found = true; break; }
+          }
+          if (!found && par !== '1') { before.splice(j, 0, `1 ${parTag}`, `2 ${chi} ${value}`); j += 2; }
+        } else {
+          let found = false;
+          for (let k = i+1; k < j; k++) {
+            if (before[k].trim().startsWith(`1 ${tag} `) || before[k].trim() === `1 ${tag}`) { before[k] = `1 ${tag} ${value}`; found = true; break; }
+          }
+          if (!found) { before.splice(j, 0, `1 ${tag} ${value}`); j++; }
+        }
+      }
+      break;
+    }
+  }
+
+  return [...before, ...newLines, '0 TRLR'].join('\n') + '\n';
 }
 
 /* ───── GEDCOM 5.5.1 IMPORTER / PARSER ───── */
@@ -3178,19 +3291,28 @@ function MediaUploadModal({flat, user, onDone, onCancel}) {
 }
 
 /* ───── GEDCOM DIFF & MERGE UI ───── */
+/* ───── GEDCOM DIFF & MERGE UI — BASKET WORKFLOW ───── */
 function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete }) {
   const [diffResult, setDiffResult] = useState(null);
   const [fileName, setFileName] = useState('');
+  const [extGedcomText, setExtGedcomText] = useState(''); // keep raw text for merge-into
+  const [extFamilyIds, setExtFamilyIds] = useState(new Set());
   const [tab, setTab] = useState('summary');
   const [merging, setMerging] = useState(false);
-  const [merged, setMerged] = useState(new Set());
   const [mergeLog, setMergeLog] = useState([]);
-  const [fieldSelections, setFieldSelections] = useState({});
   const [expandedDiffs, setExpandedDiffs] = useState(new Set());
-  const [checkedExt, setCheckedExt] = useState(new Set());
-  const [checkedFtls, setCheckedFtls] = useState(new Set());
-  const [checkedChanged, setCheckedChanged] = useState(new Set());
-  const [checkedExtFam, setCheckedExtFam] = useState(new Set());
+
+  // Direction state: 'import' | 'export' | null
+  // extDir: { personId: 'import'|null } for ext-only persons
+  const [extDir, setExtDir] = useState({});
+  // ftlsDir: { personId: 'export'|null } for ftls-only persons
+  const [ftlsDir, setFtlsDir] = useState({});
+  // changedDir: { personId: 'import'|'export'|null } person-level default
+  const [changedDir, setChangedDir] = useState({});
+  // fieldDir: { personId: { fieldKey: 'import'|'export'|null } } per-field override
+  const [fieldDir, setFieldDir] = useState({});
+  // extFamDir: { famId: 'import'|null }
+  const [extFamDir, setExtFamDir] = useState({});
 
   const handleFile = () => {
     const input = document.createElement('input');
@@ -3201,7 +3323,9 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
       const reader = new FileReader();
       reader.onload = (evt) => {
         try {
-          const raw = evt.target.result.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+          const text = evt.target.result;
+          setExtGedcomText(text);
+          const raw = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
           const lines = raw.split('\n').filter(l => l.trim());
           const elements = [], stack = [{ children: elements, level: -1 }];
           for (const line of lines) {
@@ -3217,10 +3341,13 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
             if (el.tag === 'INDI' && el.pointer) { const p = parseIndi(el); extPeople[p.id] = p; }
             else if (el.tag === 'FAM' && el.pointer) { const f = parseFam(el); extFamilies[f.id] = f; }
           }
-          setDiffResult(computeGedcomDiff(extPeople, extFamilies, personMap, familyMap));
+          setExtFamilyIds(new Set(Object.keys(extFamilies)));
+          const result = computeGedcomDiff(extPeople, extFamilies, personMap, familyMap);
+          setDiffResult(result);
           setTab('summary');
-          setCheckedExt(new Set()); setCheckedFtls(new Set()); setCheckedChanged(new Set()); setCheckedExtFam(new Set());
-          setFieldSelections({}); setExpandedDiffs(new Set()); setMerged(new Set()); setMergeLog([]);
+          // Reset all directions
+          setExtDir({}); setFtlsDir({}); setChangedDir({}); setFieldDir({}); setExtFamDir({});
+          setExpandedDiffs(new Set()); setMergeLog([]);
         } catch (err) { alert('Error parsing GEDCOM: ' + err.message); }
       };
       reader.readAsText(file, 'utf-8');
@@ -3228,71 +3355,152 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
     input.click();
   };
 
-  const toggle = (set, setter, id) => { const s = new Set(set); s.has(id) ? s.delete(id) : s.add(id); setter(s); };
-  const selectAll = (setter, ids) => setter(new Set(ids));
-  const selectNone = (setter) => setter(new Set());
-  const toggleFieldSel = (pid, key) => setFieldSelections(prev => ({ ...prev, [pid]: { ...(prev[pid]||{}), [key]: !(prev[pid]||{})[key] } }));
-  const toggleExpand = (id) => { const s = new Set(expandedDiffs); s.has(id) ? s.delete(id) : s.add(id); setExpandedDiffs(s); };
+  const toggleExpand = (id) => { const s = new Set(expandedDiffs); s.has(id)?s.delete(id):s.add(id); setExpandedDiffs(s); };
 
-  // ── BATCH MERGE INTO FTLS ──
-  const batchMergeInto = async () => {
-    setMerging(true); const log = [];
-    for (const p of (diffResult?.extOnly||[])) {
-      if (!checkedExt.has(p.id) || merged.has('ep_'+p.id)) continue;
-      try { await mergePersonToDb(p, user?.email||'GEDCOM merge'); log.push('✓ Added '+p.dn); setMerged(prev => new Set([...prev,'ep_'+p.id])); }
-      catch(e) { log.push('✗ '+p.dn+': '+e.message); }
-    }
-    for (const fd of (diffResult?.familyDiffs||[]).filter(f => f.type==='ext_only')) {
-      if (!checkedExtFam.has(fd.id) || merged.has('ef_'+fd.id)) continue;
-      try { await mergeFamilyToDb(fd.ext); log.push('✓ Added family '+fd.id); setMerged(prev => new Set([...prev,'ef_'+fd.id])); }
-      catch(e) { log.push('✗ Family '+fd.id+': '+e.message); }
-    }
-    for (const m of (diffResult?.matched||[]).filter(m => m.diffs.length > 0)) {
-      if (!checkedChanged.has(m.id) || merged.has('ch_'+m.id)) continue;
-      const sel = fieldSelections[m.id]||{};
-      const fields = Object.keys(sel).filter(k => sel[k]);
-      if (fields.length === 0) continue;
-      try { await mergeFieldsToDb(m.ftls, fields, m.ext, user?.email||'GEDCOM merge'); log.push('✓ Updated '+fields.length+' fields on '+m.ftls.dn); setMerged(prev => new Set([...prev,'ch_'+m.id])); }
-      catch(e) { log.push('✗ '+m.ftls.dn+': '+e.message); }
-    }
-    if (log.length === 0) log.push('Nothing selected to merge.');
-    setMergeLog(prev => [...prev, ...log]);
-    setMerging(false);
-    if (log.some(l => l.startsWith('✓'))) setTab('log');
+  // Get effective direction for a field (field override > person default > null)
+  const getFieldDirection = (personId, fieldKey) => {
+    const fo = (fieldDir[personId]||{})[fieldKey];
+    if (fo) return fo;
+    return changedDir[personId] || null;
   };
 
-  // ── BATCH EXPORT AS GEDCOM ──
-  const batchExportOut = () => {
-    const persons = [];
-    for (const p of (diffResult?.ftlsOnly||[])) { if (checkedFtls.has(p.id)) persons.push(p); }
-    for (const m of (diffResult?.matched||[]).filter(m => m.diffs.length > 0)) { if (checkedChanged.has(m.id)) persons.push(m.ftls); }
-    if (persons.length === 0) { alert('No items selected to export.'); return; }
-    const content = exportDiffGedcom(persons, familyMap);
+  // Set person-level direction (cascades to all fields that don't have overrides)
+  const setPersonDirection = (personId, dir) => {
+    setChangedDir(prev => ({ ...prev, [personId]: dir }));
+    // Clear field-level overrides so cascade takes effect
+    setFieldDir(prev => { const n = {...prev}; delete n[personId]; return n; });
+  };
+
+  // Set field-level override
+  const setFieldDirection = (personId, fieldKey, dir) => {
+    setFieldDir(prev => ({
+      ...prev,
+      [personId]: { ...(prev[personId]||{}), [fieldKey]: dir }
+    }));
+  };
+
+  // Global select all for changed tab
+  const globalChangedDir = (dir) => {
+    if (!diffResult) return;
+    const d = {};
+    diffResult.matched.filter(m => m.diffs.length > 0).forEach(m => { d[m.id] = dir; });
+    setChangedDir(d);
+    setFieldDir({});
+  };
+
+  // ── Compute basket contents ──
+  const basket = useMemo(() => {
+    if (!diffResult) return { imports: [], exports: [], importFams: [] };
+    const imports = []; // { type, person, fields? }
+    const exports = []; // { type, person, fields? }
+    const importFams = [];
+
+    // Ext-only persons marked for import
+    diffResult.extOnly.forEach(p => { if (extDir[p.id] === 'import') imports.push({ type: 'ext_person', person: p }); });
+    // Ext-only families marked for import
+    diffResult.familyDiffs.filter(f => f.type === 'ext_only').forEach(f => { if (extFamDir[f.id] === 'import') importFams.push(f.ext); });
+    // FTLS-only persons marked for export
+    diffResult.ftlsOnly.forEach(p => { if (ftlsDir[p.id] === 'export') exports.push({ type: 'ftls_person', person: p }); });
+
+    // Changed persons — split fields by direction
+    diffResult.matched.filter(m => m.diffs.length > 0).forEach(m => {
+      const impFields = [], expFields = [];
+      m.diffs.forEach(d => {
+        const dir = getFieldDirection(m.id, d.key);
+        if (dir === 'import') impFields.push(d);
+        else if (dir === 'export') expFields.push(d);
+      });
+      if (impFields.length > 0) imports.push({ type: 'changed_fields', person: m.ftls, ext: m.ext, fields: impFields });
+      if (expFields.length > 0) exports.push({ type: 'changed_fields', person: m.ftls, fields: expFields });
+    });
+
+    return { imports, exports, importFams };
+  }, [diffResult, extDir, ftlsDir, changedDir, fieldDir, extFamDir]);
+
+  // ── BATCH IMPORT (merge to DB) ──
+  const batchImport = async () => {
+    setMerging(true); const log = [];
+    for (const item of basket.imports) {
+      if (item.type === 'ext_person') {
+        try { await mergePersonToDb(item.person, user?.email||'GEDCOM merge'); log.push('✓ Added ' + (item.person.dn||'?')); }
+        catch(e) { log.push('✗ ' + (item.person.dn||'?') + ': ' + e.message); }
+      } else if (item.type === 'changed_fields') {
+        const keys = item.fields.map(f => f.key);
+        try { await mergeFieldsToDb(item.person, keys, item.ext, user?.email||'GEDCOM merge'); log.push('✓ Updated ' + keys.length + ' fields on ' + item.person.dn); }
+        catch(e) { log.push('✗ ' + item.person.dn + ': ' + e.message); }
+      }
+    }
+    for (const fam of basket.importFams) {
+      try { await mergeFamilyToDb(fam); log.push('✓ Added family ' + fam.id); }
+      catch(e) { log.push('✗ Family ' + fam.id + ': ' + e.message); }
+    }
+    if (log.length === 0) log.push('Nothing to import.');
+    setMergeLog(prev => [...prev, ...log]);
+    setMerging(false);
+    if (log.some(l => l.startsWith('✓'))) setTab('basket');
+  };
+
+  // ── BATCH EXPORT (download GEDCOM) ──
+  const batchExportGedcom = () => {
+    const persons = basket.exports.filter(e => e.type === 'ftls_person').map(e => e.person);
+    // For changed_fields exports, include the FTLS person version
+    basket.exports.filter(e => e.type === 'changed_fields').forEach(e => {
+      if (!persons.find(p => p.id === e.person.id)) persons.push(e.person);
+    });
+    if (persons.length === 0) { alert('No items to export.'); return; }
+    const content = exportDiffGedcom(persons, familyMap, extFamilyIds);
     const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a'); a.href = url; a.download = 'FTLS_Export_For_Merge.ged';
+    const url = URL.createObjectURL(blob); const a = document.createElement('a');
+    a.href = url; a.download = 'FTLS_Export_For_Merge.ged';
     document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
-    setMergeLog(prev => [...prev, '⬆ Exported '+persons.length+' persons as GEDCOM']);
+    setMergeLog(prev => [...prev, '⬆ Exported ' + persons.length + ' persons as new GEDCOM']);
+  };
+
+  // ── MERGE INTO LOADED GEDCOM ──
+  const batchMergeIntoGedcom = () => {
+    if (!extGedcomText) { alert('No external GEDCOM loaded.'); return; }
+    const persons = basket.exports.filter(e => e.type === 'ftls_person').map(e => e.person);
+    basket.exports.filter(e => e.type === 'changed_fields').forEach(e => {
+      if (!persons.find(p => p.id === e.person.id)) persons.push(e.person);
+    });
+    const expFields = basket.exports.filter(e => e.type === 'changed_fields').map(e => ({
+      personId: e.person.id,
+      fields: e.fields.map(f => ({ key: f.key, value: f.ftls }))
+    }));
+    const content = buildMergedGedcom(extGedcomText, persons, expFields, familyMap, extFamilyIds);
+    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob); const a = document.createElement('a');
+    a.href = url; a.download = fileName.replace('.ged', '') + '_merged.ged';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+    setMergeLog(prev => [...prev, '⬆ Merged into ' + fileName + ' (' + persons.length + ' persons, ' + expFields.length + ' field updates)']);
   };
 
   const S = diffResult?.stats;
-  const tabStyle = (t) => ({ fontSize:12, padding:'6px 14px', cursor:'pointer', borderRadius:'6px 6px 0 0', background: tab===t ? 'rgba(196,163,90,0.15)' : 'transparent', color: tab===t ? GC : DM, border: tab===t ? '1px solid '+GD : '1px solid transparent', borderBottom:'none' });
-  const sectionHdr = { fontSize:14, color:GC, fontWeight:600, margin:'16px 0 8px', paddingBottom:4, borderBottom:'1px solid '+BR };
-  const rowS = { padding:'6px 0', borderBottom:'1px solid rgba(196,163,90,0.06)', fontSize:13 };
-  const badgeS = (c) => ({ display:'inline-block', padding:'1px 8px', borderRadius:10, fontSize:11, background:c, color:'#fff', marginLeft:6 });
-  const selBarS = { display:'flex', gap:8, alignItems:'center', marginBottom:10, padding:'6px 10px', background:'rgba(196,163,90,0.04)', borderRadius:6, border:'1px solid '+BR, flexWrap:'wrap' };
-  const selBtnS = { fontSize:11, color:GC, cursor:'pointer', textDecoration:'underline', background:'none', border:'none', padding:0 };
+  const tabSt = (t) => ({ fontSize:12, padding:'6px 12px', cursor:'pointer', borderRadius:'6px 6px 0 0', background:tab===t?'rgba(196,163,90,0.15)':'transparent', color:tab===t?GC:DM, border:tab===t?'1px solid '+GD:'1px solid transparent', borderBottom:'none', whiteSpace:'nowrap' });
+  const hdr = { fontSize:14, color:GC, fontWeight:600, margin:'16px 0 8px', paddingBottom:4, borderBottom:'1px solid '+BR };
+  const rowSt = { padding:'6px 0', borderBottom:'1px solid rgba(196,163,90,0.06)', fontSize:13 };
+  const badge = (c) => ({ display:'inline-block', padding:'1px 8px', borderRadius:10, fontSize:11, background:c, color:'#fff', marginLeft:6 });
+  const selBar = { display:'flex', gap:8, alignItems:'center', marginBottom:10, padding:'6px 10px', background:'rgba(196,163,90,0.04)', borderRadius:6, border:'1px solid '+BR, flexWrap:'wrap' };
+  const lnkBtn = { fontSize:11, color:GC, cursor:'pointer', textDecoration:'underline', background:'none', border:'none', padding:0 };
 
-  const anyChecked = checkedExt.size > 0 || checkedFtls.size > 0 || checkedChanged.size > 0 || checkedExtFam.size > 0;
-  const hasFieldsToMerge = checkedExt.size > 0 || checkedExtFam.size > 0 || [...checkedChanged].some(id => Object.values(fieldSelections[id]||{}).some(v=>v));
-  const hasItemsToExport = checkedFtls.size > 0 || checkedChanged.size > 0;
+  // Direction toggle button
+  const DirBtn = ({ dir, onSet, allowImport=true, allowExport=true }) => {
+    const impActive = dir === 'import';
+    const expActive = dir === 'export';
+    return (<span style={{ display:'inline-flex', gap:1, fontSize:11 }}>
+      {allowImport && <span onClick={()=>onSet(impActive?null:'import')} style={{ padding:'2px 8px', borderRadius:'4px 0 0 4px', cursor:'pointer', background: impActive?'rgba(107,158,114,0.25)':'rgba(255,255,255,0.04)', border:'1px solid '+(impActive?MC:'rgba(255,255,255,0.1)'), color: impActive?MC:DM }}>⬇ Import</span>}
+      {allowExport && <span onClick={()=>onSet(expActive?null:'export')} style={{ padding:'2px 8px', borderRadius: allowImport?'0 4px 4px 0':'4px', cursor:'pointer', background: expActive?'rgba(196,163,90,0.2)':'rgba(255,255,255,0.04)', border:'1px solid '+(expActive?GD:'rgba(255,255,255,0.1)'), color: expActive?GC:DM }}>⬆ Export</span>}
+    </span>);
+  };
+
+  const basketCount = basket.imports.length + basket.importFams.length + basket.exports.length;
 
   return (
     <div style={{ position:'fixed', inset:0, zIndex:200, display:'flex', alignItems:'center', justifyContent:'center' }}>
       <div style={{ position:'absolute', inset:0, background:'rgba(0,0,0,0.85)' }} onClick={onClose} />
-      <div style={{ position:'relative', background:'#141410', border:'1px solid '+GD, borderRadius:12, width:Math.min(920,window.innerWidth-32), maxHeight:'90vh', display:'flex', flexDirection:'column', zIndex:201 }}>
+      <div style={{ position:'relative', background:'#141410', border:'1px solid '+GD, borderRadius:12, width:Math.min(940,window.innerWidth-32), maxHeight:'90vh', display:'flex', flexDirection:'column', zIndex:201 }}>
         {/* Header */}
-        <div style={{ padding:'16px 20px', borderBottom:'1px solid '+BR, display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+        <div style={{ padding:'14px 20px', borderBottom:'1px solid '+BR, display:'flex', justifyContent:'space-between', alignItems:'center' }}>
           <div>
             <span style={{ fontSize:18, color:GC, fontWeight:500 }}>🔀 GEDCOM Diff &amp; Merge</span>
             {fileName && <span style={{ fontSize:12, color:DM, marginLeft:12 }}>vs {fileName}</span>}
@@ -3300,166 +3508,147 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
           <span onClick={onClose} style={{ fontSize:20, color:DM, cursor:'pointer', padding:'4px 8px' }}>✕</span>
         </div>
 
-        {/* Action bar */}
-        {diffResult && anyChecked && (
-          <div style={{ padding:'8px 20px', borderBottom:'1px solid '+BR, background:'rgba(107,158,114,0.06)', display:'flex', gap:10, alignItems:'center', flexWrap:'wrap' }}>
-            <span style={{ fontSize:12, color:TX }}>{checkedExt.size + checkedExtFam.size + checkedChanged.size + checkedFtls.size} items selected</span>
-            <span style={{ color:BR }}>|</span>
-            {hasFieldsToMerge && <button onClick={batchMergeInto} disabled={merging} style={{ background:'rgba(107,158,114,0.15)', border:'1px solid '+MC, color:MC, padding:'5px 14px', borderRadius:6, cursor:'pointer', fontSize:12 }}>{merging ? 'Merging...' : '⬇ Merge Selected into FTLS'}</button>}
-            {hasItemsToExport && <button onClick={batchExportOut} style={{ background:'rgba(196,163,90,0.1)', border:'1px solid '+GD, color:GC, padding:'5px 14px', borderRadius:6, cursor:'pointer', fontSize:12 }}>⬆ Export Selected as GEDCOM</button>}
-          </div>
-        )}
-
         {/* Body */}
         <div style={{ flex:1, overflowY:'auto', padding:'0 20px 20px' }}>
           {!diffResult ? (
             <div style={{ textAlign:'center', padding:'60px 20px' }}>
               <div style={{ fontSize:48, marginBottom:16 }}>📂</div>
               <div style={{ fontSize:15, color:TX, marginBottom:8 }}>Upload an external GEDCOM to compare</div>
-              <div style={{ fontSize:12, color:DM, marginBottom:24, lineHeight:1.6 }}>Compare every person and family against your FTLS database.<br/>Selectively merge incoming data or export FTLS additions.</div>
+              <div style={{ fontSize:12, color:DM, marginBottom:24, lineHeight:1.6 }}>Compare every person and family against FTLS.<br/>Mark items for import or export, then process in the basket.</div>
               <button onClick={handleFile} style={{ background:'rgba(107,158,114,0.15)', border:'1px solid '+MC, color:MC, padding:'12px 28px', borderRadius:8, cursor:'pointer', fontSize:14 }}>📄 Select GEDCOM File</button>
             </div>
           ) : (<>
             {/* Tabs */}
-            <div style={{ display:'flex', gap:2, marginTop:12, borderBottom:'1px solid '+BR }}>
-              <span style={tabStyle('summary')} onClick={()=>setTab('summary')}>Summary</span>
-              {S.changed > 0 && <span style={tabStyle('changed')} onClick={()=>setTab('changed')}>Changed ({S.changed})</span>}
-              {S.extOnly > 0 && <span style={tabStyle('ext_only')} onClick={()=>setTab('ext_only')}>External Only ({S.extOnly})</span>}
-              {S.ftlsOnly > 0 && <span style={tabStyle('ftls_only')} onClick={()=>setTab('ftls_only')}>FTLS Only ({S.ftlsOnly})</span>}
-              {diffResult.fuzzyMatched.length > 0 && <span style={tabStyle('fuzzy')} onClick={()=>setTab('fuzzy')}>Fuzzy ({diffResult.fuzzyMatched.length})</span>}
-              {mergeLog.length > 0 && <span style={tabStyle('log')} onClick={()=>setTab('log')}>Log ({mergeLog.length})</span>}
+            <div style={{ display:'flex', gap:2, marginTop:12, borderBottom:'1px solid '+BR, flexWrap:'wrap' }}>
+              <span style={tabSt('summary')} onClick={()=>setTab('summary')}>Summary</span>
+              {S.changed>0 && <span style={tabSt('changed')} onClick={()=>setTab('changed')}>Changed ({S.changed})</span>}
+              {S.extOnly>0 && <span style={tabSt('ext_only')} onClick={()=>setTab('ext_only')}>External Only ({S.extOnly})</span>}
+              {S.ftlsOnly>0 && <span style={tabSt('ftls_only')} onClick={()=>setTab('ftls_only')}>FTLS Only ({S.ftlsOnly})</span>}
+              {diffResult.fuzzyMatched.length>0 && <span style={tabSt('fuzzy')} onClick={()=>setTab('fuzzy')}>Fuzzy ({diffResult.fuzzyMatched.length})</span>}
+              <span style={tabSt('basket')} onClick={()=>setTab('basket')}>🧺 Basket {basketCount>0 && <span style={badge('rgba(196,163,90,0.7)')}>{basketCount}</span>}</span>
+              {mergeLog.length>0 && <span style={tabSt('log')} onClick={()=>setTab('log')}>Log ({mergeLog.length})</span>}
             </div>
 
-            {/* SUMMARY */}
-            {tab==='summary' && (
-              <div style={{ padding:'16px 0' }}>
-                <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12, marginBottom:20 }}>
-                  <div style={{ background:'rgba(107,158,114,0.08)', border:'1px solid rgba(107,158,114,0.2)', borderRadius:8, padding:14 }}>
-                    <div style={{ fontSize:11, color:DM, textTransform:'uppercase', letterSpacing:1, marginBottom:4 }}>External GEDCOM</div>
-                    <div style={{ fontSize:24, color:MC, fontWeight:600 }}>{S.extTotal} <span style={{ fontSize:13, fontWeight:400 }}>persons</span></div>
-                    <div style={{ fontSize:13, color:DM }}>{S.extFamilies} families</div>
-                  </div>
-                  <div style={{ background:'rgba(196,163,90,0.08)', border:'1px solid rgba(196,163,90,0.2)', borderRadius:8, padding:14 }}>
-                    <div style={{ fontSize:11, color:DM, textTransform:'uppercase', letterSpacing:1, marginBottom:4 }}>FTLS Database</div>
-                    <div style={{ fontSize:24, color:GC, fontWeight:600 }}>{S.ftlsTotal} <span style={{ fontSize:13, fontWeight:400 }}>persons</span></div>
-                    <div style={{ fontSize:13, color:DM }}>{S.ftlsFamilies} families</div>
-                  </div>
+            {/* ──── SUMMARY ──── */}
+            {tab==='summary' && (<div style={{ padding:'16px 0' }}>
+              <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12, marginBottom:20 }}>
+                <div style={{ background:'rgba(107,158,114,0.08)', border:'1px solid rgba(107,158,114,0.2)', borderRadius:8, padding:14 }}>
+                  <div style={{ fontSize:11, color:DM, textTransform:'uppercase', letterSpacing:1, marginBottom:4 }}>External GEDCOM</div>
+                  <div style={{ fontSize:24, color:MC, fontWeight:600 }}>{S.extTotal} <span style={{ fontSize:13, fontWeight:400 }}>persons</span></div>
+                  <div style={{ fontSize:13, color:DM }}>{S.extFamilies} families</div>
                 </div>
-                <div style={sectionHdr}>Match Results</div>
-                <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fill,minmax(160px,1fr))', gap:8 }}>
-                  {[[S.identical,'#6b9e72','Identical'],[S.changed,'#c4a35a','Changed'],[S.extOnly,'#7eb8d0','External Only'],[S.ftlsOnly,'#9b82c4','FTLS Only'],...(S.fuzzyMatch>0?[[S.fuzzyMatch,'#d0a07e','Fuzzy']]:[])]
-                    .map(([v,c,l])=><div key={l} style={{ padding:10, background:'rgba(255,255,255,0.02)', borderRadius:6, border:'1px solid '+BR }}><div style={{ fontSize:22, color:c, fontWeight:600 }}>{v}</div><div style={{ fontSize:11, color:DM }}>{l}</div></div>)}
+                <div style={{ background:'rgba(196,163,90,0.08)', border:'1px solid rgba(196,163,90,0.2)', borderRadius:8, padding:14 }}>
+                  <div style={{ fontSize:11, color:DM, textTransform:'uppercase', letterSpacing:1, marginBottom:4 }}>FTLS Database</div>
+                  <div style={{ fontSize:24, color:GC, fontWeight:600 }}>{S.ftlsTotal} <span style={{ fontSize:13, fontWeight:400 }}>persons</span></div>
+                  <div style={{ fontSize:13, color:DM }}>{S.ftlsFamilies} families</div>
                 </div>
-                <div style={{ marginTop:20 }}><button onClick={handleFile} style={{ background:'transparent', border:'1px solid '+BR, color:DM, padding:'8px 16px', borderRadius:6, cursor:'pointer', fontSize:12 }}>📄 Load Different File</button></div>
               </div>
-            )}
+              <div style={hdr}>Match Results</div>
+              <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fill,minmax(150px,1fr))', gap:8 }}>
+                {[[S.identical,'#6b9e72','Identical'],[S.changed,'#c4a35a','Changed'],[S.extOnly,'#7eb8d0','External Only'],[S.ftlsOnly,'#9b82c4','FTLS Only'],...(S.fuzzyMatch>0?[[S.fuzzyMatch,'#d0a07e','Fuzzy']]:[])]
+                  .map(([v,c,l])=><div key={l} style={{ padding:10, background:'rgba(255,255,255,0.02)', borderRadius:6, border:'1px solid '+BR }}><div style={{ fontSize:22, color:c, fontWeight:600 }}>{v}</div><div style={{ fontSize:11, color:DM }}>{l}</div></div>)}
+              </div>
+              <div style={{ marginTop:20 }}><button onClick={handleFile} style={{ background:'transparent', border:'1px solid '+BR, color:DM, padding:'8px 16px', borderRadius:6, cursor:'pointer', fontSize:12 }}>📄 Load Different File</button></div>
+            </div>)}
 
-            {/* CHANGED */}
+            {/* ──── CHANGED ──── */}
             {tab==='changed' && (()=>{
-              const items = diffResult.matched.filter(m => m.diffs.length > 0);
-              const allIds = items.map(m => m.id);
+              const items = diffResult.matched.filter(m=>m.diffs.length>0);
               return (<div style={{ padding:'12px 0' }}>
-                <div style={{ fontSize:12, color:DM, marginBottom:8 }}>Check rows to include in batch actions. Expand to pick individual fields for merge.</div>
-                <div style={selBarS}>
-                  <input type="checkbox" checked={checkedChanged.size===allIds.length && allIds.length>0} onChange={()=>checkedChanged.size===allIds.length ? selectNone(setCheckedChanged) : selectAll(setCheckedChanged, allIds)} />
-                  <span style={{ fontSize:12, color:DM }}>{checkedChanged.size}/{allIds.length}</span>
-                  <button style={selBtnS} onClick={()=>selectAll(setCheckedChanged, allIds)}>Select All</button>
-                  <button style={selBtnS} onClick={()=>selectNone(setCheckedChanged)}>None</button>
+                <div style={{ fontSize:12, color:DM, marginBottom:8 }}>Toggle Import/Export per person or per field. Items move to the Basket.</div>
+                <div style={selBar}>
+                  <span style={{ fontSize:12, color:DM }}>All {items.length} persons:</span>
+                  <button style={lnkBtn} onClick={()=>globalChangedDir('import')}>⬇ All Import</button>
+                  <button style={lnkBtn} onClick={()=>globalChangedDir('export')}>⬆ All Export</button>
+                  <button style={lnkBtn} onClick={()=>globalChangedDir(null)}>Clear All</button>
                 </div>
                 {items.map(m => {
                   const isExp = expandedDiffs.has(m.id);
-                  const isMerged = merged.has('ch_'+m.id);
+                  const personDir = changedDir[m.id] || null;
                   return (<div key={m.id} style={{ marginBottom:6, border:'1px solid '+BR, borderRadius:8, overflow:'hidden' }}>
                     <div style={{ padding:'7px 12px', background:'rgba(196,163,90,0.04)', display:'flex', alignItems:'center', gap:8 }}>
-                      <input type="checkbox" checked={checkedChanged.has(m.id)} onChange={()=>toggle(checkedChanged, setCheckedChanged, m.id)} />
+                      <DirBtn dir={personDir} onSet={(d)=>setPersonDirection(m.id, d)} />
                       <span onClick={()=>toggleExpand(m.id)} style={{ flex:1, cursor:'pointer', color:TX, fontSize:13 }}>
-                        <span style={{ color: isExp?GC:DM, marginRight:6 }}>{isExp?'▼':'▶'}</span>
-                        {m.ftls.dn||m.ext.dn} <span style={badgeS('rgba(196,163,90,0.6)')}>{m.diffs.length} diff{m.diffs.length>1?'s':''}</span>
+                        <span style={{ color:isExp?GC:DM, marginRight:6 }}>{isExp?'▼':'▶'}</span>
+                        {m.ftls.dn||m.ext.dn} <span style={badge('rgba(196,163,90,0.6)')}>{m.diffs.length} diff{m.diffs.length>1?'s':''}</span>
                       </span>
-                      {isMerged && <span style={{ fontSize:11, color:'#6b9e72' }}>✓ merged</span>}
                     </div>
                     {isExp && (<div style={{ padding:'8px 12px' }}>
                       <table style={{ width:'100%', fontSize:12, borderCollapse:'collapse' }}>
                         <thead><tr>
-                          <th style={{ textAlign:'left', color:DM, padding:'4px 8px', width:30 }} title="Check to import External value">⬇</th>
+                          <th style={{ textAlign:'left', color:DM, padding:'4px 8px', width:130 }}>Direction</th>
                           <th style={{ textAlign:'left', color:DM, padding:'4px 8px' }}>Field</th>
                           <th style={{ textAlign:'left', color:GC, padding:'4px 8px' }}>FTLS</th>
                           <th style={{ textAlign:'left', color:MC, padding:'4px 8px' }}>External</th>
-                          <th style={{ textAlign:'left', color:DM, padding:'4px 8px', width:55 }}>Better?</th>
+                          <th style={{ textAlign:'left', color:DM, padding:'4px 8px', width:50 }}>Hint</th>
                         </tr></thead>
                         <tbody>{m.diffs.map(d => {
+                          const fDir = getFieldDirection(m.id, d.key);
                           const fL=(d.ftls||'').replace(/^[,\s]+/,'').length, eL=(d.ext||'').replace(/^[,\s]+/,'').length;
                           const ftlsW=fL>=eL&&fL>0, extW=eL>fL;
                           return (<tr key={d.key} style={{ borderTop:'1px solid rgba(196,163,90,0.06)' }}>
-                            <td style={{ padding:'4px 8px' }}><input type="checkbox" checked={!!(fieldSelections[m.id]||{})[d.key]} onChange={()=>toggleFieldSel(m.id,d.key)} /></td>
+                            <td style={{ padding:'4px 8px' }}><DirBtn dir={fDir} onSet={(dir)=>setFieldDirection(m.id, d.key, dir)} /></td>
                             <td style={{ padding:'4px 8px', color:DM }}>{d.label}</td>
-                            <td style={{ padding:'4px 8px', color: d.ftls?TX:'#5a4040', background: ftlsW?'rgba(107,158,114,0.06)':'transparent' }}>{d.ftls||'(empty)'}</td>
-                            <td style={{ padding:'4px 8px', color: d.ext?'#8ec496':'#5a4040', background: extW?'rgba(107,158,114,0.06)':'transparent' }}>{d.ext||'(empty)'}</td>
-                            <td style={{ padding:'4px 8px', fontSize:10 }}>{ftlsW?<span style={{color:GC}}>← FTLS</span>:extW?<span style={{color:MC}}>Ext →</span>:<span style={{color:DM}}>—</span>}</td>
+                            <td style={{ padding:'4px 8px', color:d.ftls?TX:'#5a4040', background:ftlsW?'rgba(107,158,114,0.06)':'transparent' }}>{d.ftls||'(empty)'}</td>
+                            <td style={{ padding:'4px 8px', color:d.ext?'#8ec496':'#5a4040', background:extW?'rgba(107,158,114,0.06)':'transparent' }}>{d.ext||'(empty)'}</td>
+                            <td style={{ padding:'4px 8px', fontSize:10 }}>{ftlsW?<span style={{color:GC}}>←FTLS</span>:extW?<span style={{color:MC}}>Ext→</span>:<span style={{color:DM}}>—</span>}</td>
                           </tr>);
                         })}</tbody>
                       </table>
-                      <div style={{ fontSize:10, color:DM, marginTop:6 }}>Checked fields will be imported when you use "⬇ Merge Selected into FTLS". Unchecked FTLS values export via "⬆ Export Selected as GEDCOM".</div>
                     </div>)}
                   </div>);
                 })}
               </div>);
             })()}
 
-            {/* EXTERNAL ONLY */}
+            {/* ──── EXTERNAL ONLY ──── */}
             {tab==='ext_only' && (()=>{
               const persons = diffResult.extOnly;
-              const extFams = diffResult.familyDiffs.filter(f => f.type==='ext_only');
+              const extFams = diffResult.familyDiffs.filter(f=>f.type==='ext_only');
               return (<div style={{ padding:'12px 0' }}>
-                <div style={{ fontSize:12, color:DM, marginBottom:8 }}>People and families in external GEDCOM not in FTLS. Select items to merge into your database.</div>
-                {persons.length > 0 && <>
-                  <div style={sectionHdr}>Persons ({persons.length})</div>
-                  <div style={selBarS}>
-                    <input type="checkbox" checked={checkedExt.size===persons.length && persons.length>0} onChange={()=>checkedExt.size===persons.length ? selectNone(setCheckedExt) : selectAll(setCheckedExt, persons.map(p=>p.id))} />
-                    <span style={{ fontSize:12, color:DM }}>{checkedExt.size}/{persons.length}</span>
-                    <button style={selBtnS} onClick={()=>selectAll(setCheckedExt, persons.map(p=>p.id))}>Select All</button>
-                    <button style={selBtnS} onClick={()=>selectNone(setCheckedExt)}>None</button>
+                <div style={{ fontSize:12, color:DM, marginBottom:8 }}>Mark for import to add these to your FTLS database.</div>
+                {persons.length>0 && <>
+                  <div style={hdr}>Persons ({persons.length})</div>
+                  <div style={selBar}>
+                    <button style={lnkBtn} onClick={()=>{ const d={}; persons.forEach(p=>{d[p.id]='import'}); setExtDir(d); }}>⬇ All Import</button>
+                    <button style={lnkBtn} onClick={()=>setExtDir({})}>Clear All</button>
+                    <span style={{ fontSize:11, color:DM }}>{Object.values(extDir).filter(v=>v==='import').length} marked</span>
                   </div>
-                  {persons.map(p => (<div key={p.id} style={{ ...rowS, display:'flex', alignItems:'center', gap:8 }}>
-                    <input type="checkbox" checked={checkedExt.has(p.id)} onChange={()=>toggle(checkedExt, setCheckedExt, p.id)} />
-                    <span style={{ width:8, height:8, borderRadius:'50%', background: p.g==='M'?MC:FC, flexShrink:0 }} />
+                  {persons.map(p => (<div key={p.id} style={{ ...rowSt, display:'flex', alignItems:'center', gap:8 }}>
+                    <DirBtn dir={extDir[p.id]||null} onSet={(d)=>setExtDir(prev=>({...prev,[p.id]:d}))} allowExport={false} />
+                    <span style={{ width:8, height:8, borderRadius:'50%', background:p.g==='M'?MC:FC, flexShrink:0 }} />
                     <span style={{ color:TX, flex:1 }}>{p.dn||'(Unknown)'}</span>
                     {p.dob && <span style={{ color:DM, fontSize:11 }}>b.{p.dob}</span>}
                     <span style={{ color:'#5a5548', fontSize:10 }}>{p.id}</span>
-                    {merged.has('ep_'+p.id) && <span style={{ fontSize:11, color:'#6b9e72' }}>✓</span>}
                   </div>))}
                 </>}
-                {extFams.length > 0 && <>
-                  <div style={sectionHdr}>Families ({extFams.length})</div>
-                  <div style={selBarS}>
-                    <input type="checkbox" checked={checkedExtFam.size===extFams.length && extFams.length>0} onChange={()=>checkedExtFam.size===extFams.length ? selectNone(setCheckedExtFam) : selectAll(setCheckedExtFam, extFams.map(f=>f.id))} />
-                    <span style={{ fontSize:12, color:DM }}>{checkedExtFam.size}/{extFams.length}</span>
-                    <button style={selBtnS} onClick={()=>selectAll(setCheckedExtFam, extFams.map(f=>f.id))}>Select All</button>
-                    <button style={selBtnS} onClick={()=>selectNone(setCheckedExtFam)}>None</button>
+                {extFams.length>0 && <>
+                  <div style={hdr}>Families ({extFams.length})</div>
+                  <div style={selBar}>
+                    <button style={lnkBtn} onClick={()=>{ const d={}; extFams.forEach(f=>{d[f.id]='import'}); setExtFamDir(d); }}>⬇ All Import</button>
+                    <button style={lnkBtn} onClick={()=>setExtFamDir({})}>Clear All</button>
                   </div>
-                  {extFams.map(f => (<div key={f.id} style={{ ...rowS, display:'flex', alignItems:'center', gap:8 }}>
-                    <input type="checkbox" checked={checkedExtFam.has(f.id)} onChange={()=>toggle(checkedExtFam, setCheckedExtFam, f.id)} />
+                  {extFams.map(f => (<div key={f.id} style={{ ...rowSt, display:'flex', alignItems:'center', gap:8 }}>
+                    <DirBtn dir={extFamDir[f.id]||null} onSet={(d)=>setExtFamDir(prev=>({...prev,[f.id]:d}))} allowExport={false} />
                     <span style={{ color:TX, fontSize:12, flex:1 }}>{f.id} — H:{f.ext.husb||'?'} W:{f.ext.wife||'?'} {(f.ext.children||[]).length}ch</span>
-                    {merged.has('ef_'+f.id) && <span style={{ fontSize:11, color:'#6b9e72' }}>✓</span>}
                   </div>))}
                 </>}
               </div>);
             })()}
 
-            {/* FTLS ONLY */}
+            {/* ──── FTLS ONLY ──── */}
             {tab==='ftls_only' && (()=>{
               const persons = diffResult.ftlsOnly;
               return (<div style={{ padding:'12px 0' }}>
-                <div style={{ fontSize:12, color:DM, marginBottom:8 }}>People in FTLS not in external GEDCOM. Select and export as GEDCOM for the external tool.</div>
-                <div style={selBarS}>
-                  <input type="checkbox" checked={checkedFtls.size===persons.length && persons.length>0} onChange={()=>checkedFtls.size===persons.length ? selectNone(setCheckedFtls) : selectAll(setCheckedFtls, persons.map(p=>p.id))} />
-                  <span style={{ fontSize:12, color:DM }}>{checkedFtls.size}/{persons.length}</span>
-                  <button style={selBtnS} onClick={()=>selectAll(setCheckedFtls, persons.map(p=>p.id))}>Select All</button>
-                  <button style={selBtnS} onClick={()=>selectNone(setCheckedFtls)}>None</button>
+                <div style={{ fontSize:12, color:DM, marginBottom:8 }}>Mark for export to include in GEDCOM for Rolson/Abey.</div>
+                <div style={selBar}>
+                  <button style={lnkBtn} onClick={()=>{ const d={}; persons.forEach(p=>{d[p.id]='export'}); setFtlsDir(d); }}>⬆ All Export</button>
+                  <button style={lnkBtn} onClick={()=>setFtlsDir({})}>Clear All</button>
+                  <span style={{ fontSize:11, color:DM }}>{Object.values(ftlsDir).filter(v=>v==='export').length} marked</span>
                 </div>
-                {persons.map(p => (<div key={p.id} style={{ ...rowS, display:'flex', alignItems:'center', gap:8 }}>
-                  <input type="checkbox" checked={checkedFtls.has(p.id)} onChange={()=>toggle(checkedFtls, setCheckedFtls, p.id)} />
-                  <span style={{ width:8, height:8, borderRadius:'50%', background: p.g==='M'?MC:FC, flexShrink:0 }} />
+                {persons.map(p => (<div key={p.id} style={{ ...rowSt, display:'flex', alignItems:'center', gap:8 }}>
+                  <DirBtn dir={ftlsDir[p.id]||null} onSet={(d)=>setFtlsDir(prev=>({...prev,[p.id]:d}))} allowImport={false} />
+                  <span style={{ width:8, height:8, borderRadius:'50%', background:p.g==='M'?MC:FC, flexShrink:0 }} />
                   <span style={{ color:TX, flex:1 }}>{p.dn||'(Unknown)'}</span>
                   {p.dob && <span style={{ color:DM, fontSize:11 }}>b.{p.dob}</span>}
                   <span style={{ color:'#5a5548', fontSize:10 }}>{p.id}</span>
@@ -3467,21 +3656,74 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
               </div>);
             })()}
 
-            {/* FUZZY */}
+            {/* ──── FUZZY ──── */}
             {tab==='fuzzy' && (<div style={{ padding:'12px 0' }}>
-              <div style={{ fontSize:12, color:DM, marginBottom:12 }}>People matched by name/DOB with different IDs — likely the same person added independently.</div>
+              <div style={{ fontSize:12, color:DM, marginBottom:12 }}>Matched by name/DOB with different IDs — likely same person added on both sides.</div>
               {diffResult.fuzzyMatched.map(m => (<div key={m.extId} style={{ marginBottom:8, border:'1px solid rgba(208,160,126,0.3)', borderRadius:8, padding:12 }}>
                 <div style={{ fontSize:13, color:TX, marginBottom:4 }}>{m.ext.dn||'?'} <span style={{ fontSize:10, color:DM }}>score:{m.score}</span></div>
                 <div style={{ fontSize:11, color:DM }}>Ext: <span style={{ color:'#7eb8d0' }}>{m.extId}</span> → FTLS: <span style={{ color:GC }}>{m.ftlsId}</span></div>
-                {m.diffs.length > 0 && <div style={{ fontSize:11, color:'#d0a07e', marginTop:4 }}>{m.diffs.length} diff{m.diffs.length>1?'s':''}: {m.diffs.map(d=>d.label).join(', ')}</div>}
+                {m.diffs.length>0 && <div style={{ fontSize:11, color:'#d0a07e', marginTop:4 }}>{m.diffs.map(d=>d.label).join(', ')}</div>}
               </div>))}
             </div>)}
 
-            {/* LOG */}
+            {/* ──── BASKET ──── */}
+            {tab==='basket' && (<div style={{ padding:'12px 0' }}>
+              {basket.imports.length===0 && basket.exports.length===0 && basket.importFams.length===0 ? (
+                <div style={{ textAlign:'center', padding:'40px 20px', color:DM }}>
+                  <div style={{ fontSize:36, marginBottom:12 }}>🧺</div>
+                  <div style={{ fontSize:14 }}>Basket is empty</div>
+                  <div style={{ fontSize:12, marginTop:8 }}>Go to Changed, External Only, or FTLS Only tabs and mark items for Import or Export.</div>
+                </div>
+              ) : (<>
+                {/* IMPORT SECTION */}
+                {(basket.imports.length>0 || basket.importFams.length>0) && (<>
+                  <div style={hdr}>⬇ Import into FTLS ({basket.imports.length + basket.importFams.length} items)</div>
+                  {basket.imports.map((item, i) => (<div key={i} style={{ ...rowSt, display:'flex', alignItems:'center', gap:8 }}>
+                    <span style={{ width:8, height:8, borderRadius:'50%', background:item.person.g==='M'?MC:FC, flexShrink:0 }} />
+                    <span style={{ color:TX, flex:1 }}>
+                      {item.person.dn||'?'}
+                      {item.type==='changed_fields' && <span style={{ color:DM, fontSize:11, marginLeft:6 }}>({item.fields.map(f=>f.label).join(', ')})</span>}
+                      {item.type==='ext_person' && <span style={badge('rgba(126,184,208,0.5)')}>new</span>}
+                    </span>
+                  </div>))}
+                  {basket.importFams.map((fam, i) => (<div key={'f'+i} style={{ ...rowSt, fontSize:12, color:TX }}>
+                    Family {fam.id} — H:{fam.husb||'?'} W:{fam.wife||'?'} {(fam.children||[]).length}ch <span style={badge('rgba(126,184,208,0.5)')}>new</span>
+                  </div>))}
+                  <div style={{ marginTop:12 }}>
+                    <button onClick={batchImport} disabled={merging} style={{ background:'rgba(107,158,114,0.15)', border:'1px solid '+MC, color:MC, padding:'8px 20px', borderRadius:6, cursor:'pointer', fontSize:13 }}>
+                      {merging ? 'Merging...' : '⬇ Merge All to Database'}
+                    </button>
+                  </div>
+                </>)}
+
+                {/* EXPORT SECTION */}
+                {basket.exports.length>0 && (<>
+                  <div style={{...hdr, marginTop: (basket.imports.length>0||basket.importFams.length>0)?24:0}}>⬆ Export from FTLS ({basket.exports.length} items)</div>
+                  {basket.exports.map((item, i) => (<div key={i} style={{ ...rowSt, display:'flex', alignItems:'center', gap:8 }}>
+                    <span style={{ width:8, height:8, borderRadius:'50%', background:item.person.g==='M'?MC:FC, flexShrink:0 }} />
+                    <span style={{ color:TX, flex:1 }}>
+                      {item.person.dn||'?'}
+                      {item.type==='changed_fields' && <span style={{ color:DM, fontSize:11, marginLeft:6 }}>({item.fields.map(f=>f.label).join(', ')})</span>}
+                      {item.type==='ftls_person' && <span style={badge('rgba(155,130,196,0.5)')}>new</span>}
+                    </span>
+                  </div>))}
+                  <div style={{ marginTop:12, display:'flex', gap:10, flexWrap:'wrap' }}>
+                    <button onClick={batchExportGedcom} style={{ background:'rgba(196,163,90,0.1)', border:'1px solid '+GD, color:GC, padding:'8px 20px', borderRadius:6, cursor:'pointer', fontSize:13 }}>
+                      ⬆ Export as New GEDCOM
+                    </button>
+                    {extGedcomText && <button onClick={batchMergeIntoGedcom} style={{ background:'rgba(155,130,196,0.1)', border:'1px solid '+FC, color:FC, padding:'8px 20px', borderRadius:6, cursor:'pointer', fontSize:13 }}>
+                      ⬆ Merge into {fileName}
+                    </button>}
+                  </div>
+                </>)}
+              </>)}
+            </div>)}
+
+            {/* ──── LOG ──── */}
             {tab==='log' && (<div style={{ padding:'12px 0' }}>
               <div style={{ fontSize:12, color:DM, marginBottom:8 }}>Operations this session.</div>
-              {mergeLog.map((e,i) => <div key={i} style={{ padding:'3px 0', fontSize:12, color: e.startsWith('✓')?'#6b9e72':e.startsWith('⬆')?GC:'#c45050' }}>{e}</div>)}
-              {mergeLog.some(l=>l.startsWith('✓')) && <button onClick={onMergeComplete} style={{ marginTop:16, background:'rgba(196,163,90,0.12)', border:'1px solid '+GD, color:GC, padding:'8px 20px', borderRadius:6, cursor:'pointer', fontSize:13 }}>↻ Reload Tree to See Changes</button>}
+              {mergeLog.map((e,i)=><div key={i} style={{ padding:'3px 0', fontSize:12, color:e.startsWith('✓')?'#6b9e72':e.startsWith('⬆')?GC:'#c45050' }}>{e}</div>)}
+              {mergeLog.some(l=>l.startsWith('✓')) && <button onClick={onMergeComplete} style={{ marginTop:16, background:'rgba(196,163,90,0.12)', border:'1px solid '+GD, color:GC, padding:'8px 20px', borderRadius:6, cursor:'pointer', fontSize:13 }}>↻ Reload Tree</button>}
             </div>)}
           </>)}
         </div>
