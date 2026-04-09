@@ -1294,10 +1294,21 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
   const before = lines.slice(0, trlrIdx);
   const newLines = [];
   const extIds = extFamilyIds || new Set();
-  const exportPIds = new Set(exportPersons.map(p => p.id));
 
-  // Add new INDI records
-  for (const p of exportPersons) {
+  // Build set of person IDs that already exist in the original
+  const existingPIds = new Set();
+  for (const line of before) {
+    const m = line.match(/^0 (@[^@]+@) INDI/);
+    if (m) existingPIds.add(m[1]);
+  }
+
+  // Split export persons into new vs existing
+  const newPersons = exportPersons.filter(p => !existingPIds.has(p.id));
+  const existingPersons = exportPersons.filter(p => existingPIds.has(p.id));
+  const newPIds = new Set(newPersons.map(p => p.id));
+
+  // Add ONLY truly new INDI records
+  for (const p of newPersons) {
     const L = [`0 ${p.id} INDI`];
     const givn = ((p.fn||'') + (p.mn ? ' '+p.mn : '')).trim();
     const nm = p.ln ? `${givn} /${p.ln}/` : (givn || p.dn || '(Unknown)');
@@ -1323,7 +1334,7 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
     const hid = fam.husband_id || fam.husb || '';
     const wid = fam.wife_id || fam.wife || '';
     const kids = fam.children || [];
-    if (exportPIds.has(hid) || exportPIds.has(wid) || kids.some(k => exportPIds.has(k))) {
+    if (newPIds.has(hid) || newPIds.has(wid) || kids.some(k => newPIds.has(k))) {
       const F = [`0 ${fid} FAM`];
       if (hid) F.push(`1 HUSB ${hid}`);
       if (wid) F.push(`1 WIFE ${wid}`);
@@ -1335,8 +1346,8 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
     }
   }
 
-  // Patch existing FAMs: add CHIL lines for new children
-  for (const p of exportPersons) {
+  // Patch existing FAMs: add CHIL lines for new children only
+  for (const p of newPersons) {
     for (const [fid, fam] of Object.entries(ftlsFamilyMap)) {
       if (!extIds.has(fid)) continue;
       if (!(fam.children||[]).includes(p.id)) continue;
@@ -1353,9 +1364,23 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
     }
   }
 
-  // Apply field-level updates to existing INDI records
+  // Apply field-level updates to existing INDI records in the original
+  // Combine explicit exportFields + field data from existing persons in the basket
+  const allFieldUpdates = [...(exportFields || [])];
+  // For existing persons in the export basket, build field updates from their data
   const tagMap = { fn:'1>GIVN', ln:'1>SURN', dob:'BIRT>DATE', dod:'DEAT>DATE', loc:'BIRT>PLAC', ph:'PHON', em:'EMAI', prof:'OCCU', notes:'NOTE' };
-  for (const { personId, fields } of (exportFields || [])) {
+  for (const p of existingPersons) {
+    // Check if this person already has explicit field exports
+    if (allFieldUpdates.some(f => f.personId === p.id)) continue;
+    // Build field list from non-empty values
+    const fields = [];
+    for (const [key, tag] of Object.entries(tagMap)) {
+      if (p[key]) fields.push({ key, value: p[key] });
+    }
+    if (fields.length > 0) allFieldUpdates.push({ personId: p.id, fields });
+  }
+
+  for (const { personId, fields } of allFieldUpdates) {
     for (let i = 0; i < before.length; i++) {
       if (!before[i].trim().startsWith(`0 ${personId} INDI`)) continue;
       let j = i + 1;
@@ -1364,7 +1389,6 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
         const tag = tagMap[key]; if (!tag || !value) continue;
         if (tag.includes('>')) {
           const [par, chi] = tag.split('>');
-          const parLvl = par === '1' ? 1 : 1;
           const parTag = par === '1' ? 'NAME' : par;
           let found = false;
           for (let k = i+1; k < j; k++) {
