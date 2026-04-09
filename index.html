@@ -2427,8 +2427,8 @@ function ViewerIdentityModal({submitData, flat, onDone, onCancel}) {
   );
 }
 
-function AdminPanel({onClose, onReloadTree}) {
-  const [tab, setTab] = useState('updates'); // 'updates' | 'accounts' | 'users' | 'log'
+function AdminPanel({onClose, onReloadTree, onShowMigrate, onShowDiff}) {
+  const [tab, setTab] = useState('updates'); // 'updates' | 'accounts' | 'users' | 'log' | 'tools'
   const [updateReqs, setUpdateReqs] = useState([]);
   const [accessReqs, setAccessReqs] = useState([]);
   const [allUsers, setAllUsers] = useState([]);
@@ -2651,6 +2651,7 @@ function AdminPanel({onClose, onReloadTree}) {
         {tabBtn('accounts','Account Requests',pendingAccess)}
         {isSuperAdmin()&&tabBtn('users','Manage Users',0)}
         {tabBtn('log','Edit Log',0)}
+        {tabBtn('tools','🛠 Tools',0)}
         {actionMsg&&<span style={{fontSize:12,color:actionMsg.startsWith('Error')?'#c05050':'#6b9e72',marginLeft:16}}>{actionMsg}</span>}
       </div>
 
@@ -2866,11 +2867,26 @@ function AdminPanel({onClose, onReloadTree}) {
           </div>);
         })}
       </div>}
+
+      {!loading&&tab==='tools'&&<div>
+        <div style={{fontSize:13,color:'#7a7568',marginBottom:16}}>Database and GEDCOM management tools. Use with caution — these modify live data.</div>
+        <div style={{display:'flex',gap:12,flexWrap:'wrap'}}>
+          <div style={{flex:'1 1 300px',background:'rgba(196,163,90,0.04)',border:'1px solid rgba(196,163,90,0.15)',borderRadius:8,padding:16}}>
+            <div style={{fontSize:14,color:'#c4a35a',fontWeight:500,marginBottom:8}}>🗄 Migrate GEDCOM → DB</div>
+            <div style={{fontSize:12,color:'#7a7568',lineHeight:1.6,marginBottom:12}}>Replace all database data with a GEDCOM file. This clears existing persons, families, and edit logs. Use for initial setup or full reset only.</div>
+            <button onClick={onShowMigrate} style={{background:'rgba(196,163,90,0.08)',border:'1px solid rgba(196,163,90,0.3)',color:'#c4a35a',padding:'8px 18px',borderRadius:6,cursor:'pointer',fontSize:13}}>🗄 Open Migrate Tool</button>
+            <div style={{fontSize:10,color:'#a05050',marginTop:8}}>⚠ Destructive — replaces all data</div>
+          </div>
+          <div style={{flex:'1 1 300px',background:'rgba(107,158,114,0.04)',border:'1px solid rgba(107,158,114,0.15)',borderRadius:8,padding:16}}>
+            <div style={{fontSize:14,color:'#6b9e72',fontWeight:500,marginBottom:8}}>🔀 Diff &amp; Merge</div>
+            <div style={{fontSize:12,color:'#7a7568',lineHeight:1.6,marginBottom:12}}>Compare an external GEDCOM against FTLS. Selectively import new data or export FTLS additions. Safe — uses basket workflow with confirmation.</div>
+            <button onClick={onShowDiff} style={{background:'rgba(107,158,114,0.08)',border:'1px solid rgba(107,158,114,0.3)',color:'#6b9e72',padding:'8px 18px',borderRadius:6,cursor:'pointer',fontSize:13}}>🔀 Open Diff &amp; Merge</button>
+          </div>
+        </div>
+      </div>}
     </div>
   );
 }
-
-/* ───── FIELD DEFS ───── */
 const SECTIONS=[
   {title:'Basic Identity',fields:[
     {k:'fn',l:'First Name'},{k:'mn',l:'Middle Name'},{k:'ln',l:'Last Name'},
@@ -4453,8 +4469,6 @@ function App(){
               <button key={l} onClick={f} style={btnS}>{l}</button>)}
             <button onClick={()=>{downloadGedcom(tree,personMap,familyMap);setMsg('GEDCOM exported!')}} title="Download the family tree as a GEDCOM file" style={{...btnS,background:'rgba(196,163,90,0.1)',borderColor:GD,color:GC}}>⬇ Export GEDCOM</button>
             <button onClick={()=>triggerImportGedcom((result,fileName)=>{setTree(result.tree||result);setPersonMap(result.personMap||{});setFamilyMap(result.familyMap||{});setMsg('Imported: '+fileName);expandTo(2)})} title="Import a GEDCOM file to view (does not save to database)" style={{...btnS,background:'rgba(107,158,114,0.1)',borderColor:MC,color:MC}}>⬆ Import GEDCOM</button>
-            {user&&isAdmin()&&<button onClick={()=>setShowMigrate(true)} title="Replace all database data with a GEDCOM file" style={{...btnS,background:'rgba(196,163,90,0.06)',borderColor:'rgba(196,163,90,0.3)',color:GD}}>🗄 Migrate GEDCOM→DB</button>}
-            {user&&isAdmin()&&<button onClick={()=>setShowDiff(true)} title="Compare an external GEDCOM with FTLS and merge differences" style={{...btnS,background:'rgba(107,158,114,0.08)',borderColor:'rgba(107,158,114,0.4)',color:MC}}>🔀 Diff &amp; Merge</button>}
           </div>
         </div>
       </div>
@@ -4467,7 +4481,7 @@ function App(){
       {spouseEditing&&<EditForm node={spouseEditing.spouse||empty()} onSave={handleSaveSpouse} onCancel={()=>setSpouseEditing(null)} isNew={false}/>}
       {adding&&<EditForm node={empty()} onSave={handleAdd} onCancel={()=>setAdding(null)} isNew={true} parentId={adding} parentName={flat.find(n=>n.id===adding)?._n}/>}
       </>}
-      {activeTab==='admin'&&user&&isAdmin()&&<AdminPanel onReloadTree={()=>reloadTree(true)}/>}
+      {activeTab==='admin'&&user&&isAdmin()&&<AdminPanel onReloadTree={()=>reloadTree(true)} onShowMigrate={()=>setShowMigrate(true)} onShowDiff={()=>setShowDiff(true)}/>}
       
       {/* ───── PHOTOS GALLERY TAB ───── */}
       {activeTab==='photos'&&user&&<PhotoGallery flat={flat} user={user}/>}
