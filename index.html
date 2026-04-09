@@ -1095,16 +1095,46 @@ function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap)
   return results;
 }
 
-// Merge a single external person into Supabase
+// Merge a single external person into Supabase — ONLY if they don't already exist
 async function mergePersonToDb(ext, editUser) {
+  // Safety check: does this person already exist?
+  try {
+    const existing = await sbFetch(`persons?id=eq.${ext.id}&select=id`);
+    if (existing.length > 0) {
+      console.warn('mergePersonToDb: person already exists, skipping:', ext.id, ext.dn);
+      return { skipped: true, reason: 'already exists' };
+    }
+  } catch(e) {}
+  
   const person = { ...ext };
-  // Ensure display name
   if (!person.dn) person.dn = ((person.fn||'') + ' ' + (person.ln||'')).trim() || '(Unknown)';
   await savePerson(person, editUser || 'GEDCOM merge');
+  return { skipped: false };
 }
 
-// Merge a single external family into Supabase  
+// Merge a single external family into Supabase — ONLY if it doesn't already exist
+// If it exists, only ADD new children (don't overwrite)
 async function mergeFamilyToDb(extFam) {
+  try {
+    const existing = await sbFetch(`families?id=eq.${extFam.id}&select=*`);
+    if (existing.length > 0) {
+      // Family exists — only add new children, don't overwrite
+      const existingKids = new Set(existing[0].children || []);
+      const newKids = (extFam.children || []).filter(cid => !existingKids.has(cid));
+      if (newKids.length > 0) {
+        const mergedKids = [...(existing[0].children || []), ...newKids];
+        await sbFetch(`families?id=eq.${extFam.id}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ children: mergedKids }),
+          headers: { 'Prefer': 'return=minimal' }
+        });
+        return { skipped: false, action: 'added ' + newKids.length + ' children' };
+      }
+      return { skipped: true, reason: 'family exists, no new children' };
+    }
+  } catch(e) {}
+  
+  // Family doesn't exist — create it
   const row = {
     id: extFam.id,
     husband_id: extFam.husb || null,
@@ -1118,11 +1148,32 @@ async function mergeFamilyToDb(extFam) {
     body: JSON.stringify(row),
     headers: { 'Prefer': 'return=minimal,resolution=merge-duplicates', 'Authorization': 'Bearer ' + SUPABASE_KEY }
   });
+  return { skipped: false, action: 'created' };
 }
 
 // Apply specific field updates from external to an existing FTLS person
+// SAFE: starts from existing FTLS data, only overwrites selected fields
 async function mergeFieldsToDb(ftlsPerson, fieldsToApply, ext, editUser) {
-  const merged = { ...ftlsPerson };
+  // Re-fetch current state from DB to be safe (not stale in-memory data)
+  let current = ftlsPerson;
+  try {
+    const rows = await sbFetch(`persons?id=eq.${ftlsPerson.id}&select=*`);
+    if (rows.length > 0) {
+      const p = rows[0];
+      current = {
+        id:p.id, fn:p.first_name, mn:p.middle_name, ln:p.last_name,
+        dn:p.display_name, nk:p.nickname, md:p.maiden_name, g:p.gender,
+        dob:p.date_of_birth, dod:p.date_of_death, dec:p.is_deceased, bo:p.birth_order,
+        em:p.email, ph:p.phone, a1:p.address1, a2:p.address2,
+        ci:p.city, st:p.state, zp:p.zip, co:p.country,
+        fb:p.facebook, ig:p.instagram, li:p.linkedin, ws:p.website,
+        pp:p.profile_photo, bio:p.bio, loc:p.location, prof:p.profession, emp:p.employer,
+        stories:p.stories, notes:p.notes, pgl:p.photo_gallery_link, dl:p.documents_link,
+      };
+    }
+  } catch(e) { console.warn('Could not re-fetch person, using in-memory data'); }
+
+  const merged = { ...current };
   for (const key of fieldsToApply) {
     merged[key] = ext[key] || '';
   }
@@ -1137,19 +1188,102 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds) {
   const personIds = new Set(persons.map(p => p.id));
   const pMap = {};
   persons.forEach(p => { pMap[p.id] = p; });
-  const fMap = {};
+  
+  // For FAMC/FAMS refs on persons, we need ALL families (including existing ones)
+  // But we only EXPORT new FAM records
+  // So: pass full familyMap to exportTreeToGedcom for ref building,
+  // but mark which families to actually output as records
+  
+  // Build the GEDCOM manually to control what FAM records get written
+  const lines = [];
+  const exportedPersons = new Set();
+
+  // Build reverse lookups from FULL familyMap
+  const famcLookup = {}; // personId → [familyId]
+  const famsLookup = {}; // personId → [familyId]
   for (const [fid, fam] of Object.entries(ftlsFamilyMap)) {
+    const hid = fam.husband_id || fam.husb || '';
+    const wid = fam.wife_id || fam.wife || '';
+    (fam.children || []).forEach(cid => {
+      if (!famcLookup[cid]) famcLookup[cid] = [];
+      famcLookup[cid].push(fid);
+    });
+    if (hid) { if (!famsLookup[hid]) famsLookup[hid] = []; famsLookup[hid].push(fid); }
+    if (wid) { if (!famsLookup[wid]) famsLookup[wid] = []; famsLookup[wid].push(fid); }
+  }
+
+  function gedcomDate() {
+    const d = new Date();
+    const months = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+    return `${d.getDate()} ${months[d.getMonth()]} ${d.getFullYear()}`;
+  }
+  function gedcomTime() {
+    const d = new Date();
+    return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;
+  }
+
+  // Header
+  lines.push('0 HEAD','1 SOUR FTLS','2 NAME Chennamkara Family Tree Living Site','2 VERS 0.3',
+    '1 CHAR UTF-8','1 GEDC','2 VERS 5.5.1','2 FORM LINEAGE-LINKED','1 SUBM @SUBM1@',
+    '0 @SUBM1@ SUBM','1 NAME FTLS Export');
+
+  // INDI records — for each person, include FAMC/FAMS from ALL families
+  for (const [pid, person] of Object.entries(pMap)) {
+    if (exportedPersons.has(pid)) continue;
+    exportedPersons.add(pid);
+    const L = [`0 ${pid} INDI`];
+    const fn = person.fn || '', mn = person.mn || '', ln = person.ln || '';
+    const givn = (fn + (mn ? ' ' + mn : '')).trim();
+    const nameStr = ln ? `${givn} /${ln}/` : (givn || person.dn || '(Unknown)');
+    L.push(`1 NAME ${nameStr}`);
+    if (fn) L.push(`2 GIVN ${fn}`);
+    if (ln) L.push(`2 SURN ${ln}`);
+    if (person.nk) { L.push(`1 NAME ${person.nk} //`); L.push(`2 TYPE nick`); L.push(`2 GIVN ${person.nk}`); }
+    if (person.md) { L.push(`1 NAME ${person.md} //`); L.push(`2 TYPE birth`); }
+    if (person.g) L.push(`1 SEX ${person.g}`);
+    if (person.dob || person.loc) { L.push('1 BIRT'); if (person.dob) L.push(`2 DATE ${person.dob}`); if (person.loc) L.push(`2 PLAC ${person.loc}`); }
+    if (person.dod || person.dec) { L.push('1 DEAT'); if (person.dod) L.push(`2 DATE ${person.dod}`); }
+    if (person.ph) L.push(`1 PHON ${person.ph}`);
+    if (person.em) L.push(`1 EMAI ${person.em}`);
+    if (person.a1 || person.ci || person.st || person.co) {
+      L.push(`1 ADDR ${person.a1 || ''}`);
+      if (person.a2) L.push(`2 ADR2 ${person.a2}`);
+      if (person.ci) L.push(`2 CITY ${person.ci}`);
+      if (person.st) L.push(`2 STAE ${person.st}`);
+      if (person.zp) L.push(`2 POST ${person.zp}`);
+      if (person.co) L.push(`2 CTRY ${person.co}`);
+    }
+    if (person.prof) L.push(`1 OCCU ${person.prof}`);
+    if (person.ws) L.push(`1 WWW ${person.ws}`);
+    if (person.notes) L.push(`1 NOTE ${person.notes}`);
+    if (person.bio) L.push(`1 NOTE BIO: ${person.bio}`);
+    // FAMS/FAMC from FULL family map
+    (famsLookup[pid] || []).forEach(ref => L.push(`1 FAMS ${ref}`));
+    (famcLookup[pid] || []).forEach(ref => L.push(`1 FAMC ${ref}`));
+    L.push('1 CHAN'); L.push(`2 DATE ${gedcomDate()}`); L.push(`3 TIME ${gedcomTime()}`);
+    lines.push(...L);
+  }
+
+  // FAM records — ONLY new families (not in external)
+  for (const [fid, fam] of Object.entries(ftlsFamilyMap)) {
+    if (extIds.has(fid)) continue; // skip existing families
     const hid = fam.husband_id || fam.husb || '';
     const wid = fam.wife_id || fam.wife || '';
     const kids = fam.children || [];
     const involvesOur = personIds.has(hid) || personIds.has(wid) || kids.some(k => personIds.has(k));
-    if (involvesOur && !extIds.has(fid)) {
-      fMap[fid] = { id: fid, husband_id: hid, wife_id: wid, children: kids,
-        marriage_date: fam.marriage_date || fam.mdate || '',
-        marriage_place: fam.marriage_place || fam.mplace || '' };
-    }
+    if (!involvesOur) continue;
+    const F = [`0 ${fid} FAM`];
+    if (hid) F.push(`1 HUSB ${hid}`);
+    if (wid) F.push(`1 WIFE ${wid}`);
+    const md = fam.marriage_date || fam.mdate || '';
+    const mp = fam.marriage_place || fam.mplace || '';
+    if (md || mp) { F.push('1 MARR'); if (md) F.push(`2 DATE ${md}`); if (mp) F.push(`2 PLAC ${mp}`); }
+    kids.forEach(c => F.push(`1 CHIL ${c}`));
+    lines.push(...F);
   }
-  return exportTreeToGedcom(null, pMap, fMap);
+
+  lines.push('0 TRLR');
+  return lines.join('\n') + '\n';
 }
 
 // Merge FTLS additions into the original external GEDCOM text
@@ -3422,8 +3556,11 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
     setMerging(true); const log = [];
     for (const item of basket.imports) {
       if (item.type === 'ext_person') {
-        try { await mergePersonToDb(item.person, user?.email||'GEDCOM merge'); log.push('✓ Added ' + (item.person.dn||'?')); }
-        catch(e) { log.push('✗ ' + (item.person.dn||'?') + ': ' + e.message); }
+        try {
+          const result = await mergePersonToDb(item.person, user?.email||'GEDCOM merge');
+          if (result?.skipped) log.push('⊘ Skipped ' + (item.person.dn||'?') + ' (' + result.reason + ')');
+          else log.push('✓ Added ' + (item.person.dn||'?'));
+        } catch(e) { log.push('✗ ' + (item.person.dn||'?') + ': ' + e.message); }
       } else if (item.type === 'changed_fields') {
         const keys = item.fields.map(f => f.key);
         try { await mergeFieldsToDb(item.person, keys, item.ext, user?.email||'GEDCOM merge'); log.push('✓ Updated ' + keys.length + ' fields on ' + item.person.dn); }
@@ -3431,8 +3568,11 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
       }
     }
     for (const fam of basket.importFams) {
-      try { await mergeFamilyToDb(fam); log.push('✓ Added family ' + fam.id); }
-      catch(e) { log.push('✗ Family ' + fam.id + ': ' + e.message); }
+      try {
+        const result = await mergeFamilyToDb(fam);
+        if (result?.skipped) log.push('⊘ Skipped family ' + fam.id + ' (' + result.reason + ')');
+        else log.push('✓ Family ' + fam.id + ' — ' + (result?.action || 'created'));
+      } catch(e) { log.push('✗ Family ' + fam.id + ': ' + e.message); }
     }
     if (log.length === 0) log.push('Nothing to import.');
     setMergeLog(prev => [...prev, ...log]);
@@ -3689,10 +3829,16 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
                   {basket.importFams.map((fam, i) => (<div key={'f'+i} style={{ ...rowSt, fontSize:12, color:TX }}>
                     Family {fam.id} — H:{fam.husb||'?'} W:{fam.wife||'?'} {(fam.children||[]).length}ch <span style={badge('rgba(126,184,208,0.5)')}>new</span>
                   </div>))}
-                  <div style={{ marginTop:12 }}>
-                    <button onClick={batchImport} disabled={merging} style={{ background:'rgba(107,158,114,0.15)', border:'1px solid '+MC, color:MC, padding:'8px 20px', borderRadius:6, cursor:'pointer', fontSize:13 }}>
-                      {merging ? 'Merging...' : '⬇ Merge All to Database'}
+                  <div style={{ marginTop:12, display:'flex', gap:10, alignItems:'center' }}>
+                    <button onClick={()=>{
+                      const count = basket.imports.length + basket.importFams.length;
+                      if (confirm(`This will write ${count} item${count>1?'s':''} to the FTLS database. New persons will be added; existing persons will have selected fields updated.\n\nContinue?`)) {
+                        batchImport();
+                      }
+                    }} disabled={merging} style={{ background:'rgba(107,158,114,0.15)', border:'1px solid '+MC, color:MC, padding:'8px 20px', borderRadius:6, cursor:'pointer', fontSize:13 }}>
+                      {merging ? 'Merging...' : '⬇ Write to FTLS Database'}
                     </button>
+                    <span style={{ fontSize:10, color:DM }}>⚠ This modifies your database</span>
                   </div>
                 </>)}
 
@@ -3709,12 +3855,13 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
                   </div>))}
                   <div style={{ marginTop:12, display:'flex', gap:10, flexWrap:'wrap' }}>
                     <button onClick={batchExportGedcom} style={{ background:'rgba(196,163,90,0.1)', border:'1px solid '+GD, color:GC, padding:'8px 20px', borderRadius:6, cursor:'pointer', fontSize:13 }}>
-                      ⬆ Export as New GEDCOM
+                      📄 Download as New GEDCOM
                     </button>
                     {extGedcomText && <button onClick={batchMergeIntoGedcom} style={{ background:'rgba(155,130,196,0.1)', border:'1px solid '+FC, color:FC, padding:'8px 20px', borderRadius:6, cursor:'pointer', fontSize:13 }}>
-                      ⬆ Merge into {fileName}
+                      📄 Download Merged into {fileName}
                     </button>}
                   </div>
+                  <div style={{ fontSize:10, color:DM, marginTop:6 }}>These buttons download GEDCOM files — they do not modify your database.</div>
                 </>)}
               </>)}
             </div>)}
