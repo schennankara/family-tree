@@ -34,7 +34,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v2.6.0';
+    const APP_VERSION = 'v2.4.0';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
 
@@ -2998,7 +2998,34 @@ const empty=()=>({id:'@I'+Date.now()+'@',fn:'',mn:'',ln:'',dn:'',nk:'',md:'',g:'
 function EditForm({node,onSave,onCancel,isNew,parentId,parentName}){
   const [f,setF]=useState(()=>({...empty(),...node}));
   const [uploading,setUploading]=useState(false);
-  const set=(k,v)=>setF(p=>({...p,[k]:v}));
+  const [dnManuallyEdited,setDnManuallyEdited]=useState(()=>{
+    // If existing display name doesn't match auto-generated, user must have edited it
+    const n = node || {};
+    const auto = buildDisplayName(n.fn||'', n.mn||'', n.ln||'');
+    return n.dn && n.dn !== auto && n.dn !== ((n.fn||'')+(n.mn?' '+n.mn:'')+(n.ln?' '+n.ln:'')).trim();
+  });
+  
+  function buildDisplayName(fn, mn, ln) {
+    const mi = mn ? mn.charAt(0).toUpperCase() + '.' : '';
+    return [fn, mi, ln].filter(Boolean).join(' ').trim() || '(Unknown)';
+  }
+  
+  const set=(k,v)=>{
+    setF(p=>{
+      const next = {...p,[k]:v};
+      // Auto-update display name when fn/mn/ln change, unless manually edited
+      if ((k==='fn'||k==='mn'||k==='ln') && !dnManuallyEdited) {
+        next.dn = buildDisplayName(
+          k==='fn'?v:next.fn||'',
+          k==='mn'?v:next.mn||'',
+          k==='ln'?v:next.ln||''
+        );
+      }
+      // If user manually edits dn, mark it
+      if (k==='dn') setDnManuallyEdited(!!v);
+      return next;
+    });
+  };
   const inp={width:'100%',background:'#1a1a14',border:`1px solid ${BR}`,color:TX,padding:'6px 10px',
     borderRadius:5,fontSize:13,outline:'none',fontFamily:'inherit'};
   
@@ -3074,7 +3101,7 @@ function EditForm({node,onSave,onCancel,isNew,parentId,parentName}){
         ))}
         <div style={{display:'flex',gap:8,justifyContent:'flex-end',marginTop:16}}>
           <button onClick={onCancel} style={{background:'transparent',border:`1px solid ${BR}`,color:DM,padding:'8px 20px',borderRadius:6,cursor:'pointer',fontSize:13}}>Cancel</button>
-          <button onClick={()=>{const dn=f.dn||(f.fn+(f.mn?' '+f.mn:'')+(f.ln?' '+f.ln:'')).trim()||'(Unknown)';onSave({...f,dn})}}
+          <button onClick={()=>{const dn=f.dn||buildDisplayName(f.fn||'',f.mn||'',f.ln||'');onSave({...f,dn})}}
             style={{background:'rgba(196,163,90,0.15)',border:`1px solid ${GD}`,color:GC,padding:'8px 20px',borderRadius:6,cursor:'pointer',fontSize:13}}>
             {isNew?'Add Member':'Save Changes'}
           </button>
@@ -3994,7 +4021,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
 }
 
 /* ───── MOVE BRANCH MODAL ───── */
-function MoveBranchModal({ node, personMap, familyMap, flat, user, onMove, onRequestMove, onClose }) {
+function MoveBranchModal({ node, personMap, familyMap, flat, tree, user, onMove, onRequestMove, onClose }) {
   const [targetSearch, setTargetSearch] = useState('');
   const [selectedTarget, setSelectedTarget] = useState(null);
   const [selectedFamily, setSelectedFamily] = useState(null);
@@ -4106,15 +4133,21 @@ function MoveBranchModal({ node, personMap, familyMap, flat, user, onMove, onReq
               style={{ width:'100%', background:'#0a0a08', border:'1px solid '+BR, color:TX, padding:'8px 12px', borderRadius:6, fontSize:13, outline:'none', boxSizing:'border-box' }} />
             {searchResults.length > 0 && !selectedTarget && (
               <div style={{ position:'absolute', top:'100%', left:0, right:0, background:'#141410', border:'1px solid '+GD, borderTop:'none', borderRadius:'0 0 6px 6px', maxHeight:200, overflowY:'auto', zIndex:10 }}>
-                {searchResults.map(p => (
+                {searchResults.map(p => {
+                  const path = tree ? findPath(tree, p.id) : null;
+                  const lineage = path ? path.map(n=>n.dn||'?').join(' › ') : '';
+                  return (
                   <div key={p.id} onClick={() => { setSelectedTarget(p); setTargetSearch(p.dn || p._n || ''); }}
-                    style={{ padding:'6px 12px', cursor:'pointer', fontSize:13, display:'flex', alignItems:'center', gap:6 }}
+                    style={{ padding:'8px 12px', cursor:'pointer', fontSize:13 }}
                     onMouseEnter={e=>e.currentTarget.style.background='rgba(255,255,255,0.04)'}
                     onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
-                    <span style={{ width:6, height:6, borderRadius:'50%', background: p.g==='M'?MC:FC }} />
-                    <span style={{ color:TX }}>{p.dn || p._n}</span>
-                  </div>
-                ))}
+                    <div style={{ display:'flex', alignItems:'center', gap:6 }}>
+                      <span style={{ width:6, height:6, borderRadius:'50%', background: p.g==='M'?MC:FC }} />
+                      <span style={{ color:TX }}>{p.dn || p._n}</span>
+                    </div>
+                    {lineage && <div style={{ fontSize:10, color:DM, marginLeft:12, marginTop:2 }}>{lineage}</div>}
+                  </div>);
+                })}
               </div>
             )}
           </div>
@@ -4770,13 +4803,19 @@ function App(){
                 style={{width:'100%',background:CD,border:`1px solid ${BR}`,color:TX,padding:'7px 12px',borderRadius:6,fontSize:13,outline:'none'}}/>
               {matches.length>0&&<div style={{position:'absolute',top:'100%',left:0,right:0,background:CD,border:`1px solid rgba(196,163,90,0.25)`,
                 borderTop:'none',borderRadius:'0 0 6px 6px',maxHeight:280,overflowY:'auto',zIndex:60}}>
-                {matches.map((m,mi)=><div key={m.id+'_'+mi} onClick={()=>navigateTo(m)}
-                  style={{padding:'6px 12px',cursor:'pointer',fontSize:13,display:'flex',alignItems:'center',gap:6}}
+                {matches.map((m,mi)=>{
+                  const path = findPath(tree, m.id);
+                  const lineage = path && path.length > 1 ? path.map(n=>n.dn||'?').join(' › ') : '';
+                  return <div key={m.id+'_'+mi} onClick={()=>navigateTo(m)}
+                  style={{padding:'8px 12px',cursor:'pointer',fontSize:13}}
                   onMouseEnter={e=>e.currentTarget.style.background='rgba(255,255,255,0.04)'}
                   onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
-                  <span style={{width:6,height:6,borderRadius:'50%',background:m.g==='M'?MC:FC}}/><span>{m._n}</span>
-                  {m._matchType==='spouse'&&<span style={{fontSize:10,color:DM,fontStyle:'italic'}}>⚭ spouse of {m._spouseOf}</span>}
-                </div>)}
+                  <div style={{display:'flex',alignItems:'center',gap:6}}>
+                    <span style={{width:6,height:6,borderRadius:'50%',background:m.g==='M'?MC:FC}}/><span>{m._n}</span>
+                    {m._matchType==='spouse'&&<span style={{fontSize:10,color:DM,fontStyle:'italic'}}>⚭ spouse of {m._spouseOf}</span>}
+                  </div>
+                  {lineage && <div style={{fontSize:10,color:DM,marginLeft:12,marginTop:2}}>{lineage}</div>}
+                </div>})}
               </div>}
             </div>
             {[['Expand All',expandAll],['Collapse',collapseAll],['2 Lvls',()=>expandTo(2)],['3 Lvls',()=>expandTo(3)]].map(([l,f])=>
@@ -4804,7 +4843,7 @@ function App(){
       {showViewerIdentity&&viewerSubmitData&&<ViewerIdentityModal submitData={viewerSubmitData} flat={flat} onDone={()=>{setShowViewerIdentity(false);setViewerSubmitData(null);setMsg('Update request submitted!')}} onCancel={()=>{setShowViewerIdentity(false);setViewerSubmitData(null)}}/>}
       {showMigrate&&<MigrateDialog onDone={()=>setShowMigrate(false)} onCancel={()=>setShowMigrate(false)}/>}
       {showDiff&&<GedcomDiffModal onClose={()=>setShowDiff(false)} personMap={personMap} familyMap={familyMap} user={user} onMergeComplete={()=>{setShowDiff(false);setMsg('Merging complete — refreshing...');reloadTree(false)}}/>}
-      {movingBranch&&<MoveBranchModal node={movingBranch} personMap={personMap} familyMap={familyMap} flat={flat} user={user} onMove={handleMove} onRequestMove={handleRequestMove} onClose={()=>setMovingBranch(null)}/>}
+      {movingBranch&&<MoveBranchModal node={movingBranch} personMap={personMap} familyMap={familyMap} flat={flat} tree={tree} user={user} onMove={handleMove} onRequestMove={handleRequestMove} onClose={()=>setMovingBranch(null)}/>}
       {user&&user.role!=='viewer'&&<div style={{position:'fixed',bottom:16,right:16,background:CD,border:'1px solid '+BR,borderRadius:8,padding:'8px 14px',fontSize:11,color:DM,zIndex:80,display:'flex',alignItems:'center',gap:8}}>
         <span style={{width:6,height:6,borderRadius:'50%',background:MC}}/>
         <span>Signed in as <strong style={{color:TX}}>{user.name||user.email}</strong></span>
