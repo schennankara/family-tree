@@ -112,9 +112,13 @@ async function loadMedia(personId) {
 async function sbFetch(path, opts = {}) {
   const url = SUPABASE_URL + '/rest/v1/' + path;
   const headers = { ...SB_HEADERS, ...(opts.headers || {}) };
-  if (authSession?.access_token && !(opts.headers && opts.headers.Authorization)) {
-    headers.Authorization = 'Bearer ' + authSession.access_token;
-  }
+  if (
+  authSession?.access_token &&
+  !SUPABASE_KEY.startsWith('sb_publishable_') &&
+  !(opts.headers && opts.headers.Authorization)
+) {
+  headers.Authorization = 'Bearer ' + authSession.access_token;
+}
   const resp = await fetch(url, { ...opts, headers });
   const text = await resp.text();
   if (!resp.ok) {
