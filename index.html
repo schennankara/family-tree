@@ -34,7 +34,8 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v2.4.0';
+    const APP_VERSION = 'v2.5.0';
+    const BUILD_DATE = '2026-04-12';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
 
@@ -4929,6 +4930,7 @@ function App(){
           <div style={{display:'flex',alignItems:'baseline',gap:12,marginBottom:4}}>
             <span style={{fontSize:28,color:GC,fontWeight:300,letterSpacing:1,cursor:'pointer'}} onClick={()=>setActiveTab('tree')}>Chennamkara</span>
             <span style={{fontSize:11,color:DM,letterSpacing:3,textTransform:'uppercase'}}>Family Tree</span>
+            <span style={{fontSize:9,color:DM,opacity:0.5,letterSpacing:1,marginLeft:4}} title={`Build: ${BUILD_DATE}`}>{APP_VERSION}</span>
             {user&&isAdmin()&&<>
               <span onClick={()=>setActiveTab('tree')} style={{fontSize:12,color:activeTab==='tree'?GC:DM,cursor:'pointer',padding:'2px 8px',borderRadius:4,background:activeTab==='tree'?'rgba(196,163,90,0.1)':'transparent'}}>🌳 Tree</span>
               <span onClick={()=>setActiveTab('photos')} style={{fontSize:12,color:activeTab==='photos'?GC:DM,cursor:'pointer',padding:'2px 8px',borderRadius:4,background:activeTab==='photos'?'rgba(196,163,90,0.1)':'transparent'}}>📷 Photos</span>
