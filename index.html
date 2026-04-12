@@ -40,8 +40,19 @@
 
 
 /* ───── SUPABASE CONFIG ───── */
-const SUPABASE_URL = 'https://hnsikxxbpyhsybqmjgss.supabase.co';
-const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imhuc2lreHhicHloc3licW1qZ3NzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUwMDI5NTQsImV4cCI6MjA5MDU3ODk1NH0.kOJjzihX4N3c2RN_yvK4tKQEu_dJ__tPZZIVrKzPLNU';
+// ─── ENVIRONMENT SWITCH ───────────────────────────────────────────────────────
+// Set DEV_MODE = true to point at the dev Supabase project
+// Set DEV_MODE = false for production (GitHub Pages live site)
+const DEV_MODE = false;
+
+const SUPABASE_URL = DEV_MODE
+  ? 'https://miaiqlrhnzjqzciegbij.supabase.co'
+  : 'https://hnsikxxbpyhsybqmjgss.supabase.co';
+
+const SUPABASE_KEY = DEV_MODE
+  ? 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1pYWlxbHJobnpqcXpjaWVnYmlqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzU4NjY1MTAsImV4cCI6MjA5MTQ0MjUxMH0.7xk8aeahd5znjK3W6aSRthrKFYO9xXDYLsMIajVUvBQ'
+  : 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imhuc2lreHhicHloc3licW1qZ3NzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUwMDI5NTQsImV4cCI6MjA5MDU3ODk1NH0.kOJjzihX4N3c2RN_yvK4tKQEu_dJ__tPZZIVrKzPLNU';
+// ─────────────────────────────────────────────────────────────────────────────
 const SB_HEADERS = {
   'apikey': SUPABASE_KEY,
   'Authorization': 'Bearer ' + SUPABASE_KEY,
@@ -5037,6 +5048,14 @@ function App(){
 
     const root = ReactDOM.createRoot(document.getElementById("root"));
     root.render(<App />);
+
+    // Show DEV banner when in dev mode
+    if (DEV_MODE) {
+      const banner = document.createElement('div');
+      banner.style.cssText = 'position:fixed;bottom:0;left:0;right:0;background:#c4a35a;color:#0a0805;text-align:center;font-size:11px;font-weight:700;padding:4px;z-index:9999;letter-spacing:1px;';
+      banner.textContent = '⚠ DEV MODE — connected to dev database (miaiqlrhnzjqzciegbij)';
+      document.body.appendChild(banner);
+    }
   </script>
 </body>
 </html>
