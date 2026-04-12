@@ -119,6 +119,17 @@ async function sbFetch(path, opts = {}) {
   const resp = await fetch(url, { ...opts, headers });
   const text = await resp.text();
   if (!resp.ok) {
+    // If JWT expired, retry with anon key for read operations
+    if (resp.status === 401 && text.includes('JWT expired') && (!opts.method || opts.method === 'GET')) {
+      console.warn('JWT expired — retrying with anon key:', path);
+      const anonHeaders = { ...SB_HEADERS, ...(opts.headers || {}), Authorization: 'Bearer ' + SUPABASE_KEY };
+      const retry = await fetch(url, { ...opts, headers: anonHeaders });
+      const retryText = await retry.text();
+      if (retry.ok) {
+        if (!retryText) return [];
+        try { return JSON.parse(retryText); } catch(e) { return []; }
+      }
+    }
     console.error('Supabase request failed', {
       path,
       status: resp.status,
