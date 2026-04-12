@@ -120,9 +120,15 @@ async function sbFetch(path, opts = {}) {
   const resp = await fetch(url, { ...opts, headers });
   const text = await resp.text();
   if (!resp.ok) {
-    // If JWT expired, retry with anon key for read operations
-    if (resp.status === 401 && text.includes('JWT expired') && (!opts.method || opts.method === 'GET')) {
-      console.warn('JWT expired — retrying with anon key:', path);
+    // If 401 on a read operation, clear bad session and retry with anon key
+    if (resp.status === 401 && (!opts.method || opts.method === 'GET')) {
+      console.warn('401 on read — clearing session and retrying with anon key:', path);
+      // Clear stale/invalid session so future requests don't keep failing
+      if (authSession) {
+        authSession = null;
+        authUser = null;
+        try { sessionStorage.removeItem('ftls_session'); } catch(e) {}
+      }
       const anonHeaders = { ...SB_HEADERS, ...(opts.headers || {}), Authorization: 'Bearer ' + SUPABASE_KEY };
       const retry = await fetch(url, { ...opts, headers: anonHeaders });
       const retryText = await retry.text();
@@ -137,6 +143,9 @@ async function sbFetch(path, opts = {}) {
       body: text,
       usingSessionToken: !!authSession?.access_token
     });
+    if (resp.status === 401 || resp.status === 403) {
+      throw new Error('Permission denied — your session may have expired. Please sign out and sign back in.');
+    }
     throw new Error(text || `Supabase ${resp.status}`);
   }
   if (!text) return [];
