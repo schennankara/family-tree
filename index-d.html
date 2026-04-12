@@ -40,8 +40,19 @@
 
 
 /* ───── SUPABASE CONFIG ───── */
-const SUPABASE_URL = 'https://miaiqlrhnzjqzciegbij.supabase.co';
-const SUPABASE_KEY = 'sb_publishable_7ksCKGSYEETEwDSSUE4ohg_Xzd5DXSw';
+// ─── ENVIRONMENT SWITCH ───────────────────────────────────────────────────────
+// Set DEV_MODE = true to point at the dev Supabase project
+// Set DEV_MODE = false for production (GitHub Pages live site)
+const DEV_MODE = true;
+
+const SUPABASE_URL = DEV_MODE
+  ? 'https://miaiqlrhnzjqzciegbij.supabase.co'
+  : 'https://hnsikxxbpyhsybqmjgss.supabase.co';
+
+const SUPABASE_KEY = DEV_MODE
+  ? 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1pYWlxbHJobnpqcXpjaWVnYmlqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzU4NjY1MTAsImV4cCI6MjA5MTQ0MjUxMH0.7xk8aeahd5znjK3W6aSRthrKFYO9xXDYLsMIajVUvBQ'
+  : 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imhuc2lreHhicHloc3licW1qZ3NzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUwMDI5NTQsImV4cCI6MjA5MDU3ODk1NH0.kOJjzihX4N3c2RN_yvK4tKQEu_dJ__tPZZIVrKzPLNU';
+// ─────────────────────────────────────────────────────────────────────────────
 const SB_HEADERS = {
   'apikey': SUPABASE_KEY,
   'Authorization': 'Bearer ' + SUPABASE_KEY,
@@ -120,9 +131,15 @@ async function sbFetch(path, opts = {}) {
   const resp = await fetch(url, { ...opts, headers });
   const text = await resp.text();
   if (!resp.ok) {
-    // If JWT expired, retry with anon key for read operations
-    if (resp.status === 401 && text.includes('JWT expired') && (!opts.method || opts.method === 'GET')) {
-      console.warn('JWT expired — retrying with anon key:', path);
+    // If 401 on a read operation, clear bad session and retry with anon key
+    if (resp.status === 401 && (!opts.method || opts.method === 'GET')) {
+      console.warn('401 on read — clearing session and retrying with anon key:', path);
+      // Clear stale/invalid session so future requests don't keep failing
+      if (authSession) {
+        authSession = null;
+        authUser = null;
+        try { sessionStorage.removeItem('ftls_session'); } catch(e) {}
+      }
       const anonHeaders = { ...SB_HEADERS, ...(opts.headers || {}), Authorization: 'Bearer ' + SUPABASE_KEY };
       const retry = await fetch(url, { ...opts, headers: anonHeaders });
       const retryText = await retry.text();
@@ -137,6 +154,9 @@ async function sbFetch(path, opts = {}) {
       body: text,
       usingSessionToken: !!authSession?.access_token
     });
+    if (resp.status === 401 || resp.status === 403) {
+      throw new Error('Permission denied — your session may have expired. Please sign out and sign back in.');
+    }
     throw new Error(text || `Supabase ${resp.status}`);
   }
   if (!text) return [];
@@ -5028,6 +5048,14 @@ function App(){
 
     const root = ReactDOM.createRoot(document.getElementById("root"));
     root.render(<App />);
+
+    // Show DEV banner when in dev mode
+    if (DEV_MODE) {
+      const banner = document.createElement('div');
+      banner.style.cssText = 'position:fixed;bottom:0;left:0;right:0;background:#c4a35a;color:#0a0805;text-align:center;font-size:11px;font-weight:700;padding:4px;z-index:9999;letter-spacing:1px;';
+      banner.textContent = '⚠ DEV MODE — connected to dev database (miaiqlrhnzjqzciegbij)';
+      document.body.appendChild(banner);
+    }
   </script>
 </body>
 </html>
