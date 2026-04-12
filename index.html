@@ -1299,15 +1299,15 @@ async function mergeFieldsToDb(ftlsPerson, fieldsToApply, ext, editUser) {
 
 // Export FTLS-only persons as a GEDCOM fragment for import into external tools
 // Smart export: only new families, existing families handled via FAMC/FAMS on persons
-function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds) {
+function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap) {
   const extIds = extFamilyIds || new Set();
+  const extFams = extFamiliesMap || {};
   const personIds = new Set(persons.map(p => p.id));
   const pMap = {};
   persons.forEach(p => { pMap[p.id] = p; });
   
   // For FAMC/FAMS refs on persons, we need ALL families (including existing ones)
-  // But we only EXPORT new FAM records
-  // So: pass full familyMap to exportTreeToGedcom for ref building,
+  // We export: (1) brand new FAM records, AND (2) existing FAMs whose children changed
   // but mark which families to actually output as records
   
   // Build the GEDCOM manually to control what FAM records get written
@@ -1380,14 +1380,26 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds) {
     lines.push(...L);
   }
 
-  // FAM records — ONLY new families (not in external)
+  // FAM records — new families AND existing families with changed children
   for (const [fid, fam] of Object.entries(ftlsFamilyMap)) {
-    if (extIds.has(fid)) continue; // skip existing families
     const hid = fam.husband_id || fam.husb || '';
     const wid = fam.wife_id || fam.wife || '';
     const kids = fam.children || [];
     const involvesOur = personIds.has(hid) || personIds.has(wid) || kids.some(k => personIds.has(k));
     if (!involvesOur) continue;
+    
+    // If family exists in external, only include if children list changed
+    if (extIds.has(fid)) {
+      const extFam = extFams[fid];
+      if (extFam) {
+        const extKids = (extFam.children || []).sort().join(',');
+        const ftlsKids = kids.slice().sort().join(',');
+        if (extKids === ftlsKids) continue; // same children — skip
+      } else {
+        continue; // ID exists but no data to compare — skip to be safe
+      }
+    }
+    
     const F = [`0 ${fid} FAM`];
     if (hid) F.push(`1 HUSB ${hid}`);
     if (wid) F.push(`1 WIFE ${wid}`);
@@ -3717,6 +3729,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
   const [fileName, setFileName] = useState('');
   const [extGedcomText, setExtGedcomText] = useState(''); // keep raw text for merge-into
   const [extFamilyIds, setExtFamilyIds] = useState(new Set());
+  const [extFamiliesMap, setExtFamiliesMap] = useState({}); // full parsed external families for child comparison
   const [tab, setTab] = useState('summary');
   const [merging, setMerging] = useState(false);
   const [mergeLog, setMergeLog] = useState([]);
@@ -3762,6 +3775,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
             else if (el.tag === 'FAM' && el.pointer) { const f = parseFam(el); extFamilies[f.id] = f; }
           }
           setExtFamilyIds(new Set(Object.keys(extFamilies)));
+          setExtFamiliesMap(extFamilies);
           const result = computeGedcomDiff(extPeople, extFamilies, personMap, familyMap);
           setDiffResult(result);
           setTab('summary');
@@ -3875,7 +3889,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
       if (!persons.find(p => p.id === e.person.id)) persons.push(e.person);
     });
     if (persons.length === 0) { alert('No items to export.'); return; }
-    const content = exportDiffGedcom(persons, familyMap, extFamilyIds);
+    const content = exportDiffGedcom(persons, familyMap, extFamilyIds, extFamiliesMap);
     const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob); const a = document.createElement('a');
     a.href = url; a.download = 'FTLS_Export_For_Merge.ged';
