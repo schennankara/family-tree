@@ -1096,10 +1096,43 @@ function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap)
   const ftlsMatched = new Set();
   const extMatched = new Set();
   
+  // Helper: find which family a person is a child of
+  function findParentFamily(personId, familyMap) {
+    for (const [fid, fam] of Object.entries(familyMap)) {
+      const kids = fam.children || [];
+      if (kids.includes(personId)) {
+        const hid = fam.husband_id || fam.husb || '';
+        const wid = fam.wife_id || fam.wife || '';
+        return { familyId: fid, husband: hid, wife: wid };
+      }
+    }
+    return null;
+  }
+
+  // Helper: get a readable label for a parent family
+  function parentLabel(pf, pMap) {
+    if (!pf) return '(none)';
+    const hName = pf.husband && pMap[pf.husband] ? (pMap[pf.husband].dn || pMap[pf.husband].fn || pf.husband) : '';
+    const wName = pf.wife && pMap[pf.wife] ? (pMap[pf.wife].dn || pMap[pf.wife].fn || pf.wife) : '';
+    return [hName, wName].filter(Boolean).join(' & ') || pf.familyId;
+  }
+
   // Pass 1: Exact ID match
   for (const [id, ext] of Object.entries(extPeople)) {
     if (ftlsPersonMap[id]) {
       const diffs = diffPerson(ftlsPersonMap[id], ext);
+      // Compare parent family (FAMC)
+      const ftlsParent = findParentFamily(id, ftlsFamilyMap);
+      const extParent = findParentFamily(id, extFamilies);
+      const ftlsFamId = ftlsParent?.familyId || '';
+      const extFamId = extParent?.familyId || '';
+      if (ftlsFamId !== extFamId) {
+        diffs.push({
+          key: '_famc', label: 'Parent Family',
+          ftls: ftlsParent ? parentLabel(ftlsParent, ftlsPersonMap) + ' (' + ftlsFamId + ')' : '(none)',
+          ext: extParent ? parentLabel(extParent, extPeople) + ' (' + extFamId + ')' : '(none)'
+        });
+      }
       results.matched.push({ id, ftls: ftlsPersonMap[id], ext, diffs });
       ftlsMatched.add(id);
       extMatched.add(id);
@@ -1113,6 +1146,18 @@ function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap)
     const match = fuzzyMatchPerson(ext, unmatchedFtls);
     if (match) {
       const diffs = diffPerson(match.person, ext);
+      // Compare parent family (FAMC) for fuzzy matches too
+      const ftlsParent = findParentFamily(match.person.id, ftlsFamilyMap);
+      const extParent = findParentFamily(id, extFamilies);
+      const ftlsFamId = ftlsParent?.familyId || '';
+      const extFamId = extParent?.familyId || '';
+      if (ftlsFamId !== extFamId) {
+        diffs.push({
+          key: '_famc', label: 'Parent Family',
+          ftls: ftlsParent ? parentLabel(ftlsParent, ftlsPersonMap) + ' (' + ftlsFamId + ')' : '(none)',
+          ext: extParent ? parentLabel(extParent, extPeople) + ' (' + extFamId + ')' : '(none)'
+        });
+      }
       results.fuzzyMatched.push({ extId: id, ftlsId: match.person.id, ext, ftls: match.person, score: match.score, diffs });
       ftlsMatched.add(match.person.id);
       extMatched.add(id);
@@ -3692,6 +3737,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
     diffResult.matched.filter(m => m.diffs.length > 0).forEach(m => {
       const impFields = [], expFields = [];
       m.diffs.forEach(d => {
+        if (d.key === '_famc') return; // Branch changes use Move Branch, not field import/export
         const dir = getFieldDirection(m.id, d.key);
         if (dir === 'import') impFields.push(d);
         else if (dir === 'export') expFields.push(d);
@@ -3878,12 +3924,13 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
                           const fDir = getFieldDirection(m.id, d.key);
                           const fL=(d.ftls||'').replace(/^[,\s]+/,'').length, eL=(d.ext||'').replace(/^[,\s]+/,'').length;
                           const ftlsW=fL>=eL&&fL>0, extW=eL>fL;
-                          return (<tr key={d.key} style={{ borderTop:'1px solid rgba(196,163,90,0.06)' }}>
-                            <td style={{ padding:'4px 8px' }}><DirBtn dir={fDir} onSet={(dir)=>setFieldDirection(m.id, d.key, dir)} /></td>
-                            <td style={{ padding:'4px 8px', color:DM }}>{d.label}</td>
-                            <td style={{ padding:'4px 8px', color:d.ftls?TX:'#5a4040', background:ftlsW?'rgba(107,158,114,0.06)':'transparent' }}>{d.ftls||'(empty)'}</td>
-                            <td style={{ padding:'4px 8px', color:d.ext?'#8ec496':'#5a4040', background:extW?'rgba(107,158,114,0.06)':'transparent' }}>{d.ext||'(empty)'}</td>
-                            <td style={{ padding:'4px 8px', fontSize:10 }}>{ftlsW?<span style={{color:GC}}>←FTLS</span>:extW?<span style={{color:MC}}>Ext→</span>:<span style={{color:DM}}>—</span>}</td>
+                          const isBranch = d.key === '_famc';
+                          return (<tr key={d.key} style={{ borderTop:'1px solid rgba(196,163,90,0.06)', background: isBranch ? 'rgba(126,184,208,0.06)' : 'transparent' }}>
+                            <td style={{ padding:'4px 8px' }}>{isBranch ? <span style={{fontSize:10,color:'#7eb8d0'}}>🔀</span> : <DirBtn dir={fDir} onSet={(dir)=>setFieldDirection(m.id, d.key, dir)} />}</td>
+                            <td style={{ padding:'4px 8px', color: isBranch ? '#7eb8d0' : DM, fontWeight: isBranch ? 500 : 'normal' }}>{d.label}</td>
+                            <td style={{ padding:'4px 8px', color:d.ftls?TX:'#5a4040', background:ftlsW&&!isBranch?'rgba(107,158,114,0.06)':'transparent' }}>{d.ftls||'(empty)'}</td>
+                            <td style={{ padding:'4px 8px', color:d.ext?'#8ec496':'#5a4040', background:extW&&!isBranch?'rgba(107,158,114,0.06)':'transparent' }}>{d.ext||'(empty)'}</td>
+                            <td style={{ padding:'4px 8px', fontSize:10 }}>{isBranch?<span style={{color:'#7eb8d0'}}>Branch</span>:ftlsW?<span style={{color:GC}}>←FTLS</span>:extW?<span style={{color:MC}}>Ext→</span>:<span style={{color:DM}}>—</span>}</td>
                           </tr>);
                         })}</tbody>
                       </table>
