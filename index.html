@@ -34,7 +34,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v2.5.0';
+    const APP_VERSION = 'v2.5.1';
     const BUILD_DATE = '2026-04-12';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
@@ -1381,23 +1381,32 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap) 
     lines.push(...L);
   }
 
-  // FAM records — new families AND existing families with changed children
+  // Collect all family IDs referenced by exported persons (FAMC + FAMS)
+  const referencedFamIds = new Set();
+  for (const pid of personIds) {
+    (famcLookup[pid] || []).forEach(fid => referencedFamIds.add(fid));
+    (famsLookup[pid] || []).forEach(fid => referencedFamIds.add(fid));
+  }
+
+  // FAM records — include if: (1) new family, (2) children changed, OR (3) referenced by an exported person
   for (const [fid, fam] of Object.entries(ftlsFamilyMap)) {
     const hid = fam.husband_id || fam.husb || '';
     const wid = fam.wife_id || fam.wife || '';
     const kids = fam.children || [];
     const involvesOur = personIds.has(hid) || personIds.has(wid) || kids.some(k => personIds.has(k));
-    if (!involvesOur) continue;
+    const referencedByExport = referencedFamIds.has(fid);
+    if (!involvesOur && !referencedByExport) continue;
     
-    // If family exists in external, only include if children list changed
-    if (extIds.has(fid)) {
+    // If family exists in external AND not referenced by any exported person,
+    // only include if children list changed
+    if (extIds.has(fid) && !referencedByExport) {
       const extFam = extFams[fid];
       if (extFam) {
         const extKids = (extFam.children || []).sort().join(',');
         const ftlsKids = kids.slice().sort().join(',');
-        if (extKids === ftlsKids) continue; // same children — skip
+        if (extKids === ftlsKids) continue; // same children, not referenced — skip
       } else {
-        continue; // ID exists but no data to compare — skip to be safe
+        continue;
       }
     }
     
