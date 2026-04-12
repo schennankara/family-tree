@@ -34,7 +34,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v2.7.0';
+    const APP_VERSION = 'v2.4.0';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
 
@@ -1480,44 +1480,108 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
     }
   }
 
-  // Apply field-level updates to existing INDI records in the original
-  // Combine explicit exportFields + field data from existing persons in the basket
-  const allFieldUpdates = [...(exportFields || [])];
-  // For existing persons in the export basket, build field updates from their data
-  const tagMap = { fn:'1>GIVN', ln:'1>SURN', dob:'BIRT>DATE', dod:'DEAT>DATE', loc:'BIRT>PLAC', ph:'PHON', em:'EMAI', prof:'OCCU', notes:'NOTE' };
-  for (const p of existingPersons) {
-    // Check if this person already has explicit field exports
-    if (allFieldUpdates.some(f => f.personId === p.id)) continue;
-    // Build field list from non-empty values
-    const fields = [];
-    for (const [key, tag] of Object.entries(tagMap)) {
-      if (p[key]) fields.push({ key, value: p[key] });
+  // For existing persons, decide: field-level patch or full INDI replacement
+  // If exportFields specifies fields for a person → patch only those fields
+  // If person is in export basket but NOT in exportFields → full INDI replacement
+  
+  // Build FAMC/FAMS lookups from full familyMap
+  const famcLookup2 = {}, famsLookup2 = {};
+  for (const [fid, fam] of Object.entries(ftlsFamilyMap)) {
+    (fam.children || []).forEach(cid => { if (!famcLookup2[cid]) famcLookup2[cid] = []; famcLookup2[cid].push(fid); });
+    const hid = fam.husband_id || fam.husb || '';
+    const wid = fam.wife_id || fam.wife || '';
+    if (hid) { if (!famsLookup2[hid]) famsLookup2[hid] = []; famsLookup2[hid].push(fid); }
+    if (wid) { if (!famsLookup2[wid]) famsLookup2[wid] = []; famsLookup2[wid].push(fid); }
+  }
+  
+  function buildReplacementIndi(p) {
+    const L = [`0 ${p.id} INDI`];
+    const fn = p.fn || '', mn = p.mn || '', ln = p.ln || '';
+    const givn = (fn + (mn ? ' ' + mn : '')).trim();
+    const nm = ln ? `${givn} /${ln}/` : (givn || p.dn || '(Unknown)');
+    L.push(`1 NAME ${nm}`);
+    if (fn) L.push(`2 GIVN ${fn}`);
+    if (ln) L.push(`2 SURN ${ln}`);
+    if (p.nk) { L.push(`1 NAME ${p.nk} //`); L.push(`2 TYPE nick`); L.push(`2 GIVN ${p.nk}`); }
+    if (p.md) { L.push(`1 NAME ${p.md} //`); L.push(`2 TYPE birth`); }
+    if (p.g) L.push(`1 SEX ${p.g}`);
+    if (p.dob || p.loc) { L.push('1 BIRT'); if (p.dob) L.push(`2 DATE ${p.dob}`); if (p.loc) L.push(`2 PLAC ${p.loc}`); }
+    if (p.dod || p.dec) { L.push('1 DEAT'); if (p.dod) L.push(`2 DATE ${p.dod}`); }
+    if (p.ph) L.push(`1 PHON ${p.ph}`);
+    if (p.em) L.push(`1 EMAI ${p.em}`);
+    if (p.a1 || p.ci || p.st || p.co) {
+      L.push(`1 ADDR ${p.a1 || ''}`);
+      if (p.a2) L.push(`2 ADR2 ${p.a2}`);
+      if (p.ci) L.push(`2 CITY ${p.ci}`);
+      if (p.st) L.push(`2 STAE ${p.st}`);
+      if (p.zp) L.push(`2 POST ${p.zp}`);
+      if (p.co) L.push(`2 CTRY ${p.co}`);
     }
-    if (fields.length > 0) allFieldUpdates.push({ personId: p.id, fields });
+    if (p.prof) L.push(`1 OCCU ${p.prof}`);
+    if (p.ws) L.push(`1 WWW ${p.ws}`);
+    if (p.notes) L.push(`1 NOTE ${p.notes}`);
+    if (p.bio) L.push(`1 NOTE BIO: ${p.bio}`);
+    if (p.stories) L.push(`1 NOTE STORY: ${p.stories}`);
+    if (p.fb) L.push(`1 _FACEBOOK ${p.fb}`);
+    if (p.ig) L.push(`1 _INSTAGRAM ${p.ig}`);
+    if (p.li) L.push(`1 _LINKEDIN ${p.li}`);
+    if (p.pp) L.push(`1 _PHOTO ${p.pp}`);
+    if (p.emp) L.push(`1 _EMPLOYER ${p.emp}`);
+    if (p.pgl) L.push(`1 _PHOTOGALLERY ${p.pgl}`);
+    if (p.dl) L.push(`1 _DOCUMENTS ${p.dl}`);
+    (famsLookup2[p.id] || []).forEach(ref => L.push(`1 FAMS ${ref}`));
+    (famcLookup2[p.id] || []).forEach(ref => L.push(`1 FAMC ${ref}`));
+    return L;
   }
 
-  for (const { personId, fields } of allFieldUpdates) {
+  // Determine which persons get field-level patches vs full replacement
+  const fieldPatchIds = new Set((exportFields || []).map(f => f.personId));
+  const fullReplacePersons = existingPersons.filter(p => !fieldPatchIds.has(p.id));
+  const fullReplaceIds = new Set(fullReplacePersons.map(p => p.id));
+  const exportPMap = {};
+  for (const p of existingPersons) exportPMap[p.id] = p;
+
+  // Full INDI replacement for whole-person exports
+  for (let i = before.length - 1; i >= 0; i--) {
+    const m = before[i].match(/^0 (@[^@]+@) INDI/);
+    if (!m || !fullReplaceIds.has(m[1])) continue;
+    const p = exportPMap[m[1]];
+    if (!p) continue;
+    let j = i + 1;
+    while (j < before.length && !before[j].trim().startsWith('0 ')) j++;
+    before.splice(i, j - i, ...buildReplacementIndi(p));
+  }
+
+  // Field-level patching for selected-fields-only exports
+  const tagMap = {
+    fn:'NAME>GIVN', ln:'NAME>SURN', mn:'NAME>GIVN',
+    dob:'BIRT>DATE', dod:'DEAT>DATE', loc:'BIRT>PLAC',
+    ph:'PHON', em:'EMAI', prof:'OCCU', ws:'WWW',
+    notes:'NOTE', bio:'NOTE', stories:'NOTE',
+    a1:'ADDR', ci:'ADDR>CITY', st:'ADDR>STAE', zp:'ADDR>POST', co:'ADDR>CTRY',
+  };
+  for (const { personId, fields } of (exportFields || [])) {
     for (let i = 0; i < before.length; i++) {
       if (!before[i].trim().startsWith(`0 ${personId} INDI`)) continue;
       let j = i + 1;
       while (j < before.length && !before[j].trim().startsWith('0 ')) j++;
       for (const { key, value } of fields) {
-        const tag = tagMap[key]; if (!tag || !value) continue;
+        if (!value) continue;
+        const tag = tagMap[key];
+        if (!tag) continue;
         if (tag.includes('>')) {
           const [par, chi] = tag.split('>');
-          const parTag = par === '1' ? 'NAME' : par;
           let found = false;
           for (let k = i+1; k < j; k++) {
-            if (par !== '1' && before[k].trim() === `1 ${parTag}`) {
+            if (before[k].trim().startsWith(`1 ${par}`)) {
               for (let l = k+1; l < j && before[l].trim().startsWith('2 '); l++) {
                 if (before[l].trim().startsWith(`2 ${chi}`)) { before[l] = `2 ${chi} ${value}`; found = true; break; }
               }
               if (!found) { before.splice(k+1, 0, `2 ${chi} ${value}`); j++; found = true; }
               break;
             }
-            if (par === '1' && before[k].trim().startsWith(`2 ${chi}`)) { before[k] = `2 ${chi} ${value}`; found = true; break; }
           }
-          if (!found && par !== '1') { before.splice(j, 0, `1 ${parTag}`, `2 ${chi} ${value}`); j += 2; }
+          if (!found) { before.splice(j, 0, `1 ${par}`, `2 ${chi} ${value}`); j += 2; }
         } else {
           let found = false;
           for (let k = i+1; k < j; k++) {
