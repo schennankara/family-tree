@@ -34,7 +34,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v2.6.2';
+    const APP_VERSION = 'v2.4.0';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
 
@@ -1668,7 +1668,21 @@ function parseIndi(el) {
 
   // Other fields
   const prof = getChildValue(el, 'OCCU');
-  const notes = getChildValue(el, 'NOTE');
+  
+  // Notes, Bio, Stories — handle multiple NOTE tags with prefixes
+  let notes = '', bio = '', stories = '';
+  const noteEls = el.children.filter(c => c.tag === 'NOTE');
+  for (const noteEl of noteEls) {
+    const val = noteEl.value || '';
+    if (val.startsWith('BIO: ')) {
+      bio = val.substring(5);
+    } else if (val.startsWith('STORY: ')) {
+      stories = val.substring(7);
+    } else if (val) {
+      if (notes) notes += '\n';
+      notes += val;
+    }
+  }
 
   // Custom tags
   const fb = getChildValue(el, '_FACEBOOK');
@@ -1696,8 +1710,8 @@ function parseIndi(el) {
     id, fn, mn, ln, dn, nk, md, g,
     dob, dod, dec: hasDeat || !!dod, bo: 0,
     em, ph, a1, a2, ci, st, zp, co,
-    fb, ig, li, ws, pp, bio: '', loc,
-    prof, emp, stories: '', notes, pgl, dl,
+    fb, ig, li, ws, pp, bio, loc,
+    prof, emp, stories, notes, pgl, dl,
     fams, famc,
   };
 }
