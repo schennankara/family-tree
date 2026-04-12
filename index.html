@@ -834,7 +834,7 @@ function exportTreeToGedcom(tree, personMap, familyMap) {
     const givn = (fn + (mn ? ' ' + mn : '')).trim();
     const nameStr = ln ? `${givn} /${ln}/` : (givn || person.dn || '(Unknown)');
     L.push(`1 NAME ${nameStr}`);
-    if (fn) L.push(`2 GIVN ${fn}`);
+    if (givn) L.push(`2 GIVN ${givn}`);
     if (ln) L.push(`2 SURN ${ln}`);
 
     // Nickname
@@ -1352,7 +1352,7 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds) {
     const givn = (fn + (mn ? ' ' + mn : '')).trim();
     const nameStr = ln ? `${givn} /${ln}/` : (givn || person.dn || '(Unknown)');
     L.push(`1 NAME ${nameStr}`);
-    if (fn) L.push(`2 GIVN ${fn}`);
+    if (givn) L.push(`2 GIVN ${givn}`);
     if (ln) L.push(`2 SURN ${ln}`);
     if (person.nk) { L.push(`1 NAME ${person.nk} //`); L.push(`2 TYPE nick`); L.push(`2 GIVN ${person.nk}`); }
     if (person.md) { L.push(`1 NAME ${person.md} //`); L.push(`2 TYPE birth`); }
