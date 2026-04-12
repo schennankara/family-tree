@@ -834,7 +834,7 @@ function exportTreeToGedcom(tree, personMap, familyMap) {
     const givn = (fn + (mn ? ' ' + mn : '')).trim();
     const nameStr = ln ? `${givn} /${ln}/` : (givn || person.dn || '(Unknown)');
     L.push(`1 NAME ${nameStr}`);
-    if (givn) L.push(`2 GIVN ${givn}`);
+    if (fn) L.push(`2 GIVN ${fn}`);
     if (ln) L.push(`2 SURN ${ln}`);
 
     // Nickname
@@ -1352,7 +1352,7 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds) {
     const givn = (fn + (mn ? ' ' + mn : '')).trim();
     const nameStr = ln ? `${givn} /${ln}/` : (givn || person.dn || '(Unknown)');
     L.push(`1 NAME ${nameStr}`);
-    if (givn) L.push(`2 GIVN ${givn}`);
+    if (fn) L.push(`2 GIVN ${fn}`);
     if (ln) L.push(`2 SURN ${ln}`);
     if (person.nk) { L.push(`1 NAME ${person.nk} //`); L.push(`2 TYPE nick`); L.push(`2 GIVN ${person.nk}`); }
     if (person.md) { L.push(`1 NAME ${person.md} //`); L.push(`2 TYPE birth`); }
@@ -1616,13 +1616,24 @@ function parseIndi(el) {
 
       if (givnEl) {
         // Strip leading birth-order number prefix like "4. Samuel" → "Samuel"
-        let givnVal = givnEl.value.replace(/^\d+\.\s*/, '');
-        const parts = givnVal.split(' ');
-        fn = parts[0] || '';
-        if (parts.length > 1 && !mn) mn = parts.slice(1).join(' ');
+        fn = givnEl.value.replace(/^\d+\.\s*/, '');
       }
       if (surnEl) ln = surnEl.value;
       if (secgEl && !mn) mn = secgEl.value;
+      
+      // Extract middle name from NAME string: compare given portion with fn
+      // NAME "Steve S /Chennankara/" → givenPart="Steve S", fn="Steve" → mn="S"
+      // NAME "Brother 3" → no surname → fn stays "Brother 3", mn=""
+      if (fn && ln && !mn) {
+        const nameVal = nameEl.value.replace(/^\d+\.\s*/, '');
+        const slashMatch = nameVal.match(/^(.*?)\/([^\/]*)\//);
+        if (slashMatch) {
+          const givenPart = slashMatch[1].trim();
+          if (givenPart.length > fn.length && givenPart.startsWith(fn)) {
+            mn = givenPart.substring(fn.length).trim();
+          }
+        }
+      }
 
       // Fallback: parse "Given /Surname/" format
       if (!fn && !ln) {
