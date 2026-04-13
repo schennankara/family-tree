@@ -111,7 +111,7 @@ async function saveMediaRecord(record) {
   await sbFetch('media', {
     method: 'POST',
     body: JSON.stringify(record),
-    headers: { 'Prefer': 'return=minimal', 'Authorization': 'Bearer ' + SUPABASE_KEY }
+    headers: { 'Prefer': 'return=minimal' }
   });
 }
 
@@ -300,8 +300,7 @@ async function savePerson(person, editUser) {
     method: 'POST',
     body: JSON.stringify(row),
     headers: { 
-      'Prefer': 'return=minimal,resolution=merge-duplicates',
-      'Authorization': 'Bearer ' + SUPABASE_KEY 
+      'Prefer': 'return=minimal,resolution=merge-duplicates'
     }
   });
   
@@ -347,8 +346,7 @@ async function savePerson(person, editUser) {
             changed_fields: diff, 
             previous_values: prev 
           } 
-        }),
-        headers: { 'Authorization': 'Bearer ' + SUPABASE_KEY }
+        })
       });
     } catch(e) { console.warn('Edit log failed:', e); }
   }
@@ -364,7 +362,7 @@ async function saveFamily(familyId, husbandId, wifeId, children, mdate, mplace) 
   await sbFetch('families', {
     method: 'POST',
     body: JSON.stringify(row),
-    headers: { 'Prefer': 'return=minimal,resolution=merge-duplicates', 'Authorization': 'Bearer ' + SUPABASE_KEY }
+    headers: { 'Prefer': 'return=minimal,resolution=merge-duplicates' }
   });
 }
 
@@ -1283,7 +1281,7 @@ async function mergeFamilyToDb(extFam) {
   await sbFetch('families?on_conflict=id', {
     method: 'POST',
     body: JSON.stringify(row),
-    headers: { 'Prefer': 'return=minimal,resolution=merge-duplicates', 'Authorization': 'Bearer ' + SUPABASE_KEY }
+    headers: { 'Prefer': 'return=minimal,resolution=merge-duplicates' }
   });
   return { skipped: false, action: 'created' };
 }
