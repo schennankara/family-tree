@@ -337,6 +337,7 @@ async function savePerson(person, editUser) {
     try {
       await sbFetch('edit_log', {
         method: 'POST',
+        headers: { 'Prefer': 'return=minimal' },
         body: JSON.stringify({ 
           person_id: person.id, 
           action: oldRow ? 'update' : 'create', 
@@ -389,6 +390,7 @@ async function deletePersonFromDB(personId, editUser) {
   try {
     await sbFetch('edit_log', {
       method: 'POST',
+      headers: { 'Prefer': 'return=minimal' },
       body: JSON.stringify({ person_id: personId, action: 'delete', edited_by: editUser||'' })
     });
   } catch(e) {}
@@ -516,6 +518,7 @@ async function movePersonBranch(personId, fromFamilyId, toFamilyId, editUser) {
   try {
     await sbFetch('edit_log', {
       method: 'POST',
+      headers: { 'Prefer': 'return=minimal' },
       body: JSON.stringify({
         person_id: personId,
         action: 'move',
