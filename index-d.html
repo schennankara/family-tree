@@ -34,7 +34,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.5.1';
+    const APP_VERSION = 'v4.6.0';
     const BUILD_DATE = '2026-04-12';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
@@ -337,6 +337,7 @@ async function savePerson(person, editUser) {
     try {
       await sbFetch('edit_log', {
         method: 'POST',
+        headers: { 'Prefer': 'return=minimal' },
         body: JSON.stringify({ 
           person_id: person.id, 
           action: oldRow ? 'update' : 'create', 
@@ -389,6 +390,7 @@ async function deletePersonFromDB(personId, editUser) {
   try {
     await sbFetch('edit_log', {
       method: 'POST',
+      headers: { 'Prefer': 'return=minimal' },
       body: JSON.stringify({ person_id: personId, action: 'delete', edited_by: editUser||'' })
     });
   } catch(e) {}
@@ -516,6 +518,7 @@ async function movePersonBranch(personId, fromFamilyId, toFamilyId, editUser) {
   try {
     await sbFetch('edit_log', {
       method: 'POST',
+      headers: { 'Prefer': 'return=minimal' },
       body: JSON.stringify({
         person_id: personId,
         action: 'move',
@@ -2197,14 +2200,16 @@ function canEditorDirectEdit(targetId, tree, pMap, fMap) {
   const myParentFam = parentFamilyOf(myId);
   if (myParentFam) {
     if (myParentFam.husband_id === targetId || myParentFam.wife_id === targetId) return true;
-    // My siblings + their spouses
+    // My siblings + their spouses + their full descendants
     for (const sibId of (myParentFam.children||[])) {
       if (sibId === targetId) return true;
-      familiesOf(sibId).forEach(sf => {
+      // Sibling's spouse — use for loop to allow proper return
+      const sibFams = familiesOf(sibId);
+      for (const sf of sibFams) {
         const sibSp = spouseIn(sf, sibId);
-        if (sibSp === targetId) return true;
-      });
-      // Siblings' descendants
+        if (sibSp && sibSp === targetId) return true;
+      }
+      // Siblings' full descendants
       const sibDescIds = new Set();
       const collectSibDesc = (pids) => {
         for (const pid of pids) {
@@ -2223,17 +2228,35 @@ function canEditorDirectEdit(targetId, tree, pMap, fMap) {
     }
   }
 
-  // Parents-in-law (spouse's parents + their children/spouses)
+  // Parents-in-law + siblings-in-law + their spouses + their full descendants
   for (const spId of mySpouseIds) {
     const spParentFam = parentFamilyOf(spId);
     if (spParentFam) {
       if (spParentFam.husband_id === targetId || spParentFam.wife_id === targetId) return true;
       for (const silId of (spParentFam.children||[])) {
         if (silId === targetId) return true;
-        familiesOf(silId).forEach(sf => {
+        // Sibling-in-law's spouse — use for loop to allow proper return
+        const silFams = familiesOf(silId);
+        for (const sf of silFams) {
           const silSp = spouseIn(sf, silId);
-          if (silSp === targetId) return true;
-        });
+          if (silSp && silSp === targetId) return true;
+        }
+        // Sibling-in-law's full descendants
+        const silDescIds = new Set();
+        const collectSilDesc = (pids) => {
+          for (const pid of pids) {
+            familiesOf(pid).forEach(f => {
+              (f.children||[]).forEach(cid => {
+                if (!silDescIds.has(cid)) {
+                  silDescIds.add(cid);
+                  collectSilDesc([cid]);
+                }
+              });
+            });
+          }
+        };
+        collectSilDesc([silId]);
+        if (silDescIds.has(targetId)) return true;
       }
     }
   }

@@ -29,6 +29,7 @@ DROP POLICY IF EXISTS "Allow delete families" ON public.families;
 -- EDIT_LOG: restrict read to admins only
 -- ─────────────────────────────────────────────────────────────────────────────
 DROP POLICY IF EXISTS "Public read edit_log" ON public.edit_log;
+DROP POLICY IF EXISTS "Admin read edit_log" ON public.edit_log;
 
 CREATE POLICY "Admin read edit_log"
   ON public.edit_log FOR SELECT
