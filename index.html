@@ -4019,7 +4019,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
   };
 
   // ── BATCH EXPORT (download GEDCOM) ──
-  const batchExportGedcom = () => {
+  const batchExportGedcom = async () => {
     const persons = basket.exports.filter(e => e.type === 'ftls_person').map(e => e.person);
     // For changed_fields exports, include the FTLS person version
     basket.exports.filter(e => e.type === 'changed_fields').forEach(e => {
