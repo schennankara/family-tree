@@ -3867,6 +3867,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
   const [extGedcomText, setExtGedcomText] = useState(''); // keep raw text for merge-into
   const [extFamilyIds, setExtFamilyIds] = useState(new Set());
   const [extFamiliesMap, setExtFamiliesMap] = useState({}); // full parsed external families for child comparison
+  const [extPeopleMap, setExtPeopleMap] = useState({}); // parsed external persons for breadcrumbs
   const [tab, setTab] = useState('summary');
   const [merging, setMerging] = useState(false);
   const [mergeLog, setMergeLog] = useState([]);
@@ -3913,6 +3914,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
           }
           setExtFamilyIds(new Set(Object.keys(extFamilies)));
           setExtFamiliesMap(extFamilies);
+          setExtPeopleMap(extPeople);
           const result = computeGedcomDiff(extPeople, extFamilies, personMap, familyMap);
           setDiffResult(result);
           setTab('summary');
@@ -3949,6 +3951,73 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
       [personId]: { ...(prev[personId]||{}), [fieldKey]: dir }
     }));
   };
+
+  // ── Family breadcrumb helpers ──
+  // Build "Father & Mother → Spouse, children: A, B, C" string for a person
+  function ftlsBreadcrumb(personId) {
+    const parts = [];
+    // Find parent family (where this person is a child)
+    for (const [fid, fam] of Object.entries(familyMap)) {
+      if ((fam.children||[]).includes(personId)) {
+        const dad = fam.husband_id && personMap[fam.husband_id] ? personMap[fam.husband_id].dn : '';
+        const mom = fam.wife_id && personMap[fam.wife_id] ? personMap[fam.wife_id].dn : '';
+        const parents = [dad, mom].filter(Boolean).join(' & ');
+        if (parents) parts.push('⬆ ' + parents);
+        break;
+      }
+    }
+    // Find spouse family (where this person is husband/wife)
+    for (const [fid, fam] of Object.entries(familyMap)) {
+      const hid = fam.husband_id || fam.husb;
+      const wid = fam.wife_id || fam.wife;
+      if (hid === personId || wid === personId) {
+        const spouseId = hid === personId ? wid : hid;
+        if (spouseId && personMap[spouseId]) parts.push('⚭ ' + personMap[spouseId].dn);
+        const kids = (fam.children||[]).map(cid => personMap[cid]?.dn || cid).filter(Boolean);
+        if (kids.length > 0) parts.push('↓ ' + kids.slice(0,4).join(', ') + (kids.length > 4 ? '…' : ''));
+        break;
+      }
+    }
+    return parts.join('  ·  ');
+  }
+
+  function extBreadcrumb(personId) {
+    const parts = [];
+    for (const [fid, fam] of Object.entries(extFamiliesMap)) {
+      if ((fam.children||[]).includes(personId)) {
+        const dad = fam.husb && extPeopleMap[fam.husb] ? extPeopleMap[fam.husb].dn : '';
+        const mom = fam.wife && extPeopleMap[fam.wife] ? extPeopleMap[fam.wife].dn : '';
+        const parents = [dad, mom].filter(Boolean).join(' & ');
+        if (parents) parts.push('⬆ ' + parents);
+        break;
+      }
+    }
+    for (const [fid, fam] of Object.entries(extFamiliesMap)) {
+      if (fam.husb === personId || fam.wife === personId) {
+        const spouseId = fam.husb === personId ? fam.wife : fam.husb;
+        if (spouseId && extPeopleMap[spouseId]) parts.push('⚭ ' + extPeopleMap[spouseId].dn);
+        const kids = (fam.children||[]).map(cid => extPeopleMap[cid]?.dn || '').filter(Boolean);
+        if (kids.length > 0) parts.push('↓ ' + kids.slice(0,4).join(', ') + (kids.length > 4 ? '…' : ''));
+        break;
+      }
+    }
+    return parts.join('  ·  ');
+  }
+
+  // Render breadcrumb for a person — shows FTLS path and optionally external path if different
+  function FamilyPath({personId, showExt, showFtls}) {
+    const fbc = showFtls !== false ? ftlsBreadcrumb(personId) : '';
+    const ebc = showExt !== false ? extBreadcrumb(personId) : '';
+    if (!fbc && !ebc) return null;
+    const same = fbc === ebc;
+    return (
+      <div style={{fontSize:10, lineHeight:1.6, marginTop:2, paddingLeft:20}}>
+        {fbc && <div style={{color:'#8a8578'}}><span style={{color:'#c4a35a',fontSize:9}}>FTLS</span> {fbc}</div>}
+        {ebc && !same && <div style={{color:'#6a8a70'}}><span style={{color:'#6b9e72',fontSize:9}}>EXT</span> {ebc}</div>}
+        {fbc && ebc && !same && <div style={{color:'#d08050',fontSize:9,fontWeight:500}}>⚠ Different family path</div>}
+      </div>
+    );
+  }
 
   // Global select all for changed tab
   const globalChangedDir = (dir) => {
@@ -4148,10 +4217,13 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
                   return (<div key={m.id} style={{ marginBottom:6, border:'1px solid '+BR, borderRadius:8, overflow:'hidden' }}>
                     <div style={{ padding:'7px 12px', background:'rgba(196,163,90,0.04)', display:'flex', alignItems:'center', gap:8 }}>
                       <DirBtn dir={personDir} onSet={(d)=>setPersonDirection(m.id, d)} />
-                      <span onClick={()=>toggleExpand(m.id)} style={{ flex:1, cursor:'pointer', color:TX, fontSize:13 }}>
-                        <span style={{ color:isExp?GC:DM, marginRight:6 }}>{isExp?'▼':'▶'}</span>
-                        {m.ftls.dn||m.ext.dn} <span style={badge('rgba(196,163,90,0.6)')}>{m.diffs.length} diff{m.diffs.length>1?'s':''}</span>
-                      </span>
+                      <div onClick={()=>toggleExpand(m.id)} style={{ flex:1, cursor:'pointer' }}>
+                        <div style={{ color:TX, fontSize:13 }}>
+                          <span style={{ color:isExp?GC:DM, marginRight:6 }}>{isExp?'▼':'▶'}</span>
+                          {m.ftls.dn||m.ext.dn} <span style={badge('rgba(196,163,90,0.6)')}>{m.diffs.length} diff{m.diffs.length>1?'s':''}</span>
+                        </div>
+                        <FamilyPath personId={m.id} />
+                      </div>
                     </div>
                     {isExp && (<div style={{ padding:'8px 12px' }}>
                       <table style={{ width:'100%', fontSize:12, borderCollapse:'collapse' }}>
@@ -4195,12 +4267,15 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
                     <button style={lnkBtn} onClick={()=>setExtDir({})}>Clear All</button>
                     <span style={{ fontSize:11, color:DM }}>{Object.values(extDir).filter(v=>v==='import').length} marked</span>
                   </div>
-                  {persons.map(p => (<div key={p.id} style={{ ...rowSt, display:'flex', alignItems:'center', gap:8 }}>
-                    <DirBtn dir={extDir[p.id]||null} onSet={(d)=>setExtDir(prev=>({...prev,[p.id]:d}))} allowExport={false} />
-                    <span style={{ width:8, height:8, borderRadius:'50%', background:p.g==='M'?MC:FC, flexShrink:0 }} />
-                    <span style={{ color:TX, flex:1 }}>{p.dn||'(Unknown)'}</span>
-                    {p.dob && <span style={{ color:DM, fontSize:11 }}>b.{p.dob}</span>}
-                    <span style={{ color:'#5a5548', fontSize:10 }}>{p.id}</span>
+                  {persons.map(p => (<div key={p.id} style={{ ...rowSt }}>
+                    <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+                      <DirBtn dir={extDir[p.id]||null} onSet={(d)=>setExtDir(prev=>({...prev,[p.id]:d}))} allowExport={false} />
+                      <span style={{ width:8, height:8, borderRadius:'50%', background:p.g==='M'?MC:FC, flexShrink:0 }} />
+                      <span style={{ color:TX, flex:1 }}>{p.dn||'(Unknown)'}</span>
+                      {p.dob && <span style={{ color:DM, fontSize:11 }}>b.{p.dob}</span>}
+                      <span style={{ color:'#5a5548', fontSize:10 }}>{p.id}</span>
+                    </div>
+                    <FamilyPath personId={p.id} showFtls={false} showExt={true} />
                   </div>))}
                 </>}
                 {extFams.length>0 && <>
@@ -4227,12 +4302,15 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
                   <button style={lnkBtn} onClick={()=>setFtlsDir({})}>Clear All</button>
                   <span style={{ fontSize:11, color:DM }}>{Object.values(ftlsDir).filter(v=>v==='export').length} marked</span>
                 </div>
-                {persons.map(p => (<div key={p.id} style={{ ...rowSt, display:'flex', alignItems:'center', gap:8 }}>
-                  <DirBtn dir={ftlsDir[p.id]||null} onSet={(d)=>setFtlsDir(prev=>({...prev,[p.id]:d}))} allowImport={false} />
-                  <span style={{ width:8, height:8, borderRadius:'50%', background:p.g==='M'?MC:FC, flexShrink:0 }} />
-                  <span style={{ color:TX, flex:1 }}>{p.dn||'(Unknown)'}</span>
-                  {p.dob && <span style={{ color:DM, fontSize:11 }}>b.{p.dob}</span>}
-                  <span style={{ color:'#5a5548', fontSize:10 }}>{p.id}</span>
+                {persons.map(p => (<div key={p.id} style={{ ...rowSt }}>
+                  <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+                    <DirBtn dir={ftlsDir[p.id]||null} onSet={(d)=>setFtlsDir(prev=>({...prev,[p.id]:d}))} allowImport={false} />
+                    <span style={{ width:8, height:8, borderRadius:'50%', background:p.g==='M'?MC:FC, flexShrink:0 }} />
+                    <span style={{ color:TX, flex:1 }}>{p.dn||'(Unknown)'}</span>
+                    {p.dob && <span style={{ color:DM, fontSize:11 }}>b.{p.dob}</span>}
+                    <span style={{ color:'#5a5548', fontSize:10 }}>{p.id}</span>
+                  </div>
+                  <FamilyPath personId={p.id} showFtls={true} showExt={false} />
                 </div>))}
               </div>);
             })()}
@@ -4243,6 +4321,8 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
               {diffResult.fuzzyMatched.map(m => (<div key={m.extId} style={{ marginBottom:8, border:'1px solid rgba(208,160,126,0.3)', borderRadius:8, padding:12 }}>
                 <div style={{ fontSize:13, color:TX, marginBottom:4 }}>{m.ext.dn||'?'} <span style={{ fontSize:10, color:DM }}>score:{m.score}</span></div>
                 <div style={{ fontSize:11, color:DM }}>Ext: <span style={{ color:'#7eb8d0' }}>{m.extId}</span> → FTLS: <span style={{ color:GC }}>{m.ftlsId}</span></div>
+                <FamilyPath personId={m.ftlsId} />
+                <div style={{fontSize:10,color:'#6a8a70',marginTop:2,paddingLeft:4}}><span style={{color:'#7eb8d0',fontSize:9}}>EXT ID</span> {extBreadcrumb(m.extId)}</div>
                 {m.diffs.length>0 && <div style={{ fontSize:11, color:'#d0a07e', marginTop:4 }}>{m.diffs.map(d=>d.label).join(', ')}</div>}
               </div>))}
             </div>)}
