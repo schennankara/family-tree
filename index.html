@@ -34,8 +34,8 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.6.0';
-    const BUILD_DATE = '2026-04-12';
+    const APP_VERSION = 'v4.7.0';
+    const BUILD_DATE = '2026-04-13';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
 
@@ -193,6 +193,7 @@ function buildTreeFromDB(persons, families) {
       fb:p.facebook, ig:p.instagram, li:p.linkedin, ws:p.website,
       pp:p.profile_photo, bio:p.bio, loc:p.location, prof:p.profession, emp:p.employer,
       stories:p.stories, notes:p.notes, pgl:p.photo_gallery_link, dl:p.documents_link,
+      tp:p.title_prefix, burd:p.burial_date, _xg:p._extra_gedcom,
       _fams: [], _famc: [],
     };
   });
@@ -285,6 +286,8 @@ async function savePerson(person, editUser) {
     location: person.loc||'', profession: person.prof||'', employer: person.emp||'',
     stories: person.stories||'', notes: person.notes||'',
     photo_gallery_link: person.pgl||'', documents_link: person.dl||'',
+    title_prefix: person.tp||'', burial_date: person.burd||'',
+    _extra_gedcom: person._xg||'',
     updated_by: editUser||'',
   };
   
@@ -927,10 +930,13 @@ function exportTreeToGedcom(tree, personMap, familyMap) {
     // FAMC refs (families where this person is a child)
     (famcLookup[pid] || []).forEach(ref => L.push(`1 FAMC ${ref}`));
 
-    // CHAN
-    L.push('1 CHAN');
-    L.push(`2 DATE ${gedcomDate()}`);
-    L.push(`3 TIME ${gedcomTime()}`);
+    // Preserved extra GEDCOM lines (OBJE, RESI, BURI, _CRE, CHAN, etc.)
+    if (person._xg) { person._xg.split('\n').forEach(xl => { if (xl.trim()) L.push(xl); }); }
+    else {
+      L.push('1 CHAN');
+      L.push(`2 DATE ${gedcomDate()}`);
+      L.push(`3 TIME ${gedcomTime()}`);
+    }
 
     return L;
   }
@@ -949,6 +955,8 @@ function exportTreeToGedcom(tree, personMap, familyMap) {
       if (mplace) L.push(`2 PLAC ${mplace}`);
     }
     (fam.children || []).forEach(cid => L.push(`1 CHIL ${cid}`));
+    // Preserved extra GEDCOM lines for family
+    if (fam._extra_gedcom) { fam._extra_gedcom.split('\n').forEach(xl => { if (xl.trim()) L.push(xl); }); }
     return L;
   }
 
@@ -1039,8 +1047,33 @@ function exportTreeToGedcom(tree, personMap, familyMap) {
   return lines.join('\n') + '\n';
 }
 
-function downloadGedcom(tree, personMap, familyMap) {
-  const content = exportTreeToGedcom(tree, personMap, familyMap);
+async function downloadGedcom(tree, personMap, familyMap) {
+  // Load gedcom_meta records (OBJE, NOTE) for lossless export
+  let metaLines = [];
+  try {
+    const meta = await sbFetch('gedcom_meta?select=*');
+    if (meta && meta.length > 0) {
+      // Collect referenced OBJE IDs from persons
+      const referencedObje = new Set();
+      for (const p of Object.values(personMap)) {
+        if (p._xg) {
+          const matches = p._xg.match(/1 OBJE (@[^@]+@)/g);
+          if (matches) matches.forEach(m => referencedObje.add(m.replace('1 OBJE ', '')));
+        }
+      }
+      for (const m of meta) {
+        if (referencedObje.has(m.id) || m.record_type === 'NOTE') {
+          metaLines.push(m.raw_gedcom);
+        }
+      }
+    }
+  } catch(e) { console.warn('Could not load gedcom_meta:', e); }
+
+  let content = exportTreeToGedcom(tree, personMap, familyMap);
+  // Insert meta records before TRLR
+  if (metaLines.length > 0) {
+    content = content.replace('0 TRLR', metaLines.join('\n') + '\n0 TRLR');
+  }
   const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -1398,7 +1431,9 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap) 
     // FAMS/FAMC from FULL family map
     (famsLookup[pid] || []).forEach(ref => L.push(`1 FAMS ${ref}`));
     (famcLookup[pid] || []).forEach(ref => L.push(`1 FAMC ${ref}`));
-    L.push('1 CHAN'); L.push(`2 DATE ${gedcomDate()}`); L.push(`3 TIME ${gedcomTime()}`);
+    // Preserved extra GEDCOM lines (OBJE, RESI, BURI, _CRE, CHAN, etc.)
+    if (person._xg) { person._xg.split('\n').forEach(xl => { if (xl.trim()) L.push(xl); }); }
+    else { L.push('1 CHAN'); L.push(`2 DATE ${gedcomDate()}`); L.push(`3 TIME ${gedcomTime()}`); }
     lines.push(...L);
   }
 
@@ -1439,6 +1474,23 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap) 
     if (md || mp) { F.push('1 MARR'); if (md) F.push(`2 DATE ${md}`); if (mp) F.push(`2 PLAC ${mp}`); }
     kids.forEach(c => F.push(`1 CHIL ${c}`));
     lines.push(...F);
+  }
+
+  // Include OBJE records referenced by exported persons (from gedcom_meta if available)
+  // These will be loaded async before calling this function
+  if (window.gedcomMetaRecords && window.gedcomMetaRecords.length > 0) {
+    const referencedObje = new Set();
+    for (const [pid, person] of Object.entries(pMap)) {
+      if (person._xg) {
+        const objeMatches = person._xg.match(/1 OBJE (@[^@]+@)/g);
+        if (objeMatches) objeMatches.forEach(m => referencedObje.add(m.replace('1 OBJE ', '')));
+      }
+    }
+    for (const meta of window.gedcomMetaRecords) {
+      if (referencedObje.has(meta.id) || meta.record_type === 'NOTE') {
+        lines.push(meta.raw_gedcom);
+      }
+    }
   }
 
   lines.push('0 TRLR');
@@ -1574,6 +1626,8 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
     if (p.dl) L.push(`1 _DOCUMENTS ${p.dl}`);
     (famsLookup2[p.id] || []).forEach(ref => L.push(`1 FAMS ${ref}`));
     (famcLookup2[p.id] || []).forEach(ref => L.push(`1 FAMC ${ref}`));
+    // Preserved extra GEDCOM lines (OBJE, RESI, BURI, _CRE, CHAN, etc.)
+    if (p._xg) { p._xg.split('\n').forEach(xl => { if (xl.trim()) L.push(xl); }); }
     return L;
   }
 
@@ -1585,6 +1639,10 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
   for (const p of existingPersons) exportPMap[p.id] = p;
 
   // Full INDI replacement for whole-person exports
+  // BUT: preserve unknown tags (OBJE, RESI, BURI, _CRE, CHAN) from original if _xg is empty
+  const KNOWN_EXPORT_L1 = new Set(['NAME','SEX','BIRT','DEAT','ADDR','EMAI','EMAIL','PHON',
+    '_FACEBOOK','_INSTAGRAM','_LINKEDIN','WWW','_PHOTO','OCCU','_EMPLOYER',
+    'NOTE','_PHOTOGALLERY','_DOCUMENTS','FAMC','FAMS']);
   for (let i = before.length - 1; i >= 0; i--) {
     const m = before[i].match(/^0 (@[^@]+@) INDI/);
     if (!m || !fullReplaceIds.has(m[1])) continue;
@@ -1592,6 +1650,28 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
     if (!p) continue;
     let j = i + 1;
     while (j < before.length && !before[j].trim().startsWith('0 ')) j++;
+    // If person has no _xg, extract unknown tags from original block to preserve them
+    if (!p._xg) {
+      const origLines = before.slice(i+1, j);
+      const preserved = [];
+      let k = 0;
+      while (k < origLines.length) {
+        const op = origLines[k].trim().split(' ', 2);
+        if (op[0] === '1' && !KNOWN_EXPORT_L1.has(op[1])) {
+          preserved.push(origLines[k].trim());
+          k++;
+          while (k < origLines.length && origLines[k].trim().split(' ',2)[0] !== '1') {
+            preserved.push(origLines[k].trim());
+            k++;
+          }
+          continue;
+        }
+        k++;
+      }
+      if (preserved.length > 0) {
+        p._xg = preserved.join('\n');
+      }
+    }
     before.splice(i, j - i, ...buildReplacementIndi(p));
   }
 
@@ -2695,7 +2775,7 @@ function ViewerIdentityModal({submitData, flat, onDone, onCancel}) {
   );
 }
 
-function AdminPanel({onClose, onReloadTree, onShowMigrate, onShowDiff}) {
+function AdminPanel({onClose, onReloadTree, onShowMigrate, onShowDiff, onShowBackfill}) {
   const [tab, setTab] = useState('updates'); // 'updates' | 'accounts' | 'users' | 'log' | 'tools'
   const [updateReqs, setUpdateReqs] = useState([]);
   const [accessReqs, setAccessReqs] = useState([]);
@@ -3162,6 +3242,12 @@ function AdminPanel({onClose, onReloadTree, onShowMigrate, onShowDiff}) {
             <div style={{fontSize:14,color:'#6b9e72',fontWeight:500,marginBottom:8}}>🔀 Diff &amp; Merge</div>
             <div style={{fontSize:12,color:'#7a7568',lineHeight:1.6,marginBottom:12}}>Compare an external GEDCOM against FTLS. Selectively import new data or export FTLS additions. Safe — uses basket workflow with confirmation.</div>
             <button onClick={onShowDiff} style={{background:'rgba(107,158,114,0.08)',border:'1px solid rgba(107,158,114,0.3)',color:'#6b9e72',padding:'8px 18px',borderRadius:6,cursor:'pointer',fontSize:13}}>🔀 Open Diff &amp; Merge</button>
+          </div>
+          <div style={{flex:'1 1 300px',background:'rgba(90,163,196,0.04)',border:'1px solid rgba(90,163,196,0.15)',borderRadius:8,padding:16}}>
+            <div style={{fontSize:14,color:'#5aa3c4',fontWeight:500,marginBottom:8}}>📦 Backfill GEDCOM Extras</div>
+            <div style={{fontSize:12,color:'#7a7568',lineHeight:1.6,marginBottom:12}}>Parse a GEDCOM and populate _extra_gedcom, addresses, titles, burial dates for existing persons. Safe — only fills empty fields, matches by ID, never touches names or family links.</div>
+            <button onClick={onShowBackfill} style={{background:'rgba(90,163,196,0.08)',border:'1px solid rgba(90,163,196,0.3)',color:'#5aa3c4',padding:'8px 18px',borderRadius:6,cursor:'pointer',fontSize:13}}>📦 Open Backfill Tool</button>
+            <div style={{fontSize:10,color:'#7a7568',marginTop:8}}>✓ Non-destructive — only adds missing data</div>
           </div>
         </div>
       </div>}
@@ -3940,6 +4026,8 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
       if (!persons.find(p => p.id === e.person.id)) persons.push(e.person);
     });
     if (persons.length === 0) { alert('No items to export.'); return; }
+    // Load gedcom_meta records (OBJE, NOTE) so export can include them
+    try { window.gedcomMetaRecords = await sbFetch('gedcom_meta?select=*'); } catch(e) { window.gedcomMetaRecords = []; }
     const content = exportDiffGedcom(persons, familyMap, extFamilyIds, extFamiliesMap);
     const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob); const a = document.createElement('a');
@@ -4438,6 +4526,387 @@ function MoveBranchModal({ node, personMap, familyMap, flat, tree, user, onMove,
 }
 
 /* ───── APP ───── */
+/* ───── BACKFILL MODAL ─────
+   Parses a GEDCOM file and safely populates _extra_gedcom, address, title_prefix, 
+   burial_date for existing persons in Supabase. Only fills empty fields, matches by ID,
+   never touches names, family links, or any field that already has data.
+*/
+function BackfillModal({onClose, onComplete}) {
+  const [status, setStatus] = useState('idle'); // idle | parsing | preview | running | done
+  const [log, setLog] = useState([]);
+  const [preview, setPreview] = useState(null);
+  const [progress, setProgress] = useState('');
+  const fileRef = useRef(null);
+
+  const addLog = (msg) => setLog(prev => [...prev, msg]);
+
+  // Parse address from GEDCOM RESI data
+  function parseAddress(addr) {
+    if (!addr) return null;
+    addr = addr.trim();
+    let m = addr.match(/^(.+?),(.+?),,([A-Z]{2})-(\d{5}(?:-\d{4})?),USA$/);
+    if (m) return {a1:m[1].trim(),ci:m[2].trim(),st:m[3],zp:m[4],co:'US'};
+    m = addr.match(/^(.+?),\s*(.+?),\s*([A-Z]{2})\s+(\d{5}(?:-\d{4})?)$/);
+    if (m) return {a1:m[1].trim(),ci:m[2].trim(),st:m[3],zp:m[4],co:'US'};
+    m = addr.match(/^(.+?),\s*(.+?),\s*([A-Z]{2})\s*(\d{5})$/);
+    if (m) return {a1:m[1].trim(),ci:m[2].trim(),st:m[3],zp:m[4],co:'US'};
+    m = addr.match(/^(.+?),\s*(.+?),\s*([A-Z]{2}\d+\s+\d[A-Z]{2})\s+UK$/);
+    if (m) return {a1:m[1].trim(),ci:m[2].trim(),zp:m[3],co:'GB'};
+    if (addr.includes('India')) return {a1:addr,co:'IN'};
+    if (!addr.includes(',') && addr.length < 30) return {ci:addr};
+    return {a1:addr};
+  }
+
+  async function handleFile(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    setStatus('parsing');
+    setLog([]);
+    addLog(`Reading ${file.name}...`);
+
+    const text = await file.text();
+    const raw = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    const lines = raw.split('\n').filter(l => l.trim());
+
+    // ─── Parse standalone NOTE records ───
+    const notes = {};
+    let noteId = null, noteLines = [], noteRaw = [];
+    for (const line of lines) {
+      const parts = line.trim().split(' ', 3);
+      if (parts[0] === '0') {
+        if (noteId) notes[noteId] = {text: noteLines.join('\n'), raw: noteRaw.join('\n')};
+        noteId = null; noteLines = []; noteRaw = [];
+        const nm = line.trim().match(/^0 (@[^@]+@) NOTE(.*)/);
+        if (nm) { noteId = nm[1]; noteRaw = [line.trim()]; const r = nm[2].trim(); if (r) noteLines.push(r); }
+      } else if (noteId) {
+        noteRaw.push(line.trim());
+        if (parts.length > 1 && (parts[1] === 'CONT' || parts[1] === 'CONC')) {
+          const v = line.trim().split(' ', 3)[2] || '';
+          if (parts[1] === 'CONT') noteLines.push(v); 
+          else if (noteLines.length) noteLines[noteLines.length-1] += v; else noteLines.push(v);
+        }
+      }
+    }
+    if (noteId) notes[noteId] = {text: noteLines.join('\n'), raw: noteRaw.join('\n')};
+
+    // ─── Parse OBJE records ───
+    const objeRecords = {};
+    let inObje = false, objeId = null, objeRaw = [];
+    for (const line of lines) {
+      const parts = line.trim().split(' ', 3);
+      if (parts[0] === '0') {
+        if (inObje && objeId) objeRecords[objeId] = objeRaw.join('\n');
+        const om = line.trim().match(/^0 (@[^@]+@) OBJE/);
+        inObje = !!om; objeId = om ? om[1] : null; objeRaw = om ? [line.trim()] : [];
+      } else if (inObje) { objeRaw.push(line.trim()); }
+    }
+    if (inObje && objeId) objeRecords[objeId] = objeRaw.join('\n');
+
+    // ─── Parse INDI records for extra data ───
+    const KNOWN_L1 = new Set(['NAME','SEX','BIRT','DEAT','ADDR','EMAI','EMAIL','PHON',
+      '_FACEBOOK','_INSTAGRAM','_LINKEDIN','WWW','_PHOTO','OCCU','_EMPLOYER',
+      'NOTE','_PHOTOGALLERY','_DOCUMENTS','FAMC','FAMS']);
+
+    const personExtras = {}; // pid → {extraLines, address, titlePrefix, burialDate, prof}
+    let inIndi = false, curPid = null, curBlock = [];
+
+    function processBlock(pid, block) {
+      const result = {extraLines:[], address:null, titlePrefix:'', burialDate:'', prof:''};
+      let i = 0;
+      while (i < block.length) {
+        const p = block[i].trim().split(' ', 3);
+        const lv = p[0], tag = p[1] || '', val = p[2] || '';
+        
+        function collectBlock(startI) {
+          const out = [block[startI].trim()];
+          let j = startI + 1;
+          while (j < block.length) {
+            const np = block[j].trim().split(' ', 3);
+            if (np[0] === '1' || np[0] === '0') break;
+            out.push(block[j].trim());
+            j++;
+          }
+          return [out, j];
+        }
+
+        if (lv === '1') {
+          if (tag === 'OBJE') {
+            const [bl, ni] = collectBlock(i); result.extraLines.push(...bl); i = ni; continue;
+          }
+          if (tag === 'BURI') {
+            const [bl, ni] = collectBlock(i); result.extraLines.push(...bl);
+            for (const cl of bl) { const cp = cl.trim().split(' ',3); if (cp[1]==='DATE'&&cp[2]) result.burialDate=cp[2]; }
+            i = ni; continue;
+          }
+          if (tag === 'RESI') {
+            const [bl, ni] = collectBlock(i); result.extraLines.push(...bl);
+            for (const cl of bl) {
+              const cp = cl.trim().split(' ', 3);
+              if (cp[1]==='NOTE' && cp[2] && cp[2].startsWith('@') && notes[cp[2]]) {
+                result.address = parseAddress(notes[cp[2]].text);
+              } else if (cp[1]==='PLAC' && cp[2] && !result.address) {
+                result.address = parseAddress(cp[2]);
+              }
+            }
+            i = ni; continue;
+          }
+          if (tag === 'NAME') {
+            i++;
+            while (i < block.length) {
+              const np = block[i].trim().split(' ', 3);
+              if (np[0]==='1'||np[0]==='0') break;
+              if (np[1]==='NPFX'&&np[2]) result.titlePrefix = np[2];
+              if (np[1]==='_CRE') { const [bl2,ni2]=collectBlock(i); result.extraLines.push(...bl2); i=ni2; continue; }
+              i++;
+            }
+            continue;
+          }
+          if (['_CRE','_STP','_STO','CHAN'].includes(tag)) {
+            const [bl, ni] = collectBlock(i); result.extraLines.push(...bl); i = ni; continue;
+          }
+          if (tag === 'OCCU') {
+            result.prof = val;
+            const [bl, ni] = collectBlock(i);
+            for (const cl of bl.slice(1)) result.extraLines.push(cl);
+            i = ni; continue;
+          }
+          if (!KNOWN_L1.has(tag)) {
+            const [bl, ni] = collectBlock(i); result.extraLines.push(...bl); i = ni; continue;
+          }
+        }
+        i++;
+      }
+      return result;
+    }
+
+    for (const line of lines) {
+      const stripped = line.trim();
+      const parts = stripped.split(' ', 3);
+      if (parts[0] === '0') {
+        if (inIndi && curPid && curBlock.length) personExtras[curPid] = processBlock(curPid, curBlock);
+        const im = stripped.match(/^0 (@[^@]+@) INDI/);
+        inIndi = !!im; curPid = im ? im[1] : null; curBlock = [];
+      } else if (inIndi) { curBlock.push(stripped); }
+    }
+    if (inIndi && curPid && curBlock.length) personExtras[curPid] = processBlock(curPid, curBlock);
+
+    // ─── Parse FAM extra data ───
+    const famExtras = {};
+    const KNOWN_FAM = new Set(['HUSB','WIFE','CHIL','MARR']);
+    let inFam = false, famId = null, famBlock = [];
+    for (const line of lines) {
+      const stripped = line.trim();
+      const parts = stripped.split(' ', 3);
+      if (parts[0] === '0') {
+        if (inFam && famId && famBlock.length) {
+          const extra = [];
+          let fi = 0;
+          while (fi < famBlock.length) {
+            const fp = famBlock[fi].trim().split(' ',3);
+            if (fp[0]==='1' && !KNOWN_FAM.has(fp[1])) {
+              extra.push(famBlock[fi].trim());
+              fi++;
+              while (fi < famBlock.length) { const np=famBlock[fi].trim().split(' ',3); if(np[0]==='1')break; extra.push(famBlock[fi].trim()); fi++; }
+              continue;
+            }
+            fi++;
+          }
+          if (extra.length) famExtras[famId] = extra.join('\n');
+        }
+        const fm = stripped.match(/^0 (@[^@]+@) FAM/);
+        inFam = !!fm; famId = fm ? fm[1] : null; famBlock = [];
+      } else if (inFam) { famBlock.push(stripped); }
+    }
+
+    // ─── Match against existing DB ───
+    addLog('Loading current persons from Supabase...');
+    let dbPersons, dbFamilies;
+    try {
+      dbPersons = await sbFetch('persons?select=id,display_name,address1,city,state,zip,country,profession,title_prefix,burial_date,_extra_gedcom');
+      dbFamilies = await sbFetch('families?select=id,_extra_gedcom');
+    } catch(e) { addLog('ERROR: ' + e.message); setStatus('idle'); return; }
+
+    const dbPMap = {};
+    dbPersons.forEach(p => dbPMap[p.id] = p);
+    const dbFMap = {};
+    dbFamilies.forEach(f => dbFMap[f.id] = f);
+
+    // Build preview
+    const updates = { persons: [], families: [], obje: [], notes: [] };
+
+    for (const [pid, data] of Object.entries(personExtras)) {
+      if (!dbPMap[pid]) continue; // Not in DB — skip (don't add new people)
+      const db = dbPMap[pid];
+      const changes = {};
+      
+      // Only fill _extra_gedcom if currently empty
+      if (data.extraLines.length > 0 && (!db._extra_gedcom || db._extra_gedcom === '')) {
+        changes._extra_gedcom = data.extraLines.join('\n');
+      }
+      // Fill address fields only if currently empty
+      if (data.address) {
+        if (data.address.a1 && (!db.address1 || db.address1 === '')) changes.address1 = data.address.a1;
+        if (data.address.ci && (!db.city || db.city === '')) changes.city = data.address.ci;
+        if (data.address.st && (!db.state || db.state === '')) changes.state = data.address.st;
+        if (data.address.zp && (!db.zip || db.zip === '')) changes.zip = data.address.zp;
+        if (data.address.co && (!db.country || db.country === '')) changes.country = data.address.co;
+      }
+      if (data.titlePrefix && (!db.title_prefix || db.title_prefix === '')) changes.title_prefix = data.titlePrefix;
+      if (data.burialDate && (!db.burial_date || db.burial_date === '')) changes.burial_date = data.burialDate;
+      if (data.prof && (!db.profession || db.profession === '')) changes.profession = data.prof;
+
+      if (Object.keys(changes).length > 0) {
+        updates.persons.push({id: pid, name: db.display_name, changes});
+      }
+    }
+
+    for (const [fid, extra] of Object.entries(famExtras)) {
+      if (!dbFMap[fid]) continue;
+      if (!dbFMap[fid]._extra_gedcom || dbFMap[fid]._extra_gedcom === '') {
+        updates.families.push({id: fid, changes: {_extra_gedcom: extra}});
+      }
+    }
+
+    for (const [oid, raw] of Object.entries(objeRecords)) updates.obje.push({id: oid, raw});
+    for (const [nid, data] of Object.entries(notes)) updates.notes.push({id: nid, raw: data.raw});
+
+    const hasAddr = updates.persons.filter(p => p.changes.address1 || p.changes.city).length;
+    const hasExtra = updates.persons.filter(p => p.changes._extra_gedcom).length;
+    const hasTitle = updates.persons.filter(p => p.changes.title_prefix).length;
+    const hasBuri = updates.persons.filter(p => p.changes.burial_date).length;
+
+    addLog(`Parsed: ${Object.keys(personExtras).length} persons, ${Object.keys(famExtras).length} families`);
+    addLog(`Matched to DB: ${updates.persons.length} persons with changes, ${updates.families.length} families`);
+    addLog(`  → ${hasAddr} addresses, ${hasTitle} titles, ${hasBuri} burial dates, ${hasExtra} extra GEDCOM blocks`);
+    addLog(`  → ${updates.obje.length} OBJE records, ${updates.notes.length} NOTE records for gedcom_meta`);
+
+    setPreview(updates);
+    setStatus('preview');
+  }
+
+  async function runBackfill() {
+    if (!preview) return;
+    setStatus('running');
+    let successP = 0, successF = 0, successM = 0, errors = 0;
+
+    // Update persons in batches
+    for (let i = 0; i < preview.persons.length; i++) {
+      const {id, changes} = preview.persons[i];
+      try {
+        await sbFetch(`persons?id=eq.${encodeURIComponent(id)}`, {
+          method: 'PATCH',
+          body: JSON.stringify(changes),
+          headers: {'Prefer': 'return=minimal'}
+        });
+        successP++;
+      } catch(e) { errors++; if (errors <= 5) addLog(`Error ${id}: ${e.message}`); }
+      if (i % 20 === 0) setProgress(`Persons: ${i+1}/${preview.persons.length}`);
+    }
+    addLog(`Persons updated: ${successP} (${errors} errors)`);
+
+    // Update families
+    setProgress('Updating families...');
+    for (const {id, changes} of preview.families) {
+      try {
+        await sbFetch(`families?id=eq.${encodeURIComponent(id)}`, {
+          method: 'PATCH',
+          body: JSON.stringify(changes),
+          headers: {'Prefer': 'return=minimal'}
+        });
+        successF++;
+      } catch(e) { errors++; }
+    }
+    addLog(`Families updated: ${successF}`);
+
+    // Insert gedcom_meta (OBJE + NOTE)
+    setProgress('Inserting OBJE/NOTE records...');
+    const allMeta = [
+      ...preview.obje.map(o => ({id: o.id, record_type: 'OBJE', raw_gedcom: o.raw})),
+      ...preview.notes.map(n => ({id: n.id, record_type: 'NOTE', raw_gedcom: n.raw}))
+    ];
+    // Batch insert
+    for (let i = 0; i < allMeta.length; i += 20) {
+      const batch = allMeta.slice(i, i + 20);
+      try {
+        await sbFetch('gedcom_meta?on_conflict=id', {
+          method: 'POST',
+          body: JSON.stringify(batch),
+          headers: {'Prefer': 'return=minimal,resolution=merge-duplicates'}
+        });
+        successM += batch.length;
+      } catch(e) { 
+        // Fall back to individual inserts
+        for (const item of batch) {
+          try {
+            await sbFetch('gedcom_meta?on_conflict=id', {
+              method: 'POST', body: JSON.stringify(item),
+              headers: {'Prefer': 'return=minimal,resolution=merge-duplicates'}
+            });
+            successM++;
+          } catch(e2) { errors++; }
+        }
+      }
+    }
+    addLog(`Gedcom_meta inserted: ${successM}`);
+    addLog(`Done! ${successP} persons, ${successF} families, ${successM} meta records. ${errors} errors.`);
+    setProgress('');
+    setStatus('done');
+  }
+
+  const overlay = {position:'fixed',top:0,left:0,right:0,bottom:0,background:'rgba(0,0,0,0.7)',zIndex:400,display:'flex',alignItems:'center',justifyContent:'center'};
+  const modal = {background:'#141410',border:'1px solid rgba(90,163,196,0.2)',borderRadius:12,width:Math.min(600,window.innerWidth-32),maxHeight:'80vh',overflow:'auto',padding:28};
+  const btnPrimary = {background:'rgba(90,163,196,0.15)',border:'1px solid rgba(90,163,196,0.4)',color:'#5aa3c4',padding:'10px 24px',borderRadius:6,cursor:'pointer',fontSize:14,fontWeight:500};
+
+  return (
+    <div style={overlay} onClick={onClose}>
+      <div style={modal} onClick={e=>e.stopPropagation()}>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
+          <div style={{fontSize:18,color:'#5aa3c4',fontWeight:300}}>📦 Backfill GEDCOM Extras</div>
+          <span onClick={onClose} style={{color:'#7a7568',cursor:'pointer',fontSize:20}}>✕</span>
+        </div>
+        <div style={{fontSize:12,color:'#7a7568',lineHeight:1.6,marginBottom:16}}>
+          Upload the original GEDCOM file. This will safely populate <strong style={{color:'#d4cfc0'}}>_extra_gedcom</strong> (OBJE, RESI, BURI, CHAN, _CRE),
+          plus address, title prefix, burial date, and profession fields — <strong style={{color:'#6b9e72'}}>only where the DB field is currently empty</strong>. 
+          It matches by person ID and never touches names, family links, or existing data.
+        </div>
+
+        {status==='idle'&&<div>
+          <input ref={fileRef} type="file" accept=".ged,.GED" onChange={handleFile} style={{display:'none'}}/>
+          <button onClick={()=>fileRef.current?.click()} style={btnPrimary}>Choose GEDCOM File</button>
+        </div>}
+
+        {log.length > 0 && <div style={{background:'#0a0a08',border:'1px solid rgba(90,163,196,0.1)',borderRadius:6,padding:12,marginTop:12,maxHeight:200,overflow:'auto',fontSize:12,fontFamily:'monospace',color:'#8a8578',lineHeight:1.8}}>
+          {log.map((l,i) => <div key={i}>{l}</div>)}
+        </div>}
+
+        {progress && <div style={{fontSize:12,color:'#5aa3c4',marginTop:8}}>{progress}</div>}
+
+        {status==='preview'&&preview&&<div style={{marginTop:16}}>
+          <div style={{fontSize:14,color:'#d4cfc0',marginBottom:8}}>Preview — {preview.persons.length} persons, {preview.families.length} families, {preview.obje.length + preview.notes.length} meta records</div>
+          <div style={{maxHeight:200,overflow:'auto',fontSize:11,fontFamily:'monospace',background:'#0a0a08',borderRadius:6,padding:10,border:'1px solid rgba(196,163,90,0.1)'}}>
+            {preview.persons.slice(0,30).map((p,i) => {
+              const fields = Object.keys(p.changes).filter(k => k !== '_extra_gedcom');
+              const hasXg = !!p.changes._extra_gedcom;
+              return <div key={i} style={{color:'#8a8578',marginBottom:2}}>
+                <span style={{color:'#c4a35a'}}>{p.name || p.id}</span>: {fields.length > 0 ? fields.join(', ') : ''}{hasXg ? (fields.length > 0 ? ' + ' : '') + '_extra_gedcom' : ''}
+              </div>;
+            })}
+            {preview.persons.length > 30 && <div style={{color:'#5a5548'}}>... and {preview.persons.length - 30} more</div>}
+          </div>
+          <div style={{display:'flex',gap:12,marginTop:16}}>
+            <button onClick={runBackfill} style={btnPrimary}>✓ Run Backfill ({preview.persons.length} persons)</button>
+            <button onClick={onClose} style={{...btnPrimary,background:'transparent',color:'#7a7568',borderColor:'rgba(122,117,104,0.3)'}}>Cancel</button>
+          </div>
+        </div>}
+
+        {status==='done'&&<div style={{marginTop:16}}>
+          <button onClick={onComplete} style={btnPrimary}>✓ Close &amp; Refresh Tree</button>
+        </div>}
+      </div>
+    </div>
+  );
+}
+
 function App(){
   const [tree,setTree]=useState(null);
   const [personMap,setPersonMap]=useState({});
@@ -4464,6 +4933,7 @@ function App(){
   const [showPasswordReset,setShowPasswordReset]=useState(false);
   const [resetToken,setResetToken]=useState(null);
   const [showDiff,setShowDiff]=useState(false);
+  const [showBackfill,setShowBackfill]=useState(false);
   const [movingBranch,setMovingBranch]=useState(null); // person node to move
   const flat=useMemo(()=>tree?flattenAll(tree):[],[tree]);
 
@@ -5047,7 +5517,7 @@ function App(){
       {spouseEditing&&<EditForm node={spouseEditing.spouse||empty()} onSave={handleSaveSpouse} onCancel={()=>setSpouseEditing(null)} isNew={false}/>}
       {adding&&<EditForm node={empty()} onSave={handleAdd} onCancel={()=>setAdding(null)} isNew={true} parentId={adding} parentName={flat.find(n=>n.id===adding)?._n}/>}
       </>}
-      {activeTab==='admin'&&user&&isAdmin()&&<AdminPanel onReloadTree={()=>reloadTree(true)} onShowMigrate={()=>setShowMigrate(true)} onShowDiff={()=>setShowDiff(true)}/>}
+      {activeTab==='admin'&&user&&isAdmin()&&<AdminPanel onReloadTree={()=>reloadTree(true)} onShowMigrate={()=>setShowMigrate(true)} onShowDiff={()=>setShowDiff(true)} onShowBackfill={()=>setShowBackfill(true)}/>}
       
       {/* ───── PHOTOS GALLERY TAB ───── */}
       {activeTab==='photos'&&user&&<PhotoGallery flat={flat} user={user}/>}
@@ -5056,6 +5526,7 @@ function App(){
       {showViewerIdentity&&viewerSubmitData&&<ViewerIdentityModal submitData={viewerSubmitData} flat={flat} onDone={()=>{setShowViewerIdentity(false);setViewerSubmitData(null);setMsg('Update request submitted!')}} onCancel={()=>{setShowViewerIdentity(false);setViewerSubmitData(null)}}/>}
       {showMigrate&&<MigrateDialog onDone={()=>setShowMigrate(false)} onCancel={()=>setShowMigrate(false)}/>}
       {showDiff&&<GedcomDiffModal onClose={()=>setShowDiff(false)} personMap={personMap} familyMap={familyMap} user={user} onMergeComplete={()=>{setShowDiff(false);setMsg('Merging complete — refreshing...');reloadTree(false)}}/>}
+      {showBackfill&&<BackfillModal onClose={()=>setShowBackfill(false)} onComplete={()=>{setShowBackfill(false);setMsg('Backfill complete — refreshing...');reloadTree(false)}}/>}
       {movingBranch&&<MoveBranchModal node={movingBranch} personMap={personMap} familyMap={familyMap} flat={flat} tree={tree} user={user} onMove={handleMove} onRequestMove={handleRequestMove} onClose={()=>setMovingBranch(null)}/>}
       {user&&user.role!=='viewer'&&<div style={{position:'fixed',bottom:16,right:16,background:CD,border:'1px solid '+BR,borderRadius:8,padding:'8px 14px',fontSize:11,color:DM,zIndex:80,display:'flex',alignItems:'center',gap:8}}>
         <span style={{width:6,height:6,borderRadius:'50%',background:MC}}/>
