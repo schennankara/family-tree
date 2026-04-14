@@ -1096,11 +1096,16 @@ function diffPerson(ftls, ext) {
     ['a1','Address'],['ci','City'],['st','State'],['co','Country'],['zp','Zip'],
     ['notes','Notes'],['bio','Bio']
   ];
+  // Fields where "FTLS has data, external is empty" is not a meaningful diff
+  // (data came from RESI/NOTE backfill, not directly parseable from INDI record)
+  const skipIfExtEmpty = new Set(['a1','ci','st','co','zp','ph','em','prof','tp','burd']);
   const diffs = [];
   for (const [key, label] of fields) {
     const fVal = (ftls[key]||'').toString().trim();
     const eVal = (ext[key]||'').toString().trim();
     if (fVal !== eVal && (fVal || eVal)) {
+      // Skip noise: FTLS has data from backfill, external is empty
+      if (skipIfExtEmpty.has(key) && fVal && !eVal) continue;
       diffs.push({ key, label, ftls: fVal, ext: eVal });
     }
   }
