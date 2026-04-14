@@ -1096,16 +1096,11 @@ function diffPerson(ftls, ext) {
     ['a1','Address'],['ci','City'],['st','State'],['co','Country'],['zp','Zip'],
     ['notes','Notes'],['bio','Bio']
   ];
-  // Fields where "FTLS has data, external is empty" is not a meaningful diff
-  // (data came from RESI/NOTE backfill, not directly parseable from INDI record)
-  const skipIfExtEmpty = new Set(['a1','ci','st','co','zp','ph','em','prof','tp','burd']);
   const diffs = [];
   for (const [key, label] of fields) {
     const fVal = (ftls[key]||'').toString().trim();
     const eVal = (ext[key]||'').toString().trim();
     if (fVal !== eVal && (fVal || eVal)) {
-      // Skip noise: FTLS has data from backfill, external is empty
-      if (skipIfExtEmpty.has(key) && fVal && !eVal) continue;
       diffs.push({ key, label, ftls: fVal, ext: eVal });
     }
   }
@@ -4207,15 +4202,25 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
 
             {/* ──── CHANGED ──── */}
             {tab==='changed' && (()=>{
-              const items = diffResult.matched.filter(m=>m.diffs.length>0);
+              const addressKeys = new Set(['a1','ci','st','co','zp']);
+              const allItems = diffResult.matched.filter(m=>m.diffs.length>0);
+              const hasNonAddr = (m) => m.diffs.some(d => !addressKeys.has(d.key));
+              const nameOrStructure = allItems.filter(hasNonAddr);
+              const addrOnly = allItems.filter(m => !hasNonAddr(m));
+              const [showAddrOnly, setShowAddrOnly] = React.useState(false);
+              const items = showAddrOnly ? allItems : nameOrStructure;
               return (<div style={{ padding:'12px 0' }}>
                 <div style={{ fontSize:12, color:DM, marginBottom:8 }}>Toggle Import/Export per person or per field. Items move to the Basket.</div>
                 <div style={selBar}>
-                  <span style={{ fontSize:12, color:DM }}>All {items.length} persons:</span>
+                  <span style={{ fontSize:12, color:DM }}>Showing {items.length} of {allItems.length}:</span>
                   <button style={lnkBtn} onClick={()=>globalChangedDir('import')}>⬇ All Import</button>
                   <button style={lnkBtn} onClick={()=>globalChangedDir('export')}>⬆ All Export</button>
                   <button style={lnkBtn} onClick={()=>globalChangedDir(null)}>Clear All</button>
                 </div>
+                {addrOnly.length > 0 && <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:10,padding:'6px 10px',background:'rgba(196,163,90,0.04)',borderRadius:6,border:'1px solid '+BR}}>
+                  <input type="checkbox" checked={showAddrOnly} onChange={e=>setShowAddrOnly(e.target.checked)} style={{accentColor:'#c4a35a'}}/>
+                  <span style={{fontSize:11,color:DM}}>Show {addrOnly.length} address-only diffs <span style={{color:'#5a5548'}}>(people where the only difference is address/city/state/zip/country)</span></span>
+                </div>}
                 {items.map(m => {
                   const isExp = expandedDiffs.has(m.id);
                   const personDir = changedDir[m.id] || null;
