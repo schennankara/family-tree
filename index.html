@@ -3956,57 +3956,70 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
 
   // ── Family breadcrumb helpers ──
   // Build "Father & Mother → Spouse, children: A, B, C" string for a person
+  // Build lineage path: walk up through parent families to root
   function ftlsBreadcrumb(personId) {
-    const parts = [];
-    // Find parent family (where this person is a child)
-    for (const [fid, fam] of Object.entries(familyMap)) {
-      if ((fam.children||[]).includes(personId)) {
-        const dad = fam.husband_id && personMap[fam.husband_id] ? personMap[fam.husband_id].dn : '';
-        const mom = fam.wife_id && personMap[fam.wife_id] ? personMap[fam.wife_id].dn : '';
-        const parents = [dad, mom].filter(Boolean).join(' & ');
-        if (parents) parts.push('⬆ ' + parents);
-        break;
+    const path = [];
+    let curId = personId;
+    const visited = new Set();
+    while (curId && !visited.has(curId)) {
+      visited.add(curId);
+      const p = personMap[curId];
+      if (!p) break;
+      if (curId !== personId) path.unshift(p.fn || p.dn || '?');
+      // Find parent family
+      let parentFound = false;
+      for (const [fid, fam] of Object.entries(familyMap)) {
+        if ((fam.children||[]).includes(curId)) {
+          // Go to father, or mother if no father
+          curId = fam.husband_id || fam.wife_id || null;
+          parentFound = true;
+          break;
+        }
       }
+      if (!parentFound) break;
     }
-    // Find spouse family (where this person is husband/wife)
-    for (const [fid, fam] of Object.entries(familyMap)) {
-      const hid = fam.husband_id || fam.husb;
-      const wid = fam.wife_id || fam.wife;
-      if (hid === personId || wid === personId) {
-        const spouseId = hid === personId ? wid : hid;
-        if (spouseId && personMap[spouseId]) parts.push('⚭ ' + personMap[spouseId].dn);
-        const kids = (fam.children||[]).map(cid => personMap[cid]?.dn || cid).filter(Boolean);
-        if (kids.length > 0) parts.push('↓ ' + kids.slice(0,4).join(', ') + (kids.length > 4 ? '…' : ''));
-        break;
+    if (path.length === 0) {
+      // Not blood — check if spouse connects to tree
+      for (const [fid, fam] of Object.entries(familyMap)) {
+        const hid = fam.husband_id, wid = fam.wife_id;
+        if (hid === personId && wid && personMap[wid]) return '⚭ ' + (personMap[wid].dn||'?');
+        if (wid === personId && hid && personMap[hid]) return '⚭ ' + (personMap[hid].dn||'?');
       }
+      return '';
     }
-    return parts.join('  ·  ');
+    return path.join(' → ');
   }
 
   function extBreadcrumb(personId) {
-    const parts = [];
-    for (const [fid, fam] of Object.entries(extFamiliesMap)) {
-      if ((fam.children||[]).includes(personId)) {
-        const dad = fam.husb && extPeopleMap[fam.husb] ? extPeopleMap[fam.husb].dn : '';
-        const mom = fam.wife && extPeopleMap[fam.wife] ? extPeopleMap[fam.wife].dn : '';
-        const parents = [dad, mom].filter(Boolean).join(' & ');
-        if (parents) parts.push('⬆ ' + parents);
-        break;
+    const path = [];
+    let curId = personId;
+    const visited = new Set();
+    while (curId && !visited.has(curId)) {
+      visited.add(curId);
+      const p = extPeopleMap[curId];
+      if (!p) break;
+      if (curId !== personId) path.unshift(p.fn || p.dn || '?');
+      let parentFound = false;
+      for (const [fid, fam] of Object.entries(extFamiliesMap)) {
+        if ((fam.children||[]).includes(curId)) {
+          curId = fam.husb || fam.wife || null;
+          parentFound = true;
+          break;
+        }
       }
+      if (!parentFound) break;
     }
-    for (const [fid, fam] of Object.entries(extFamiliesMap)) {
-      if (fam.husb === personId || fam.wife === personId) {
-        const spouseId = fam.husb === personId ? fam.wife : fam.husb;
-        if (spouseId && extPeopleMap[spouseId]) parts.push('⚭ ' + extPeopleMap[spouseId].dn);
-        const kids = (fam.children||[]).map(cid => extPeopleMap[cid]?.dn || '').filter(Boolean);
-        if (kids.length > 0) parts.push('↓ ' + kids.slice(0,4).join(', ') + (kids.length > 4 ? '…' : ''));
-        break;
+    if (path.length === 0) {
+      for (const [fid, fam] of Object.entries(extFamiliesMap)) {
+        if (fam.husb === personId && fam.wife && extPeopleMap[fam.wife]) return '⚭ ' + (extPeopleMap[fam.wife].dn||'?');
+        if (fam.wife === personId && fam.husb && extPeopleMap[fam.husb]) return '⚭ ' + (extPeopleMap[fam.husb].dn||'?');
       }
+      return '';
     }
-    return parts.join('  ·  ');
+    return path.join(' → ');
   }
 
-  // Render breadcrumb for a person — shows FTLS path and optionally external path if different
+  // Render lineage for a person — shows path up to root
   function FamilyPath({personId, showExt, showFtls}) {
     const fbc = showFtls !== false ? ftlsBreadcrumb(personId) : '';
     const ebc = showExt !== false ? extBreadcrumb(personId) : '';
@@ -4016,7 +4029,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
       <div style={{fontSize:10, lineHeight:1.6, marginTop:2, paddingLeft:20}}>
         {fbc && <div style={{color:'#8a8578'}}><span style={{color:'#c4a35a',fontSize:9}}>FTLS</span> {fbc}</div>}
         {ebc && !same && <div style={{color:'#6a8a70'}}><span style={{color:'#6b9e72',fontSize:9}}>EXT</span> {ebc}</div>}
-        {fbc && ebc && !same && <div style={{color:'#d08050',fontSize:9,fontWeight:500}}>⚠ Different family path</div>}
+        {fbc && ebc && !same && <div style={{color:'#d08050',fontSize:9,fontWeight:500}}>⚠ Different lineage</div>}
       </div>
     );
   }
@@ -4322,32 +4335,8 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
                 </div>}
                 {familyItems.length === 0 && <div style={{color:DM,fontSize:12,padding:'12px 0'}}>No meaningful field differences for family members{familyAddrOnly.length > 0 ? ' (check the box above to see address-only diffs)' : ''}.</div>}
                 {familyItems.map(renderChangedRow)}
-
-                {/* ══════ SECTION 2: NEW FAMILY MEMBERS ══════ */}
-                {extConnected.length > 0 && <>
-                  <div style={{...hdr, marginTop:24, color:'#7eb8d0'}}>🆕 New Family Members ({extConnected.length})</div>
-                  <div style={{ fontSize:12, color:DM, marginBottom:8 }}>New people connected to the tree — safe to bulk import.</div>
-                  <div style={selBar}>
-                    <button style={lnkBtn} onClick={()=>{ const d={...extDir}; extConnected.forEach(p=>{d[p.id]='import'}); setExtDir(d); }}>⬇ All Import</button>
-                    <button style={lnkBtn} onClick={()=>{ const d={...extDir}; extConnected.forEach(p=>{delete d[p.id]}); setExtDir(d); }}>Clear</button>
-                    <span style={{ fontSize:11, color:DM }}>{extConnected.filter(p=>extDir[p.id]==='import').length} marked</span>
-                  </div>
-                  {extConnected.map(renderExtRow)}
-                </>}
-
-                {/* ══════ SECTION 3: FTLS ONLY — FOR EXPORT ══════ */}
-                {ftlsInTree.length > 0 && <>
-                  <div style={{...hdr, marginTop:24, color:'#9b82c4'}}>⬆ FTLS Only — For Export ({ftlsInTree.length})</div>
-                  <div style={{ fontSize:12, color:DM, marginBottom:8 }}>People in FTLS that Abey/Rolson don't have — safe to bulk export.</div>
-                  <div style={selBar}>
-                    <button style={lnkBtn} onClick={()=>{ const d={...ftlsDir}; ftlsInTree.forEach(p=>{d[p.id]='export'}); setFtlsDir(d); }}>⬆ All Export</button>
-                    <button style={lnkBtn} onClick={()=>{ const d={...ftlsDir}; ftlsInTree.forEach(p=>{delete d[p.id]}); setFtlsDir(d); }}>Clear</button>
-                    <span style={{ fontSize:11, color:DM }}>{ftlsInTree.filter(p=>ftlsDir[p.id]==='export').length} marked</span>
-                  </div>
-                  {ftlsInTree.map(renderFtlsRow)}
-                </>}
                 
-                {/* ══════ SECTION 4: OTHERS — READ ONLY ══════ */}
+                {/* ══════ OTHERS — READ ONLY ══════ */}
                 {othersTotal > 0 && <div style={{marginTop:24}}>
                   <div onClick={()=>setShowOthers(!showOthers)} style={{...hdr, cursor:'pointer', color:'#7a7568'}}>
                     <span style={{marginRight:6}}>{showOthers?'▼':'▶'}</span>
