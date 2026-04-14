@@ -4203,73 +4203,203 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
             {/* ──── CHANGED ──── */}
             {tab==='changed' && (()=>{
               const addressKeys = new Set(['a1','ci','st','co','zp']);
-              const allItems = diffResult.matched.filter(m=>m.diffs.length>0);
+              const allChanged = diffResult.matched.filter(m=>m.diffs.length>0);
               const hasNonAddr = (m) => m.diffs.some(d => !addressKeys.has(d.key));
-              const nameOrStructure = allItems.filter(hasNonAddr);
-              const addrOnly = allItems.filter(m => !hasNonAddr(m));
+              
+              // Split changed: in-tree vs not-in-tree
+              const familyChanged = allChanged.filter(m => personMap[m.id]);
+              const othersChanged = allChanged.filter(m => !personMap[m.id]);
+              const familyMeaningful = familyChanged.filter(hasNonAddr);
+              const familyAddrOnly = familyChanged.filter(m => !hasNonAddr(m));
+              
+              // External Only: split into connected-to-tree vs unconnected
+              const extOnlyAll = diffResult.extOnly || [];
+              const extOnlyFams = (diffResult.familyDiffs || []).filter(f=>f.type==='ext_only');
+              const isConnected = (p) => {
+                for (const [fid, fam] of Object.entries(extFamiliesMap)) {
+                  const hid = fam.husb||'', wid = fam.wife||'', kids = fam.children||[];
+                  if (kids.includes(p.id)) { if (personMap[hid] || personMap[wid]) return true; }
+                  if (hid === p.id || wid === p.id) { if (personMap[hid] || personMap[wid] || kids.some(k=>personMap[k])) return true; }
+                }
+                return false;
+              };
+              const extConnected = extOnlyAll.filter(isConnected);
+              const extUnconnected = extOnlyAll.filter(p => !isConnected(p));
+              
               const [showAddrOnly, setShowAddrOnly] = React.useState(false);
-              const items = showAddrOnly ? allItems : nameOrStructure;
+              const [showOthers, setShowOthers] = React.useState(false);
+              const familyItems = showAddrOnly ? familyChanged : familyMeaningful;
+              const ftlsNotInTree = (diffResult.ftlsOnly||[]).filter(p => !personMap[p.id]);
+              
+              // Reusable: render a changed person row with expandable diffs
+              const renderChangedRow = (m) => {
+                const isExp = expandedDiffs.has(m.id);
+                const pDir = changedDir[m.id] || null;
+                return (<div key={m.id} style={{ marginBottom:6, border:'1px solid '+BR, borderRadius:8, overflow:'hidden' }}>
+                  <div style={{ padding:'7px 12px', background:'rgba(196,163,90,0.04)', display:'flex', alignItems:'center', gap:8 }}>
+                    <DirBtn dir={pDir} onSet={(d)=>setPersonDirection(m.id, d)} />
+                    <div onClick={()=>toggleExpand(m.id)} style={{ flex:1, cursor:'pointer' }}>
+                      <div style={{ color:TX, fontSize:13 }}>
+                        <span style={{ color:isExp?GC:DM, marginRight:6 }}>{isExp?'▼':'▶'}</span>
+                        {m.ftls.dn||m.ext.dn} <span style={badge('rgba(196,163,90,0.6)')}>{m.diffs.length} diff{m.diffs.length>1?'s':''}</span>
+                      </div>
+                      <FamilyPath personId={m.id} />
+                    </div>
+                  </div>
+                  {isExp && (<div style={{ padding:'8px 12px' }}>
+                    <table style={{ width:'100%', fontSize:12, borderCollapse:'collapse' }}>
+                      <thead><tr>
+                        <th style={{ textAlign:'left', color:DM, padding:'4px 8px', width:130 }}>Direction</th>
+                        <th style={{ textAlign:'left', color:DM, padding:'4px 8px' }}>Field</th>
+                        <th style={{ textAlign:'left', color:GC, padding:'4px 8px' }}>FTLS</th>
+                        <th style={{ textAlign:'left', color:MC, padding:'4px 8px' }}>External</th>
+                        <th style={{ textAlign:'left', color:DM, padding:'4px 8px', width:50 }}>Hint</th>
+                      </tr></thead>
+                      <tbody>{m.diffs.map(d => {
+                        const fDir = getFieldDirection(m.id, d.key);
+                        const fL=(d.ftls||'').replace(/^[,\s]+/,'').length, eL=(d.ext||'').replace(/^[,\s]+/,'').length;
+                        const ftlsW=fL>=eL&&fL>0, extW=eL>fL;
+                        const isBranch = d.key === '_famc';
+                        return (<tr key={d.key} style={{ borderTop:'1px solid rgba(196,163,90,0.06)', background: isBranch ? 'rgba(126,184,208,0.06)' : 'transparent' }}>
+                          <td style={{ padding:'4px 8px' }}>{isBranch ? <span style={{fontSize:10,color:'#7eb8d0'}}>🔀</span> : <DirBtn dir={fDir} onSet={(dir)=>setFieldDirection(m.id, d.key, dir)} />}</td>
+                          <td style={{ padding:'4px 8px', color: isBranch ? '#7eb8d0' : DM, fontWeight: isBranch ? 500 : 'normal' }}>{d.label}</td>
+                          <td style={{ padding:'4px 8px', color:d.ftls?TX:'#5a4040', background:ftlsW&&!isBranch?'rgba(107,158,114,0.06)':'transparent' }}>{d.ftls||'(empty)'}</td>
+                          <td style={{ padding:'4px 8px', color:d.ext?'#8ec496':'#5a4040', background:extW&&!isBranch?'rgba(107,158,114,0.06)':'transparent' }}>{d.ext||'(empty)'}</td>
+                          <td style={{ padding:'4px 8px', fontSize:10 }}>{isBranch?<span style={{color:'#7eb8d0'}}>Branch</span>:ftlsW?<span style={{color:GC}}>←FTLS</span>:extW?<span style={{color:MC}}>Ext→</span>:<span style={{color:DM}}>—</span>}</td>
+                        </tr>);
+                      })}</tbody>
+                    </table>
+                  </div>)}
+                </div>);
+              };
+              
+              // Reusable: render an ext-only person row
+              const renderExtRow = (p) => (<div key={p.id} style={{ ...rowSt }}>
+                <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+                  <DirBtn dir={extDir[p.id]||null} onSet={(d)=>setExtDir(prev=>({...prev,[p.id]:d}))} allowExport={false} />
+                  <span style={{ width:8, height:8, borderRadius:'50%', background:p.g==='M'?MC:FC, flexShrink:0 }} />
+                  <span style={{ color:TX, flex:1 }}>{p.dn||'(Unknown)'}</span>
+                  {p.dob && <span style={{ color:DM, fontSize:11 }}>b.{p.dob}</span>}
+                  <span style={{ color:'#5a5548', fontSize:10 }}>{p.id}</span>
+                </div>
+                <FamilyPath personId={p.id} showFtls={false} showExt={true} />
+              </div>);
+              
               return (<div style={{ padding:'12px 0' }}>
-                <div style={{ fontSize:12, color:DM, marginBottom:8 }}>Toggle Import/Export per person or per field. Items move to the Basket.</div>
+                {/* ── SECTION 1: FAMILY MEMBERS WITH CHANGES ── */}
+                <div style={hdr}>👨‍👩‍👧‍👦 Family Members with Changes ({familyItems.length})</div>
+                <div style={{ fontSize:12, color:DM, marginBottom:8 }}>People connected to the family tree with data differences.</div>
                 <div style={selBar}>
-                  <span style={{ fontSize:12, color:DM }}>Showing {items.length} of {allItems.length}:</span>
                   <button style={lnkBtn} onClick={()=>globalChangedDir('import')}>⬇ All Import</button>
                   <button style={lnkBtn} onClick={()=>globalChangedDir('export')}>⬆ All Export</button>
                   <button style={lnkBtn} onClick={()=>globalChangedDir(null)}>Clear All</button>
                 </div>
-                {addrOnly.length > 0 && <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:10,padding:'6px 10px',background:'rgba(196,163,90,0.04)',borderRadius:6,border:'1px solid '+BR}}>
+                {familyAddrOnly.length > 0 && <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:10,padding:'6px 10px',background:'rgba(196,163,90,0.04)',borderRadius:6,border:'1px solid '+BR}}>
                   <input type="checkbox" checked={showAddrOnly} onChange={e=>setShowAddrOnly(e.target.checked)} style={{accentColor:'#c4a35a'}}/>
-                  <span style={{fontSize:11,color:DM}}>Show {addrOnly.length} address-only diffs <span style={{color:'#5a5548'}}>(people where the only difference is address/city/state/zip/country)</span></span>
+                  <span style={{fontSize:11,color:DM}}>Show {familyAddrOnly.length} address-only diffs</span>
                 </div>}
-                {items.map(m => {
-                  const isExp = expandedDiffs.has(m.id);
-                  const personDir = changedDir[m.id] || null;
-                  return (<div key={m.id} style={{ marginBottom:6, border:'1px solid '+BR, borderRadius:8, overflow:'hidden' }}>
-                    <div style={{ padding:'7px 12px', background:'rgba(196,163,90,0.04)', display:'flex', alignItems:'center', gap:8 }}>
-                      <DirBtn dir={personDir} onSet={(d)=>setPersonDirection(m.id, d)} />
-                      <div onClick={()=>toggleExpand(m.id)} style={{ flex:1, cursor:'pointer' }}>
-                        <div style={{ color:TX, fontSize:13 }}>
-                          <span style={{ color:isExp?GC:DM, marginRight:6 }}>{isExp?'▼':'▶'}</span>
-                          {m.ftls.dn||m.ext.dn} <span style={badge('rgba(196,163,90,0.6)')}>{m.diffs.length} diff{m.diffs.length>1?'s':''}</span>
-                        </div>
-                        <FamilyPath personId={m.id} />
-                      </div>
+                {familyItems.length === 0 && <div style={{color:DM,fontSize:12,padding:'12px 0'}}>No meaningful field differences for family members{familyAddrOnly.length > 0 ? ' (check the box above to see address-only diffs)' : ''}.</div>}
+                {familyItems.map(renderChangedRow)}
+
+                {/* ── SECTION 2: NEW FAMILY MEMBERS (external only, connected to tree) ── */}
+                {extConnected.length > 0 && <>
+                  <div style={{...hdr, marginTop:24, color:'#7eb8d0'}}>🆕 New Family Members ({extConnected.length})</div>
+                  <div style={{ fontSize:12, color:DM, marginBottom:8 }}>People in the external GEDCOM connected to someone already in the tree — likely new additions to import.</div>
+                  <div style={selBar}>
+                    <button style={lnkBtn} onClick={()=>{ const d={...extDir}; extConnected.forEach(p=>{d[p.id]='import'}); setExtDir(d); }}>⬇ All Import</button>
+                    <button style={lnkBtn} onClick={()=>{ const d={...extDir}; extConnected.forEach(p=>{delete d[p.id]}); setExtDir(d); }}>Clear</button>
+                    <span style={{ fontSize:11, color:DM }}>{extConnected.filter(p=>extDir[p.id]==='import').length} marked</span>
+                  </div>
+                  {extConnected.map(renderExtRow)}
+                </>}
+
+                {/* ── SECTION 3: FTLS ONLY — FOR EXPORT ── */}
+                {(diffResult.ftlsOnly||[]).length > 0 && (()=>{
+                  const ftlsPersons = diffResult.ftlsOnly;
+                  const ftlsInTree = ftlsPersons.filter(p => personMap[p.id]);
+                  const ftlsNotInTree = ftlsPersons.filter(p => !personMap[p.id]);
+                  return <>
+                    <div style={{...hdr, marginTop:24, color:'#9b82c4'}}>⬆ FTLS Only — For Export ({ftlsInTree.length})</div>
+                    <div style={{ fontSize:12, color:DM, marginBottom:8 }}>People in FTLS that don't exist in the external GEDCOM — export to share with Rolson/Abey.</div>
+                    <div style={selBar}>
+                      <button style={lnkBtn} onClick={()=>{ const d={}; ftlsInTree.forEach(p=>{d[p.id]='export'}); setFtlsDir(prev=>({...prev,...d})); }}>⬆ All Export</button>
+                      <button style={lnkBtn} onClick={()=>{ const d={...ftlsDir}; ftlsInTree.forEach(p=>{delete d[p.id]}); setFtlsDir(d); }}>Clear</button>
+                      <span style={{ fontSize:11, color:DM }}>{ftlsInTree.filter(p=>ftlsDir[p.id]==='export').length} marked</span>
                     </div>
-                    {isExp && (<div style={{ padding:'8px 12px' }}>
-                      <table style={{ width:'100%', fontSize:12, borderCollapse:'collapse' }}>
-                        <thead><tr>
-                          <th style={{ textAlign:'left', color:DM, padding:'4px 8px', width:130 }}>Direction</th>
-                          <th style={{ textAlign:'left', color:DM, padding:'4px 8px' }}>Field</th>
-                          <th style={{ textAlign:'left', color:GC, padding:'4px 8px' }}>FTLS</th>
-                          <th style={{ textAlign:'left', color:MC, padding:'4px 8px' }}>External</th>
-                          <th style={{ textAlign:'left', color:DM, padding:'4px 8px', width:50 }}>Hint</th>
-                        </tr></thead>
-                        <tbody>{m.diffs.map(d => {
-                          const fDir = getFieldDirection(m.id, d.key);
-                          const fL=(d.ftls||'').replace(/^[,\s]+/,'').length, eL=(d.ext||'').replace(/^[,\s]+/,'').length;
-                          const ftlsW=fL>=eL&&fL>0, extW=eL>fL;
-                          const isBranch = d.key === '_famc';
-                          return (<tr key={d.key} style={{ borderTop:'1px solid rgba(196,163,90,0.06)', background: isBranch ? 'rgba(126,184,208,0.06)' : 'transparent' }}>
-                            <td style={{ padding:'4px 8px' }}>{isBranch ? <span style={{fontSize:10,color:'#7eb8d0'}}>🔀</span> : <DirBtn dir={fDir} onSet={(dir)=>setFieldDirection(m.id, d.key, dir)} />}</td>
-                            <td style={{ padding:'4px 8px', color: isBranch ? '#7eb8d0' : DM, fontWeight: isBranch ? 500 : 'normal' }}>{d.label}</td>
-                            <td style={{ padding:'4px 8px', color:d.ftls?TX:'#5a4040', background:ftlsW&&!isBranch?'rgba(107,158,114,0.06)':'transparent' }}>{d.ftls||'(empty)'}</td>
-                            <td style={{ padding:'4px 8px', color:d.ext?'#8ec496':'#5a4040', background:extW&&!isBranch?'rgba(107,158,114,0.06)':'transparent' }}>{d.ext||'(empty)'}</td>
-                            <td style={{ padding:'4px 8px', fontSize:10 }}>{isBranch?<span style={{color:'#7eb8d0'}}>Branch</span>:ftlsW?<span style={{color:GC}}>←FTLS</span>:extW?<span style={{color:MC}}>Ext→</span>:<span style={{color:DM}}>—</span>}</td>
-                          </tr>);
-                        })}</tbody>
-                      </table>
-                    </div>)}
-                  </div>);
-                })}
+                    {ftlsInTree.map(p => (<div key={p.id} style={{ ...rowSt }}>
+                      <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+                        <DirBtn dir={ftlsDir[p.id]||null} onSet={(d)=>setFtlsDir(prev=>({...prev,[p.id]:d}))} allowImport={false} />
+                        <span style={{ width:8, height:8, borderRadius:'50%', background:p.g==='M'?MC:FC, flexShrink:0 }} />
+                        <span style={{ color:TX, flex:1 }}>{p.dn||'(Unknown)'}</span>
+                        {p.dob && <span style={{ color:DM, fontSize:11 }}>b.{p.dob}</span>}
+                        <span style={{ color:'#5a5548', fontSize:10 }}>{p.id}</span>
+                      </div>
+                      <FamilyPath personId={p.id} showFtls={true} showExt={false} />
+                    </div>))}
+                    {ftlsNotInTree.length > 0 && <div style={{fontSize:11,color:'#5a5548',marginTop:8,padding:'6px 10px',background:'rgba(155,130,196,0.04)',borderRadius:6,border:'1px solid '+BR}}>
+                      + {ftlsNotInTree.length} FTLS-only persons not connected to tree (see Others section)
+                    </div>}
+                  </>;
+                })()}
+                
+                {/* ── SECTION 3: OTHERS (collapsed) ── */}
+                {(othersChanged.length > 0 || extUnconnected.length > 0 || ftlsNotInTree.length > 0) && <div style={{marginTop:24}}>
+                  <div onClick={()=>setShowOthers(!showOthers)} style={{...hdr, cursor:'pointer', color:'#7a7568'}}>
+                    <span style={{marginRight:6}}>{showOthers?'▼':'▶'}</span>
+                    📋 Others ({othersChanged.length + extUnconnected.length + ftlsNotInTree.length})
+                    <span style={{fontSize:10,fontWeight:'normal',marginLeft:8,color:'#5a5548'}}>Not connected to the family tree</span>
+                  </div>
+                  {showOthers && <>
+                    {othersChanged.length > 0 && <>
+                      <div style={{fontSize:11,color:DM,marginBottom:4,marginTop:8}}>Changed but not in tree ({othersChanged.length}):</div>
+                      {othersChanged.map(renderChangedRow)}
+                    </>}
+                    {ftlsNotInTree.length > 0 && <>
+                      <div style={{fontSize:11,color:DM,marginBottom:4,marginTop:12}}>FTLS only, not in tree ({ftlsNotInTree.length}):</div>
+                      <div style={selBar}>
+                        <button style={lnkBtn} onClick={()=>{ const d={...ftlsDir}; ftlsNotInTree.forEach(p=>{d[p.id]='export'}); setFtlsDir(d); }}>⬆ All Export</button>
+                        <button style={lnkBtn} onClick={()=>{ const d={...ftlsDir}; ftlsNotInTree.forEach(p=>{delete d[p.id]}); setFtlsDir(d); }}>Clear</button>
+                      </div>
+                      {ftlsNotInTree.map(p => (<div key={p.id} style={{ ...rowSt }}>
+                        <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+                          <DirBtn dir={ftlsDir[p.id]||null} onSet={(d)=>setFtlsDir(prev=>({...prev,[p.id]:d}))} allowImport={false} />
+                          <span style={{ width:8, height:8, borderRadius:'50%', background:p.g==='M'?MC:FC, flexShrink:0 }} />
+                          <span style={{ color:TX, flex:1 }}>{p.dn||'(Unknown)'}</span>
+                          {p.dob && <span style={{ color:DM, fontSize:11 }}>b.{p.dob}</span>}
+                          <span style={{ color:'#5a5548', fontSize:10 }}>{p.id}</span>
+                        </div>
+                      </div>))}
+                    </>}
+                    {extUnconnected.length > 0 && <>
+                      <div style={{fontSize:11,color:DM,marginBottom:4,marginTop:12}}>External only, no tree connection ({extUnconnected.length}):</div>
+                      <div style={selBar}>
+                        <button style={lnkBtn} onClick={()=>{ const d={...extDir}; extUnconnected.forEach(p=>{d[p.id]='import'}); setExtDir(d); }}>⬇ All Import</button>
+                        <button style={lnkBtn} onClick={()=>{ const d={...extDir}; extUnconnected.forEach(p=>{delete d[p.id]}); setExtDir(d); }}>Clear</button>
+                      </div>
+                      {extUnconnected.map(renderExtRow)}
+                    </>}
+                    {extOnlyFams.length > 0 && <>
+                      <div style={{fontSize:11,color:DM,marginBottom:4,marginTop:12}}>New families ({extOnlyFams.length}):</div>
+                      <div style={selBar}>
+                        <button style={lnkBtn} onClick={()=>{ const d={}; extOnlyFams.forEach(f=>{d[f.id]='import'}); setExtFamDir(d); }}>⬇ All Import</button>
+                        <button style={lnkBtn} onClick={()=>setExtFamDir({})}>Clear</button>
+                      </div>
+                      {extOnlyFams.map(f => (<div key={f.id} style={{ ...rowSt, display:'flex', alignItems:'center', gap:8 }}>
+                        <DirBtn dir={extFamDir[f.id]||null} onSet={(d)=>setExtFamDir(prev=>({...prev,[f.id]:d}))} allowExport={false} />
+                        <span style={{ color:TX, fontSize:12, flex:1 }}>{f.id} — H:{f.ext.husb||'?'} W:{f.ext.wife||'?'} {(f.ext.children||[]).length}ch</span>
+                      </div>))}
+                    </>}
+                  </>}
+                </div>}
               </div>);
             })()}
 
-            {/* ──── EXTERNAL ONLY ──── */}
+            {/* ──── EXTERNAL ONLY (now integrated into Changed tab, keep for backward compat) ──── */}
             {tab==='ext_only' && (()=>{
               const persons = diffResult.extOnly;
               const extFams = diffResult.familyDiffs.filter(f=>f.type==='ext_only');
               return (<div style={{ padding:'12px 0' }}>
-                <div style={{ fontSize:12, color:DM, marginBottom:8 }}>Mark for import to add these to your FTLS database.</div>
+                <div style={{ fontSize:12, color:DM, marginBottom:8 }}>These are also shown in the Changed tab above, organized by family connection. Use this tab for a flat view.</div>
                 {persons.length>0 && <>
                   <div style={hdr}>Persons ({persons.length})</div>
                   <div style={selBar}>
