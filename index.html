@@ -34,7 +34,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.7.2';
+    const APP_VERSION = 'v4.7.0';
     const BUILD_DATE = '2026-04-13';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
@@ -3884,6 +3884,8 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
   const [fieldDir, setFieldDir] = useState({});
   // extFamDir: { famId: 'import'|null }
   const [extFamDir, setExtFamDir] = useState({});
+  const [showAddrOnly, setShowAddrOnly] = useState(false);
+  const [showOthers, setShowOthers] = useState(false);
 
   const handleFile = () => {
     const input = document.createElement('input');
@@ -4231,8 +4233,6 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
               const ftlsInTree = ftlsAll.filter(p => personMap[p.id]);
               const ftlsNotInTree = ftlsAll.filter(p => !personMap[p.id]);
 
-              const [showAddrOnly, setShowAddrOnly] = React.useState(false);
-              const [showOthers, setShowOthers] = React.useState(false);
               const familyItems = showAddrOnly ? familyChanged : familyMeaningful;
               
               // ── Render: changed person row (individual toggle only) ──
