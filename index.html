@@ -3851,14 +3851,14 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
   // Build "Father & Mother → Spouse, children: A, B, C" string for a person
   // Build lineage path: walk up through parent families to root
   function ftlsBreadcrumb(personId) {
-    const path = [];
+    const path = [], pathIds = [];
     let curId = personId;
     const visited = new Set();
     while (curId && !visited.has(curId)) {
       visited.add(curId);
       const p = personMap[curId];
       if (!p) break;
-      if (curId !== personId) path.unshift(p.dn || p.fn || '?');
+      if (curId !== personId) { path.unshift(p.dn || p.fn || '?'); pathIds.unshift(curId); }
       let parentFound = false;
       for (const [fid, fam] of Object.entries(familyMap)) {
         if ((fam.children||[]).includes(curId)) {
@@ -3872,31 +3872,24 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
     if (path.length === 0) {
       for (const [fid, fam] of Object.entries(familyMap)) {
         const hid = fam.husband_id, wid = fam.wife_id;
-        if (hid === personId && wid && personMap[wid]) return '⚭ ' + (personMap[wid].dn||'?');
-        if (wid === personId && hid && personMap[hid]) return '⚭ ' + (personMap[hid].dn||'?');
+        if (hid === personId && wid && personMap[wid]) return { text: '⚭ ' + (personMap[wid].dn||'?'), ids: [wid] };
+        if (wid === personId && hid && personMap[hid]) return { text: '⚭ ' + (personMap[hid].dn||'?'), ids: [hid] };
       }
-      return '';
+      return { text: '', ids: [] };
     }
-    return path.join(' → ');
+    return { text: path.join(' → '), ids: pathIds };
   }
 
   function extBreadcrumb(personId) {
-    const path = [];
+    const path = [], pathIds = [];
     let curId = personId;
     const visited = new Set();
     while (curId && !visited.has(curId)) {
       visited.add(curId);
-      // Check external people first, then fall back to FTLS personMap
       const p = extPeopleMap[curId] || personMap[curId];
       if (!p) break;
-      if (curId !== personId) {
-        const name = p.dn || p.fn || '?';
-        // Mark if this person is already in FTLS
-        const inFtls = !!personMap[curId];
-        path.unshift(inFtls ? name : name);
-      }
+      if (curId !== personId) { path.unshift(p.dn || p.fn || '?'); pathIds.unshift(curId); }
       let parentFound = false;
-      // Check external families first, then FTLS families
       for (const [fid, fam] of Object.entries(extFamiliesMap)) {
         if ((fam.children||[]).includes(curId)) {
           curId = fam.husb || fam.wife || null;
@@ -3919,25 +3912,26 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
       for (const [fid, fam] of Object.entries(extFamiliesMap)) {
         const hp = extPeopleMap[fam.husb] || personMap[fam.husb];
         const wp = extPeopleMap[fam.wife] || personMap[fam.wife];
-        if (fam.husb === personId && wp) return '⚭ ' + (wp.dn||'?');
-        if (fam.wife === personId && hp) return '⚭ ' + (hp.dn||'?');
+        if (fam.husb === personId && wp) return { text: '⚭ ' + (wp.dn||'?'), ids: [fam.wife] };
+        if (fam.wife === personId && hp) return { text: '⚭ ' + (hp.dn||'?'), ids: [fam.husb] };
       }
-      return '';
+      return { text: '', ids: [] };
     }
-    return path.join(' → ');
+    return { text: path.join(' → '), ids: pathIds };
   }
 
   // Render lineage for a person — shows path up to root
   function FamilyPath({personId, showExt, showFtls}) {
-    const fbc = showFtls !== false ? ftlsBreadcrumb(personId) : '';
-    const ebc = showExt !== false ? extBreadcrumb(personId) : '';
-    if (!fbc && !ebc) return null;
-    const same = fbc === ebc;
+    const fbc = showFtls !== false ? ftlsBreadcrumb(personId) : { text: '', ids: [] };
+    const ebc = showExt !== false ? extBreadcrumb(personId) : { text: '', ids: [] };
+    if (!fbc.text && !ebc.text) return null;
+    // Compare by person IDs, not display names — avoids false "Different lineage" from name formatting
+    const same = fbc.ids.join(',') === ebc.ids.join(',');
     return (
       <div style={{fontSize:10, lineHeight:1.6, marginTop:2, paddingLeft:20}}>
-        {fbc && <div style={{color:'#8a8578'}}><span style={{color:'#c4a35a',fontSize:9}}>FTLS</span> {fbc}</div>}
-        {ebc && !same && <div style={{color:'#6a8a70'}}><span style={{color:'#6b9e72',fontSize:9}}>EXT</span> {ebc}</div>}
-        {fbc && ebc && !same && <div style={{color:'#d08050',fontSize:9,fontWeight:500}}>⚠ Different lineage</div>}
+        {fbc.text && <div style={{color:'#8a8578'}}><span style={{color:'#c4a35a',fontSize:9}}>FTLS</span> {fbc.text}</div>}
+        {ebc.text && !same && <div style={{color:'#6a8a70'}}><span style={{color:'#6b9e72',fontSize:9}}>EXT</span> {ebc.text}</div>}
+        {fbc.text && ebc.text && !same && <div style={{color:'#d08050',fontSize:9,fontWeight:500}}>⚠ Different lineage</div>}
       </div>
     );
   }
