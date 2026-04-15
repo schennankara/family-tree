@@ -567,6 +567,13 @@ async function migrateGedcomToSupabase(gedcomText, onProgress) {
     const tag = m[3].trim();
     const value = (m[4] || '').trim();
     const el = { level, pointer, tag, value, children: [] };
+    if (tag === 'CONT' || tag === 'CONC') {
+      const parent = stack[stack.length - 1];
+      if (parent && parent.value !== undefined) {
+        parent.value += (tag === 'CONT' ? '\n' : '') + value;
+      }
+      continue;
+    }
     while (stack.length > 1 && stack[stack.length - 1].level >= level) stack.pop();
     stack[stack.length - 1].children.push(el);
     stack.push(el);
@@ -850,10 +857,17 @@ function personToGedcomLines(person) {
   if (person.prof) L.push(`1 OCCU ${person.prof}`);
   // Website
   if (person.ws) L.push(`1 WWW ${person.ws}`);
-  // Notes
-  if (person.notes) L.push(`1 NOTE ${person.notes}`);
-  if (person.bio) L.push(`1 NOTE BIO: ${person.bio}`);
-  if (person.stories) L.push(`1 NOTE STORY: ${person.stories}`);
+  // Notes — split multi-line text into CONT lines for GEDCOM compliance
+  const pushNote = (level, text) => {
+    const noteLines = text.split('\n');
+    L.push(`${level} NOTE ${noteLines[0]}`);
+    for (let i = 1; i < noteLines.length; i++) {
+      L.push(`${level+1} CONT ${noteLines[i]}`);
+    }
+  };
+  if (person.notes) pushNote(1, person.notes);
+  if (person.bio) pushNote(1, 'BIO: ' + person.bio);
+  if (person.stories) pushNote(1, 'STORY: ' + person.stories);
   // Custom tags
   if (person.fb) L.push(`1 _FACEBOOK ${person.fb}`);
   if (person.ig) L.push(`1 _INSTAGRAM ${person.ig}`);
@@ -1376,36 +1390,11 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap) 
   for (const [pid, person] of Object.entries(pMap)) {
     if (exportedPersons.has(pid)) continue;
     exportedPersons.add(pid);
-    const L = [`0 ${pid} INDI`];
-    const fn = person.fn || '', mn = person.mn || '', ln = person.ln || '';
-    const givn = (fn + (mn ? ' ' + mn : '')).trim();
-    const nameStr = ln ? `${givn} /${ln}/` : (givn || person.dn || '(Unknown)');
-    L.push(`1 NAME ${nameStr}`);
-    if (fn) L.push(`2 GIVN ${fn}`);
-    if (ln) L.push(`2 SURN ${ln}`);
-    if (person.nk) { L.push(`1 NAME ${person.nk} //`); L.push(`2 TYPE nick`); L.push(`2 GIVN ${person.nk}`); }
-    if (person.md) { L.push(`1 NAME ${person.md} //`); L.push(`2 TYPE birth`); }
-    if (person.g) L.push(`1 SEX ${person.g}`);
-    if (person.dob || person.loc) { L.push('1 BIRT'); if (person.dob) L.push(`2 DATE ${person.dob}`); if (person.loc) L.push(`2 PLAC ${person.loc}`); }
-    if (person.dod || person.dec) { L.push('1 DEAT'); if (person.dod) L.push(`2 DATE ${person.dod}`); }
-    if (person.ph) L.push(`1 PHON ${person.ph}`);
-    if (person.em) L.push(`1 EMAI ${person.em}`);
-    if (person.a1 || person.ci || person.st || person.co) {
-      L.push(`1 ADDR ${person.a1 || ''}`);
-      if (person.a2) L.push(`2 ADR2 ${person.a2}`);
-      if (person.ci) L.push(`2 CITY ${person.ci}`);
-      if (person.st) L.push(`2 STAE ${person.st}`);
-      if (person.zp) L.push(`2 POST ${person.zp}`);
-      if (person.co) L.push(`2 CTRY ${person.co}`);
-    }
-    if (person.prof) L.push(`1 OCCU ${person.prof}`);
-    if (person.ws) L.push(`1 WWW ${person.ws}`);
-    if (person.notes) L.push(`1 NOTE ${person.notes}`);
-    if (person.bio) L.push(`1 NOTE BIO: ${person.bio}`);
+    const L = personToGedcomLines(person);
     // FAMS/FAMC from FULL family map
     (famsLookup[pid] || []).forEach(ref => L.push(`1 FAMS ${ref}`));
     (famcLookup[pid] || []).forEach(ref => L.push(`1 FAMC ${ref}`));
-    // Preserved extra GEDCOM lines (OBJE, RESI, BURI, _CRE, CHAN, etc.)
+    // Preserved extra GEDCOM lines
     if (person._xg) { person._xg.split('\n').forEach(xl => { if (xl.trim()) L.push(xl); }); }
     else { L.push('1 CHAN'); L.push(`2 DATE ${gedcomDate()}`); L.push(`3 TIME ${gedcomTime()}`); }
     lines.push(...L);
@@ -1494,22 +1483,14 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
 
   // Add ONLY truly new INDI records
   for (const p of newPersons) {
-    const L = [`0 ${p.id} INDI`];
-    const givn = ((p.fn||'') + (p.mn ? ' '+p.mn : '')).trim();
-    const nm = p.ln ? `${givn} /${p.ln}/` : (givn || p.dn || '(Unknown)');
-    L.push(`1 NAME ${nm}`);
-    if (p.fn) L.push(`2 GIVN ${p.fn}`);
-    if (p.ln) L.push(`2 SURN ${p.ln}`);
-    if (p.nk) { L.push(`1 NAME ${p.nk} //`); L.push(`2 TYPE nick`); L.push(`2 GIVN ${p.nk}`); }
-    if (p.g) L.push(`1 SEX ${p.g}`);
-    if (p.dob || p.loc) { L.push('1 BIRT'); if (p.dob) L.push(`2 DATE ${p.dob}`); if (p.loc) L.push(`2 PLAC ${p.loc}`); }
-    if (p.dod || p.dec) { L.push('1 DEAT'); if (p.dod) L.push(`2 DATE ${p.dod}`); }
-    if (p.ph) L.push(`1 PHON ${p.ph}`);
-    if (p.em) L.push(`1 EMAI ${p.em}`);
+    const L = personToGedcomLines(p);
+    // Add FAMS/FAMC refs
     for (const [fid, fam] of Object.entries(ftlsFamilyMap)) {
       if ((fam.husband_id||fam.husb) === p.id || (fam.wife_id||fam.wife) === p.id) L.push(`1 FAMS ${fid}`);
       if ((fam.children||[]).includes(p.id)) L.push(`1 FAMC ${fid}`);
     }
+    // Preserved extra GEDCOM lines
+    if (p._xg) { p._xg.split('\n').forEach(xl => { if (xl.trim()) L.push(xl); }); }
     newLines.push(...L);
   }
 
@@ -1635,6 +1616,16 @@ function parseGedcomFile(text) {
     const tag = m[3].trim();
     const value = (m[4] || '').trim();
     const el = { level, pointer, tag, value, children: [] };
+
+    // CONT = continuation with newline, CONC = concatenation without newline
+    // These extend the value of their parent element rather than being separate children
+    if (tag === 'CONT' || tag === 'CONC') {
+      const parent = stack[stack.length - 1];
+      if (parent && parent.value !== undefined) {
+        parent.value += (tag === 'CONT' ? '\n' : '') + value;
+      }
+      continue;
+    }
 
     // Pop stack to find parent
     while (stack.length > 1 && stack[stack.length - 1].level >= level) {
