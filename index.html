@@ -809,6 +809,63 @@ function MigrateDialog({onDone, onCancel}) {
   );
 }
 
+/* ───── SHARED: Convert person object → GEDCOM INDI lines ───── */
+// Used by full export, diff export, and merged export.
+// Returns array of GEDCOM lines (without FAMS/FAMC — caller adds those).
+// Cardinal features (OBJE, RESI, CHAN, _CRE, etc.) come via person._xg.
+function personToGedcomLines(person) {
+  const L = [`0 ${person.id} INDI`];
+
+  // Primary NAME
+  const fn = person.fn || '', mn = person.mn || '', ln = person.ln || '';
+  const givn = (fn + (mn ? ' ' + mn : '')).trim();
+  const nameStr = ln ? `${givn} /${ln}/` : (givn || person.dn || '(Unknown)');
+  L.push(`1 NAME ${nameStr}`);
+  if (fn) L.push(`2 GIVN ${fn}`);
+  if (ln) L.push(`2 SURN ${ln}`);
+
+  // Nickname
+  if (person.nk) { L.push(`1 NAME ${person.nk} //`); L.push(`2 TYPE nick`); L.push(`2 GIVN ${person.nk}`); }
+  // Maiden name
+  if (person.md) { L.push(`1 NAME ${person.md} //`); L.push(`2 TYPE birth`); }
+  // SEX
+  if (person.g) L.push(`1 SEX ${person.g}`);
+  // BIRT
+  if (person.dob || person.loc) { L.push('1 BIRT'); if (person.dob) L.push(`2 DATE ${person.dob}`); if (person.loc) L.push(`2 PLAC ${person.loc}`); }
+  // DEAT
+  if (person.dod || person.dec) { L.push('1 DEAT'); if (person.dod) L.push(`2 DATE ${person.dod}`); }
+  // Contact
+  if (person.ph) L.push(`1 PHON ${person.ph}`);
+  if (person.em) L.push(`1 EMAI ${person.em}`);
+  // Address
+  if (person.a1 || person.ci || person.st || person.co) {
+    L.push(`1 ADDR ${person.a1 || ''}`);
+    if (person.a2) L.push(`2 ADR2 ${person.a2}`);
+    if (person.ci) L.push(`2 CITY ${person.ci}`);
+    if (person.st) L.push(`2 STAE ${person.st}`);
+    if (person.zp) L.push(`2 POST ${person.zp}`);
+    if (person.co) L.push(`2 CTRY ${person.co}`);
+  }
+  // Occupation
+  if (person.prof) L.push(`1 OCCU ${person.prof}`);
+  // Website
+  if (person.ws) L.push(`1 WWW ${person.ws}`);
+  // Notes
+  if (person.notes) L.push(`1 NOTE ${person.notes}`);
+  if (person.bio) L.push(`1 NOTE BIO: ${person.bio}`);
+  if (person.stories) L.push(`1 NOTE STORY: ${person.stories}`);
+  // Custom tags
+  if (person.fb) L.push(`1 _FACEBOOK ${person.fb}`);
+  if (person.ig) L.push(`1 _INSTAGRAM ${person.ig}`);
+  if (person.li) L.push(`1 _LINKEDIN ${person.li}`);
+  if (person.pp) L.push(`1 _PHOTO ${person.pp}`);
+  if (person.emp) L.push(`1 _EMPLOYER ${person.emp}`);
+  if (person.pgl) L.push(`1 _PHOTOGALLERY ${person.pgl}`);
+  if (person.dl) L.push(`1 _DOCUMENTS ${person.dl}`);
+
+  return L;
+}
+
 /* ───── GEDCOM 5.5.1 EXPORTER ───── */
 function exportTreeToGedcom(tree, personMap, familyMap) {
   const lines = [];
@@ -848,96 +905,13 @@ function exportTreeToGedcom(tree, personMap, familyMap) {
   function buildIndi(person) {
     if (exportedPersons.has(person.id)) return null;
     exportedPersons.add(person.id);
-    const L = [];
-    const pid = person.id;
-    L.push(`0 ${pid} INDI`);
-
-    // Primary NAME
-    const fn = person.fn || '';
-    const mn = person.mn || '';
-    const ln = person.ln || '';
-    const givn = (fn + (mn ? ' ' + mn : '')).trim();
-    const nameStr = ln ? `${givn} /${ln}/` : (givn || person.dn || '(Unknown)');
-    L.push(`1 NAME ${nameStr}`);
-    if (fn) L.push(`2 GIVN ${fn}`);
-    if (ln) L.push(`2 SURN ${ln}`);
-
-    // Nickname
-    if (person.nk) {
-      L.push(`1 NAME ${person.nk} //`);
-      L.push(`2 TYPE nick`);
-      L.push(`2 GIVN ${person.nk}`);
-    }
-
-    // Maiden name
-    if (person.md) {
-      L.push(`1 NAME ${person.md} //`);
-      L.push(`2 TYPE birth`);
-    }
-
-    // SEX
-    if (person.g) L.push(`1 SEX ${person.g}`);
-
-    // BIRT
-    if (person.dob || person.loc) {
-      L.push('1 BIRT');
-      if (person.dob) L.push(`2 DATE ${person.dob}`);
-      if (person.loc) L.push(`2 PLAC ${person.loc}`);
-    }
-
-    // DEAT
-    if (person.dod || person.dec) {
-      L.push('1 DEAT');
-      if (person.dod) L.push(`2 DATE ${person.dod}`);
-    }
-
-    // Contact
-    if (person.ph) L.push(`1 PHON ${person.ph}`);
-    if (person.em) L.push(`1 EMAI ${person.em}`);
-
-    // Address
-    if (person.a1 || person.ci || person.st || person.co) {
-      L.push(`1 ADDR ${person.a1 || ''}`);
-      if (person.a2) L.push(`2 ADR2 ${person.a2}`);
-      if (person.ci) L.push(`2 CITY ${person.ci}`);
-      if (person.st) L.push(`2 STAE ${person.st}`);
-      if (person.zp) L.push(`2 POST ${person.zp}`);
-      if (person.co) L.push(`2 CTRY ${person.co}`);
-    }
-
-    // Occupation
-    if (person.prof) L.push(`1 OCCU ${person.prof}`);
-
-    // Website
-    if (person.ws) L.push(`1 WWW ${person.ws}`);
-
-    // Notes
-    if (person.notes) L.push(`1 NOTE ${person.notes}`);
-    if (person.bio) L.push(`1 NOTE BIO: ${person.bio}`);
-    if (person.stories) L.push(`1 NOTE STORY: ${person.stories}`);
-
-    // Custom tags for rich fields
-    if (person.fb) L.push(`1 _FACEBOOK ${person.fb}`);
-    if (person.ig) L.push(`1 _INSTAGRAM ${person.ig}`);
-    if (person.li) L.push(`1 _LINKEDIN ${person.li}`);
-    if (person.pp) L.push(`1 _PHOTO ${person.pp}`);
-    if (person.emp) L.push(`1 _EMPLOYER ${person.emp}`);
-    if (person.pgl) L.push(`1 _PHOTOGALLERY ${person.pgl}`);
-    if (person.dl) L.push(`1 _DOCUMENTS ${person.dl}`);
-
-    // FAMS refs (families where this person is husband/wife)
-    (famsLookup[pid] || []).forEach(ref => L.push(`1 FAMS ${ref}`));
-    // FAMC refs (families where this person is a child)
-    (famcLookup[pid] || []).forEach(ref => L.push(`1 FAMC ${ref}`));
-
+    const L = personToGedcomLines(person);
+    // Add FAMS/FAMC refs
+    (famsLookup[person.id] || []).forEach(ref => L.push(`1 FAMS ${ref}`));
+    (famcLookup[person.id] || []).forEach(ref => L.push(`1 FAMC ${ref}`));
     // Preserved extra GEDCOM lines (OBJE, RESI, BURI, _CRE, CHAN, etc.)
     if (person._xg) { person._xg.split('\n').forEach(xl => { if (xl.trim()) L.push(xl); }); }
-    else {
-      L.push('1 CHAN');
-      L.push(`2 DATE ${gedcomDate()}`);
-      L.push(`3 TIME ${gedcomTime()}`);
-    }
-
+    else { L.push('1 CHAN'); L.push(`2 DATE ${gedcomDate()}`); L.push(`3 TIME ${gedcomTime()}`); }
     return L;
   }
 
@@ -1590,40 +1564,8 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
   }
   
   function buildReplacementIndi(p) {
-    const L = [`0 ${p.id} INDI`];
-    const fn = p.fn || '', mn = p.mn || '', ln = p.ln || '';
-    const givn = (fn + (mn ? ' ' + mn : '')).trim();
-    const nm = ln ? `${givn} /${ln}/` : (givn || p.dn || '(Unknown)');
-    L.push(`1 NAME ${nm}`);
-    if (fn) L.push(`2 GIVN ${fn}`);
-    if (ln) L.push(`2 SURN ${ln}`);
-    if (p.nk) { L.push(`1 NAME ${p.nk} //`); L.push(`2 TYPE nick`); L.push(`2 GIVN ${p.nk}`); }
-    if (p.md) { L.push(`1 NAME ${p.md} //`); L.push(`2 TYPE birth`); }
-    if (p.g) L.push(`1 SEX ${p.g}`);
-    if (p.dob || p.loc) { L.push('1 BIRT'); if (p.dob) L.push(`2 DATE ${p.dob}`); if (p.loc) L.push(`2 PLAC ${p.loc}`); }
-    if (p.dod || p.dec) { L.push('1 DEAT'); if (p.dod) L.push(`2 DATE ${p.dod}`); }
-    if (p.ph) L.push(`1 PHON ${p.ph}`);
-    if (p.em) L.push(`1 EMAI ${p.em}`);
-    if (p.a1 || p.ci || p.st || p.co) {
-      L.push(`1 ADDR ${p.a1 || ''}`);
-      if (p.a2) L.push(`2 ADR2 ${p.a2}`);
-      if (p.ci) L.push(`2 CITY ${p.ci}`);
-      if (p.st) L.push(`2 STAE ${p.st}`);
-      if (p.zp) L.push(`2 POST ${p.zp}`);
-      if (p.co) L.push(`2 CTRY ${p.co}`);
-    }
-    if (p.prof) L.push(`1 OCCU ${p.prof}`);
-    if (p.ws) L.push(`1 WWW ${p.ws}`);
-    if (p.notes) L.push(`1 NOTE ${p.notes}`);
-    if (p.bio) L.push(`1 NOTE BIO: ${p.bio}`);
-    if (p.stories) L.push(`1 NOTE STORY: ${p.stories}`);
-    if (p.fb) L.push(`1 _FACEBOOK ${p.fb}`);
-    if (p.ig) L.push(`1 _INSTAGRAM ${p.ig}`);
-    if (p.li) L.push(`1 _LINKEDIN ${p.li}`);
-    if (p.pp) L.push(`1 _PHOTO ${p.pp}`);
-    if (p.emp) L.push(`1 _EMPLOYER ${p.emp}`);
-    if (p.pgl) L.push(`1 _PHOTOGALLERY ${p.pgl}`);
-    if (p.dl) L.push(`1 _DOCUMENTS ${p.dl}`);
+    const L = personToGedcomLines(p);
+    // Add FAMS/FAMC refs from the family map
     (famsLookup2[p.id] || []).forEach(ref => L.push(`1 FAMS ${ref}`));
     (famcLookup2[p.id] || []).forEach(ref => L.push(`1 FAMC ${ref}`));
     // Preserved extra GEDCOM lines (OBJE, RESI, BURI, _CRE, CHAN, etc.)
@@ -1631,26 +1573,25 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
     return L;
   }
 
-  // Determine which persons get field-level patches vs full replacement
-  const fieldPatchIds = new Set((exportFields || []).map(f => f.personId));
-  const fullReplacePersons = existingPersons.filter(p => !fieldPatchIds.has(p.id));
-  const fullReplaceIds = new Set(fullReplacePersons.map(p => p.id));
+  // ── ONE PATH: Replace INDI blocks for all exported existing persons ──
+  // For each person: extract cardinal features from original, build fresh FTLS INDI, append cardinal.
   const exportPMap = {};
   for (const p of existingPersons) exportPMap[p.id] = p;
+  const existingExportIds = new Set(existingPersons.map(p => p.id));
 
-  // Full INDI replacement for whole-person exports
-  // BUT: preserve unknown tags (OBJE, RESI, BURI, _CRE, CHAN) from original if _xg is empty
+  // Tags that FTLS manages (everything else is "cardinal" and gets preserved)
   const KNOWN_EXPORT_L1 = new Set(['NAME','SEX','BIRT','DEAT','ADDR','EMAI','EMAIL','PHON',
     '_FACEBOOK','_INSTAGRAM','_LINKEDIN','WWW','_PHOTO','OCCU','_EMPLOYER',
     'NOTE','_PHOTOGALLERY','_DOCUMENTS','FAMC','FAMS']);
+  
   for (let i = before.length - 1; i >= 0; i--) {
     const m = before[i].match(/^0 (@[^@]+@) INDI/);
-    if (!m || !fullReplaceIds.has(m[1])) continue;
+    if (!m || !existingExportIds.has(m[1])) continue;
     const p = exportPMap[m[1]];
     if (!p) continue;
     let j = i + 1;
     while (j < before.length && !before[j].trim().startsWith('0 ')) j++;
-    // If person has no _xg, extract unknown tags from original block to preserve them
+    // Extract cardinal features from original block (OBJE, RESI, BURI, _CRE, CHAN, DIV, etc.)
     if (!p._xg) {
       const origLines = before.slice(i+1, j);
       const preserved = [];
@@ -1661,61 +1602,17 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
           preserved.push(origLines[k].trim());
           k++;
           while (k < origLines.length && origLines[k].trim().split(' ',2)[0] !== '1') {
-            preserved.push(origLines[k].trim());
-            k++;
+            preserved.push(origLines[k].trim()); k++;
           }
           continue;
         }
         k++;
       }
-      if (preserved.length > 0) {
-        p._xg = preserved.join('\n');
-      }
+      if (preserved.length > 0) p._xg = preserved.join('\n');
     }
     before.splice(i, j - i, ...buildReplacementIndi(p));
   }
 
-  // Field-level patching for selected-fields-only exports
-  const tagMap = {
-    fn:'NAME>GIVN', ln:'NAME>SURN', mn:'NAME>GIVN',
-    dob:'BIRT>DATE', dod:'DEAT>DATE', loc:'BIRT>PLAC',
-    ph:'PHON', em:'EMAI', prof:'OCCU', ws:'WWW',
-    notes:'NOTE', bio:'NOTE', stories:'NOTE',
-    a1:'ADDR', ci:'ADDR>CITY', st:'ADDR>STAE', zp:'ADDR>POST', co:'ADDR>CTRY',
-  };
-  for (const { personId, fields } of (exportFields || [])) {
-    for (let i = 0; i < before.length; i++) {
-      if (!before[i].trim().startsWith(`0 ${personId} INDI`)) continue;
-      let j = i + 1;
-      while (j < before.length && !before[j].trim().startsWith('0 ')) j++;
-      for (const { key, value } of fields) {
-        if (!value) continue;
-        const tag = tagMap[key];
-        if (!tag) continue;
-        if (tag.includes('>')) {
-          const [par, chi] = tag.split('>');
-          let found = false;
-          for (let k = i+1; k < j; k++) {
-            if (before[k].trim().startsWith(`1 ${par}`)) {
-              for (let l = k+1; l < j && before[l].trim().startsWith('2 '); l++) {
-                if (before[l].trim().startsWith(`2 ${chi}`)) { before[l] = `2 ${chi} ${value}`; found = true; break; }
-              }
-              if (!found) { before.splice(k+1, 0, `2 ${chi} ${value}`); j++; found = true; }
-              break;
-            }
-          }
-          if (!found) { before.splice(j, 0, `1 ${par}`, `2 ${chi} ${value}`); j += 2; }
-        } else {
-          let found = false;
-          for (let k = i+1; k < j; k++) {
-            if (before[k].trim().startsWith(`1 ${tag} `) || before[k].trim() === `1 ${tag}`) { before[k] = `1 ${tag} ${value}`; found = true; break; }
-          }
-          if (!found) { before.splice(j, 0, `1 ${tag} ${value}`); j++; }
-        }
-      }
-      break;
-    }
-  }
 
   return [...before, ...newLines, '0 TRLR'].join('\n') + '\n';
 }
@@ -4060,8 +3957,8 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
     // Changed persons — split fields by direction
     diffResult.matched.filter(m => m.diffs.length > 0).forEach(m => {
       const impFields = [], expFields = [];
-      m.diffs.forEach(d => {
-        if (d.key === '_famc') return; // Branch changes use Move Branch, not field import/export
+      const nonBranchDiffs = m.diffs.filter(d => d.key !== '_famc');
+      nonBranchDiffs.forEach(d => {
         const dir = getFieldDirection(m.id, d.key);
         if (dir === 'import') impFields.push(d);
         else if (dir === 'export') expFields.push(d);
