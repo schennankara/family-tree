@@ -648,7 +648,7 @@ async function migrateGedcomToSupabase(gedcomText, onProgress) {
         id: el.pointer,
         husband_id: gv(el,'HUSB') || null,
         wife_id: gv(el,'WIFE') || null,
-        children: el.children.filter(c => c.tag === 'CHIL').map(c => c.value),
+        children: [...new Set(el.children.filter(c => c.tag === 'CHIL').map(c => c.value))],
         marriage_date: gnv(el,'MARR','DATE'),
         marriage_place: gnv(el,'MARR','PLAC'),
       });
@@ -844,8 +844,9 @@ function personToGedcomLines(person) {
   // Contact
   if (person.ph) L.push(`1 PHON ${person.ph}`);
   if (person.em) L.push(`1 EMAI ${person.em}`);
-  // Address
-  if (person.a1 || person.ci || person.st || person.co) {
+  // Address — skip if _xg already has RESI or ADDR (avoid duplication)
+  const xgHasAddr = person._xg && (/^1 (RESI|ADDR)/m).test(person._xg);
+  if (!xgHasAddr && (person.a1 || person.ci || person.st || person.co)) {
     L.push(`1 ADDR ${person.a1 || ''}`);
     if (person.a2) L.push(`2 ADR2 ${person.a2}`);
     if (person.ci) L.push(`2 CITY ${person.ci}`);
@@ -1050,7 +1051,7 @@ async function downloadGedcom(tree, personMap, familyMap) {
         }
       }
       for (const m of meta) {
-        if (referencedObje.has(m.id) || m.record_type === 'NOTE') {
+        if (referencedObje.has(m.id) || m.record_type === 'NOTE' || m.record_type === 'REPO') {
           metaLines.push(m.raw_gedcom);
         }
       }
@@ -1277,19 +1278,29 @@ async function mergeFamilyToDb(extFam) {
   try {
     const existing = await sbFetch(`families?id=eq.${extFam.id}&select=*`);
     if (existing.length > 0) {
-      // Family exists — only add new children, don't overwrite
+      // Family exists — update empty spouse slots + add new children
+      const patch = {};
+      // Fill empty husband/wife slots (don't overwrite existing)
+      if (!existing[0].husband_id && extFam.husb) patch.husband_id = extFam.husb;
+      if (!existing[0].wife_id && extFam.wife) patch.wife_id = extFam.wife;
+      // Add new children
       const existingKids = new Set(existing[0].children || []);
       const newKids = (extFam.children || []).filter(cid => !existingKids.has(cid));
-      if (newKids.length > 0) {
-        const mergedKids = [...(existing[0].children || []), ...newKids];
+      if (newKids.length > 0) patch.children = [...(existing[0].children || []), ...newKids];
+      // Apply if anything changed
+      if (Object.keys(patch).length > 0) {
         await sbFetch(`families?id=eq.${extFam.id}`, {
           method: 'PATCH',
-          body: JSON.stringify({ children: mergedKids }),
+          body: JSON.stringify(patch),
           headers: { 'Prefer': 'return=minimal' }
         });
-        return { skipped: false, action: 'added ' + newKids.length + ' children' };
+        const actions = [];
+        if (patch.husband_id) actions.push('added husband');
+        if (patch.wife_id) actions.push('added wife');
+        if (patch.children) actions.push('added ' + newKids.length + ' children');
+        return { skipped: false, action: actions.join(', ') };
       }
-      return { skipped: true, reason: 'family exists, no new children' };
+      return { skipped: true, reason: 'family exists, no changes needed' };
     }
   } catch(e) {}
   
@@ -1450,7 +1461,7 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap) 
       }
     }
     for (const meta of window.gedcomMetaRecords) {
-      if (referencedObje.has(meta.id) || meta.record_type === 'NOTE') {
+      if (referencedObje.has(meta.id) || meta.record_type === 'NOTE' || meta.record_type === 'REPO') {
         lines.push(meta.raw_gedcom);
       }
     }
@@ -1598,6 +1609,46 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
   return [...before, ...newLines, '0 TRLR'].join('\n') + '\n';
 }
 
+
+/* ───── GEDCOM Link Repair: Cross-reference FAMC/FAMS ───── */
+// After parsing, ensure bidirectional links:
+// - If FAM has CHIL → INDI must have FAMC
+// - If FAM has HUSB/WIFE → INDI must have FAMS
+function repairGedcomLinks(people, families) {
+  let repaired = 0;
+  for (const [fid, fam] of Object.entries(families)) {
+    // Repair FAMC for children
+    for (const cid of (fam.children || [])) {
+      const p = people[cid];
+      if (p && !(p.famc || []).includes(fid)) {
+        if (!p.famc) p.famc = [];
+        p.famc.push(fid);
+        repaired++;
+      }
+    }
+    // Repair FAMS for husband
+    if (fam.husb && people[fam.husb]) {
+      const p = people[fam.husb];
+      if (!(p.fams || []).includes(fid)) {
+        if (!p.fams) p.fams = [];
+        p.fams.push(fid);
+        repaired++;
+      }
+    }
+    // Repair FAMS for wife
+    if (fam.wife && people[fam.wife]) {
+      const p = people[fam.wife];
+      if (!(p.fams || []).includes(fid)) {
+        if (!p.fams) p.fams = [];
+        p.fams.push(fid);
+        repaired++;
+      }
+    }
+  }
+  if (repaired > 0) console.log(`repairGedcomLinks: repaired ${repaired} missing FAMC/FAMS links`);
+  return repaired;
+}
+
 /* ───── GEDCOM 5.5.1 IMPORTER / PARSER ───── */
 function parseGedcomFile(text) {
   // Normalize line endings
@@ -1635,6 +1686,23 @@ function parseGedcomFile(text) {
     stack.push(el);
   }
 
+  // Check character encoding (#13)
+  const headEl = elements.find(e => e.tag === 'HEAD');
+  if (headEl) {
+    const charEl = headEl.children.find(c => c.tag === 'CHAR');
+    if (charEl && charEl.value && charEl.value.toUpperCase() !== 'UTF-8' && charEl.value.toUpperCase() !== 'UNICODE') {
+      console.warn('GEDCOM encoding is ' + charEl.value + ', not UTF-8. Some characters may display incorrectly.');
+    }
+    // Check GEDCOM version (#19)
+    const gedcEl = headEl.children.find(c => c.tag === 'GEDC');
+    if (gedcEl) {
+      const versEl = gedcEl.children.find(c => c.tag === 'VERS');
+      if (versEl && versEl.value && versEl.value.startsWith('7.')) {
+        console.warn('GEDCOM 7.x detected. This parser supports 5.5.1. Some features may not parse correctly.');
+      }
+    }
+  }
+
   // Extract individuals
   const people = {};
   const families = {};
@@ -1648,6 +1716,9 @@ function parseGedcomFile(text) {
       families[f.id] = f;
     }
   }
+
+  // Repair missing FAMC/FAMS links (#1/#6)
+  repairGedcomLinks(people, families);
 
   // Compute generations & build tree
   return buildTreeFromFlat(people, families);
@@ -1807,7 +1878,7 @@ function parseFam(el) {
     id: el.pointer,
     husb: getChildValue(el, 'HUSB'),
     wife: getChildValue(el, 'WIFE'),
-    children: el.children.filter(c => c.tag === 'CHIL').map(c => c.value),
+    children: [...new Set(el.children.filter(c => c.tag === 'CHIL').map(c => c.value))],
     mdate: getNestedValue(el, 'MARR', 'DATE'),
     mplace: getNestedValue(el, 'MARR', 'PLAC'),
   };
@@ -3807,6 +3878,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
             if (el.tag === 'INDI' && el.pointer) { const p = parseIndi(el); extPeople[p.id] = p; }
             else if (el.tag === 'FAM' && el.pointer) { const f = parseFam(el); extFamilies[f.id] = f; }
           }
+          repairGedcomLinks(extPeople, extFamilies);
           setExtFamilyIds(new Set(Object.keys(extFamilies)));
           setExtFamiliesMap(extFamilies);
           setExtPeopleMap(extPeople);
@@ -3854,6 +3926,14 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
     const path = [], pathIds = [];
     let curId = personId;
     const visited = new Set();
+    // Helper: check if a person has parents in FTLS
+    const hasParentsInFtls = (pid) => {
+      if (!pid) return false;
+      for (const [fid, fam] of Object.entries(familyMap)) {
+        if ((fam.children||[]).includes(pid)) return true;
+      }
+      return false;
+    };
     while (curId && !visited.has(curId)) {
       visited.add(curId);
       const p = personMap[curId];
@@ -3862,7 +3942,13 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
       let parentFound = false;
       for (const [fid, fam] of Object.entries(familyMap)) {
         if ((fam.children||[]).includes(curId)) {
-          curId = fam.husband_id || fam.wife_id || null;
+          // Pick the parent who has parents themselves (continues the chain)
+          const hid = fam.husband_id, wid = fam.wife_id;
+          if (hid && wid) {
+            curId = hasParentsInFtls(hid) ? hid : hasParentsInFtls(wid) ? wid : hid;
+          } else {
+            curId = hid || wid || null;
+          }
           parentFound = true;
           break;
         }
@@ -3884,6 +3970,17 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
     const path = [], pathIds = [];
     let curId = personId;
     const visited = new Set();
+    // Helper: check if a person has parents in ext or FTLS families
+    const hasParents = (pid) => {
+      if (!pid) return false;
+      for (const [fid, fam] of Object.entries(extFamiliesMap)) {
+        if ((fam.children||[]).includes(pid)) return true;
+      }
+      for (const [fid, fam] of Object.entries(familyMap)) {
+        if ((fam.children||[]).includes(pid)) return true;
+      }
+      return false;
+    };
     while (curId && !visited.has(curId)) {
       visited.add(curId);
       const p = extPeopleMap[curId] || personMap[curId];
@@ -3892,7 +3989,12 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
       let parentFound = false;
       for (const [fid, fam] of Object.entries(extFamiliesMap)) {
         if ((fam.children||[]).includes(curId)) {
-          curId = fam.husb || fam.wife || null;
+          const hid = fam.husb, wid = fam.wife;
+          if (hid && wid) {
+            curId = hasParents(hid) ? hid : hasParents(wid) ? wid : hid;
+          } else {
+            curId = hid || wid || null;
+          }
           parentFound = true;
           break;
         }
@@ -3900,7 +4002,12 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
       if (!parentFound) {
         for (const [fid, fam] of Object.entries(familyMap)) {
           if ((fam.children||[]).includes(curId)) {
-            curId = fam.husband_id || fam.wife_id || null;
+            const hid = fam.husband_id, wid = fam.wife_id;
+            if (hid && wid) {
+              curId = hasParents(hid) ? hid : hasParents(wid) ? wid : hid;
+            } else {
+              curId = hid || wid || null;
+            }
             parentFound = true;
             break;
           }
@@ -3997,6 +4104,39 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
         if (result?.skipped) log.push('⊘ Skipped family ' + fam.id + ' (' + result.reason + ')');
         else log.push('✓ Family ' + fam.id + ' — ' + (result?.action || 'created'));
       } catch(e) { log.push('✗ Family ' + fam.id + ': ' + e.message); }
+    }
+    // Auto-update: find ALL external families that reference any imported person
+    // This catches cases where a new child was added to an existing FTLS family
+    const importedPersonIds = new Set(
+      basket.imports.filter(i => i.type === 'ext_person').map(i => i.person.id)
+    );
+    const alreadyProcessedFams = new Set(basket.importFams.map(f => f.id));
+    if (importedPersonIds.size > 0 && extFamiliesMap) {
+      for (const [fid, fam] of Object.entries(extFamiliesMap)) {
+        if (alreadyProcessedFams.has(fid)) continue;
+        const involves = importedPersonIds.has(fam.husb) || importedPersonIds.has(fam.wife) ||
+          (fam.children||[]).some(c => importedPersonIds.has(c));
+        if (!involves) continue;
+        try {
+          const result = await mergeFamilyToDb(fam);
+          if (result && !result.skipped) log.push('✓ Auto-updated family: ' + fid + ' — ' + (result.action || 'updated'));
+        } catch(e) { log.push('⚠ Auto-family ' + fid + ': ' + e.message); }
+      }
+    }
+    // Post-import validation: check for orphan family links (#22)
+    if (log.some(l => l.startsWith('✓'))) {
+      try {
+        const allPersons = await sbFetch('persons?select=id');
+        const allFamilies = await sbFetch('families?select=id,husband_id,wife_id,children');
+        const pidSet = new Set(allPersons.map(p => p.id));
+        for (const f of allFamilies) {
+          if (f.husband_id && !pidSet.has(f.husband_id)) log.push('⚠ Family ' + f.id + ' references missing husband ' + f.husband_id);
+          if (f.wife_id && !pidSet.has(f.wife_id)) log.push('⚠ Family ' + f.id + ' references missing wife ' + f.wife_id);
+          for (const cid of (f.children || [])) {
+            if (!pidSet.has(cid)) log.push('⚠ Family ' + f.id + ' references missing child ' + cid);
+          }
+        }
+      } catch(e) { log.push('⚠ Could not run post-import validation: ' + e.message); }
     }
     if (log.length === 0) log.push('Nothing to import.');
     setMergeLog(prev => [...prev, ...log]);
@@ -4821,6 +4961,20 @@ function BackfillModal({onClose, onComplete}) {
       }
     }
     if (noteId) notes[noteId] = {text: noteLines.join('\n'), raw: noteRaw.join('\n')};
+
+    // ─── Parse REPO records ───
+    const repos = [];
+    for (let i = 0; i < allLines.length; i++) {
+      const parts = allLines[i].trim().split(/\s+/, 3);
+      if (parts[0] === '0' && parts.length >= 3 && parts[2] === 'REPO') {
+        const repoId = parts[1];
+        const repoLines = [allLines[i].trim()];
+        let j = i + 1;
+        while (j < allLines.length && !allLines[j].trim().startsWith('0 ')) { repoLines.push(allLines[j].trim()); j++; }
+        repos.push({ id: repoId, raw: repoLines.join('\n') });
+        i = j - 1;
+      }
+    }
 
     // ─── Parse OBJE records ───
     const objeRecords = {};
