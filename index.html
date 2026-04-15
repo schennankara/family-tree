@@ -3853,12 +3853,10 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
       visited.add(curId);
       const p = personMap[curId];
       if (!p) break;
-      if (curId !== personId) path.unshift(p.fn || p.dn || '?');
-      // Find parent family
+      if (curId !== personId) path.unshift(p.dn || p.fn || '?');
       let parentFound = false;
       for (const [fid, fam] of Object.entries(familyMap)) {
         if ((fam.children||[]).includes(curId)) {
-          // Go to father, or mother if no father
           curId = fam.husband_id || fam.wife_id || null;
           parentFound = true;
           break;
@@ -3867,7 +3865,6 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
       if (!parentFound) break;
     }
     if (path.length === 0) {
-      // Not blood — check if spouse connects to tree
       for (const [fid, fam] of Object.entries(familyMap)) {
         const hid = fam.husband_id, wid = fam.wife_id;
         if (hid === personId && wid && personMap[wid]) return '⚭ ' + (personMap[wid].dn||'?');
@@ -3886,7 +3883,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
       visited.add(curId);
       const p = extPeopleMap[curId];
       if (!p) break;
-      if (curId !== personId) path.unshift(p.fn || p.dn || '?');
+      if (curId !== personId) path.unshift(p.dn || p.fn || '?');
       let parentFound = false;
       for (const [fid, fam] of Object.entries(extFamiliesMap)) {
         if ((fam.children||[]).includes(curId)) {
@@ -4263,41 +4260,167 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
               </div>);
             })()}
 
-            {/* ──── EXTERNAL ONLY (now integrated into Changed tab, keep for backward compat) ──── */}
+            {/* ──── EXTERNAL ONLY ──── */}
             {tab==='ext_only' && (()=>{
               const persons = diffResult.extOnly;
               const extFams = diffResult.familyDiffs.filter(f=>f.type==='ext_only');
+              
+              // Resolve names helper
+              const extName = (id) => {
+                if (!id) return '?';
+                const p = extPeopleMap[id];
+                return p ? (p.dn || p.fn || '?') : (personMap[id]?.dn || id);
+              };
+              
+              // Determine connection for each person
+              const isConnected = (p) => {
+                for (const [fid, fam] of Object.entries(extFamiliesMap)) {
+                  const hid = fam.husb||'', wid = fam.wife||'', kids = fam.children||[];
+                  if (kids.includes(p.id)) { if (personMap[hid] || personMap[wid]) return extName(personMap[hid] ? hid : wid); }
+                  if (hid === p.id || wid === p.id) { 
+                    const spId = hid === p.id ? wid : hid;
+                    if (personMap[spId]) return extName(spId);
+                    for (const k of kids) { if (personMap[k]) return extName(k); }
+                  }
+                }
+                return null;
+              };
+              
+              // Find what role this person plays (child of, spouse of, parent of)
+              const getRole = (p) => {
+                for (const [fid, fam] of Object.entries(extFamiliesMap)) {
+                  const hid = fam.husb||'', wid = fam.wife||'', kids = fam.children||[];
+                  if (kids.includes(p.id)) {
+                    const dadName = extName(hid), momName = extName(wid);
+                    return `child of ${[dadName, momName].filter(n=>n!=='?').join(' & ')}`;
+                  }
+                  if (hid === p.id || wid === p.id) {
+                    const spId = hid === p.id ? wid : hid;
+                    if (spId) return `spouse of ${extName(spId)}`;
+                  }
+                }
+                return '';
+              };
+              
+              // Split into connected vs unconnected vs unnamed
+              const unnamed = persons.filter(p => !p.fn && !p.ln && (!p.dn || p.dn === '(Unknown)'));
+              const named = persons.filter(p => p.fn || p.ln || (p.dn && p.dn !== '(Unknown)'));
+              const connected = named.filter(p => isConnected(p));
+              const unconnected = named.filter(p => !isConnected(p));
+              
+              // Find families needed for selected persons
+              const getNeededFamilies = () => {
+                const needed = [];
+                const markedIds = new Set(Object.entries(extDir).filter(([k,v])=>v==='import').map(([k])=>k));
+                for (const f of extFams) {
+                  const fam = f.ext;
+                  const involves = markedIds.has(fam.husb) || markedIds.has(fam.wife) || 
+                    (fam.children||[]).some(c => markedIds.has(c));
+                  if (involves) needed.push(f);
+                }
+                return needed;
+              };
+              
+              // Auto-mark families when persons are marked
+              const markPerson = (pid, dir) => {
+                setExtDir(prev => ({...prev, [pid]: dir}));
+                // Auto-mark needed families
+                if (dir === 'import') {
+                  const famIds = {};
+                  for (const f of extFams) {
+                    const fam = f.ext;
+                    if (fam.husb === pid || fam.wife === pid || (fam.children||[]).includes(pid)) {
+                      famIds[f.id] = 'import';
+                    }
+                  }
+                  if (Object.keys(famIds).length > 0) setExtFamDir(prev => ({...prev, ...famIds}));
+                }
+              };
+              
+              const markAllConnected = () => {
+                const d = {...extDir};
+                const fd = {...extFamDir};
+                connected.forEach(p => {
+                  d[p.id] = 'import';
+                  for (const f of extFams) {
+                    const fam = f.ext;
+                    if (fam.husb === p.id || fam.wife === p.id || (fam.children||[]).includes(p.id)) fd[f.id] = 'import';
+                  }
+                });
+                setExtDir(d);
+                setExtFamDir(fd);
+              };
+              
+              const clearAll = () => { setExtDir({}); setExtFamDir({}); };
+              
+              const markedCount = Object.values(extDir).filter(v=>v==='import').length;
+              const neededFams = getNeededFamilies();
+              
               return (<div style={{ padding:'12px 0' }}>
-                <div style={{ fontSize:12, color:DM, marginBottom:8 }}>These are also shown in the Changed tab above, organized by family connection. Use this tab for a flat view.</div>
-                {persons.length>0 && <>
-                  <div style={hdr}>Persons ({persons.length})</div>
+                {/* ── CONNECTED TO TREE ── */}
+                {connected.length > 0 && <>
+                  <div style={{...hdr, color:'#7eb8d0'}}>🆕 Connected to Tree ({connected.length})</div>
+                  <div style={{ fontSize:12, color:DM, marginBottom:8 }}>New people linked to someone already in FTLS. Families are imported automatically.</div>
                   <div style={selBar}>
-                    <button style={lnkBtn} onClick={()=>{ const d={}; persons.forEach(p=>{d[p.id]='import'}); setExtDir(d); }}>⬇ All Import</button>
-                    <button style={lnkBtn} onClick={()=>setExtDir({})}>Clear All</button>
-                    <span style={{ fontSize:11, color:DM }}>{Object.values(extDir).filter(v=>v==='import').length} marked</span>
+                    <button style={lnkBtn} onClick={markAllConnected}>⬇ All Import</button>
+                    <button style={lnkBtn} onClick={clearAll}>Clear All</button>
+                    <span style={{ fontSize:11, color:DM }}>{markedCount} marked</span>
                   </div>
-                  {persons.map(p => (<div key={p.id} style={{ ...rowSt }}>
-                    <div style={{ display:'flex', alignItems:'center', gap:8 }}>
-                      <DirBtn dir={extDir[p.id]||null} onSet={(d)=>setExtDir(prev=>({...prev,[p.id]:d}))} allowExport={false} />
-                      <span style={{ width:8, height:8, borderRadius:'50%', background:p.g==='M'?MC:FC, flexShrink:0 }} />
-                      <span style={{ color:TX, flex:1 }}>{p.dn||'(Unknown)'}</span>
-                      {p.dob && <span style={{ color:DM, fontSize:11 }}>b.{p.dob}</span>}
-                      <span style={{ color:'#5a5548', fontSize:10 }}>{p.id}</span>
-                    </div>
-                    <FamilyPath personId={p.id} showFtls={false} showExt={true} />
+                  {connected.map(p => {
+                    const conn = isConnected(p);
+                    const role = getRole(p);
+                    return (<div key={p.id} style={{ ...rowSt }}>
+                      <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+                        <DirBtn dir={extDir[p.id]||null} onSet={(d)=>markPerson(p.id, d)} allowExport={false} />
+                        <span style={{ width:8, height:8, borderRadius:'50%', background:p.g==='M'?MC:FC, flexShrink:0 }} />
+                        <span style={{ color:TX, flex:1 }}>
+                          {p.dn||'(Unknown)'}
+                          {role && <span style={{ color:DM, fontSize:11, marginLeft:6 }}>({role})</span>}
+                        </span>
+                        {p.dob && <span style={{ color:DM, fontSize:11 }}>b.{p.dob}</span>}
+                      </div>
+                      <FamilyPath personId={p.id} showFtls={false} showExt={true} />
+                    </div>);
+                  })}
+                </>}
+                
+                {/* ── UNCONNECTED ── */}
+                {unconnected.length > 0 && <>
+                  <div style={{...hdr, marginTop:20, color:'#7a7568'}}>Unconnected ({unconnected.length})</div>
+                  <div style={{ fontSize:12, color:DM, marginBottom:8 }}>Not linked to anyone in FTLS yet. Import individually if you recognize them.</div>
+                  {unconnected.map(p => {
+                    const role = getRole(p);
+                    return (<div key={p.id} style={{ ...rowSt }}>
+                      <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+                        <DirBtn dir={extDir[p.id]||null} onSet={(d)=>markPerson(p.id, d)} allowExport={false} />
+                        <span style={{ width:8, height:8, borderRadius:'50%', background:p.g==='M'?MC:FC, flexShrink:0 }} />
+                        <span style={{ color:'#7a7568', flex:1 }}>
+                          {p.dn||'(Unknown)'}
+                          {role && <span style={{ color:'#5a5548', fontSize:11, marginLeft:6 }}>({role})</span>}
+                        </span>
+                        {p.dob && <span style={{ color:DM, fontSize:11 }}>b.{p.dob}</span>}
+                      </div>
+                      <FamilyPath personId={p.id} showFtls={false} showExt={true} />
+                    </div>);
+                  })}
+                </>}
+                
+                {/* ── UNNAMED PLACEHOLDERS ── */}
+                {unnamed.length > 0 && <>
+                  <div style={{...hdr, marginTop:20, color:'#5a4040'}}>Unnamed Placeholders ({unnamed.length}) — skip</div>
+                  <div style={{ fontSize:11, color:'#5a4040', marginBottom:4 }}>Records with no name — likely data entry placeholders. Not importable.</div>
+                  {unnamed.map(p => (<div key={p.id} style={{ ...rowSt, color:'#5a4040', fontSize:11 }}>
+                    {p.id} — {p.g==='M'?'Male':'Female'} {getRole(p)}
                   </div>))}
                 </>}
-                {extFams.length>0 && <>
-                  <div style={hdr}>Families ({extFams.length})</div>
-                  <div style={selBar}>
-                    <button style={lnkBtn} onClick={()=>{ const d={}; extFams.forEach(f=>{d[f.id]='import'}); setExtFamDir(d); }}>⬇ All Import</button>
-                    <button style={lnkBtn} onClick={()=>setExtFamDir({})}>Clear All</button>
-                  </div>
-                  {extFams.map(f => (<div key={f.id} style={{ ...rowSt, display:'flex', alignItems:'center', gap:8 }}>
-                    <DirBtn dir={extFamDir[f.id]||null} onSet={(d)=>setExtFamDir(prev=>({...prev,[f.id]:d}))} allowExport={false} />
-                    <span style={{ color:TX, fontSize:12, flex:1 }}>{f.id} — H:{f.ext.husb||'?'} W:{f.ext.wife||'?'} {(f.ext.children||[]).length}ch</span>
+                
+                {/* ── AUTO-INCLUDED FAMILIES (info only) ── */}
+                {neededFams.length > 0 && <div style={{ marginTop:16, padding:'8px 12px', background:'rgba(126,184,208,0.04)', borderRadius:6, border:'1px solid '+BR }}>
+                  <div style={{ fontSize:11, color:'#7eb8d0', marginBottom:4 }}>📎 {neededFams.length} families will be auto-imported with the selected persons:</div>
+                  {neededFams.map(f => (<div key={f.id} style={{ fontSize:11, color:DM, paddingLeft:8 }}>
+                    {extName(f.ext.husb)} ⚭ {extName(f.ext.wife)} — {(f.ext.children||[]).length} children
                   </div>))}
-                </>}
+                </div>}
               </div>);
             })()}
 
@@ -4356,9 +4479,13 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
                       {item.type==='ext_person' && <span style={badge('rgba(126,184,208,0.5)')}>new</span>}
                     </span>
                   </div>))}
-                  {basket.importFams.map((fam, i) => (<div key={'f'+i} style={{ ...rowSt, fontSize:12, color:TX }}>
-                    Family {fam.id} — H:{fam.husb||'?'} W:{fam.wife||'?'} {(fam.children||[]).length}ch <span style={badge('rgba(126,184,208,0.5)')}>new</span>
-                  </div>))}
+                  {basket.importFams.map((fam, i) => {
+                    const hName = fam.husb ? (extPeopleMap[fam.husb]?.dn || personMap[fam.husb]?.dn || fam.husb) : '?';
+                    const wName = fam.wife ? (extPeopleMap[fam.wife]?.dn || personMap[fam.wife]?.dn || fam.wife) : '?';
+                    return (<div key={'f'+i} style={{ ...rowSt, fontSize:12, color:TX }}>
+                      📎 {hName} ⚭ {wName} — {(fam.children||[]).length} children <span style={badge('rgba(126,184,208,0.5)')}>new family</span>
+                    </div>);
+                  })}
                   <div style={{ marginTop:12, display:'flex', gap:10, alignItems:'center' }}>
                     <button onClick={()=>{
                       const count = basket.imports.length + basket.importFams.length;
