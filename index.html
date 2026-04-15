@@ -3794,6 +3794,11 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
             if (!m) continue;
             const level = parseInt(m[1]), pointer = (m[2]||'').trim(), tag = m[3].trim(), value = (m[4]||'').trim();
             const el = { level, pointer, tag, value, children: [] };
+            if (tag === 'CONT' || tag === 'CONC') {
+              const parent = stack[stack.length-1];
+              if (parent && parent.value !== undefined) parent.value += (tag === 'CONT' ? '\n' : '') + value;
+              continue;
+            }
             while (stack.length > 1 && stack[stack.length-1].level >= level) stack.pop();
             stack[stack.length-1].children.push(el); stack.push(el);
           }
@@ -3881,10 +3886,17 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
     const visited = new Set();
     while (curId && !visited.has(curId)) {
       visited.add(curId);
-      const p = extPeopleMap[curId];
+      // Check external people first, then fall back to FTLS personMap
+      const p = extPeopleMap[curId] || personMap[curId];
       if (!p) break;
-      if (curId !== personId) path.unshift(p.dn || p.fn || '?');
+      if (curId !== personId) {
+        const name = p.dn || p.fn || '?';
+        // Mark if this person is already in FTLS
+        const inFtls = !!personMap[curId];
+        path.unshift(inFtls ? name : name);
+      }
       let parentFound = false;
+      // Check external families first, then FTLS families
       for (const [fid, fam] of Object.entries(extFamiliesMap)) {
         if ((fam.children||[]).includes(curId)) {
           curId = fam.husb || fam.wife || null;
@@ -3892,12 +3904,23 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
           break;
         }
       }
+      if (!parentFound) {
+        for (const [fid, fam] of Object.entries(familyMap)) {
+          if ((fam.children||[]).includes(curId)) {
+            curId = fam.husband_id || fam.wife_id || null;
+            parentFound = true;
+            break;
+          }
+        }
+      }
       if (!parentFound) break;
     }
     if (path.length === 0) {
       for (const [fid, fam] of Object.entries(extFamiliesMap)) {
-        if (fam.husb === personId && fam.wife && extPeopleMap[fam.wife]) return '⚭ ' + (extPeopleMap[fam.wife].dn||'?');
-        if (fam.wife === personId && fam.husb && extPeopleMap[fam.husb]) return '⚭ ' + (extPeopleMap[fam.husb].dn||'?');
+        const hp = extPeopleMap[fam.husb] || personMap[fam.husb];
+        const wp = extPeopleMap[fam.wife] || personMap[fam.wife];
+        if (fam.husb === personId && wp) return '⚭ ' + (wp.dn||'?');
+        if (fam.wife === personId && hp) return '⚭ ' + (hp.dn||'?');
       }
       return '';
     }
