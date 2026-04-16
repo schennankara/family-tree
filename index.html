@@ -34,7 +34,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.7.1';
+    const APP_VERSION = 'v4.7.2';
     const BUILD_DATE = '2026-04-15';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
@@ -1132,6 +1132,49 @@ function fuzzyMatchPerson(person, candidates) {
   return bestMatch;
 }
 
+// Fuzzy match FAMILIES: match by spouse person IDs and children overlap
+// Two families are "the same" if they share the same husband+wife (or one spouse + significant child overlap)
+function fuzzyMatchFamily(extFam, ftlsFamilies, extPeople, ftlsPersonMap, personFuzzyMap) {
+  // personFuzzyMap: { extPersonId: ftlsPersonId } from person fuzzy matches
+  // Resolve ext person ID to FTLS person ID (handles both exact match and fuzzy remap)
+  const resolve = (eid) => {
+    if (!eid) return null;
+    if (ftlsPersonMap[eid]) return eid; // exact match
+    return personFuzzyMap[eid] || null; // fuzzy remapped
+  };
+
+  const extH = resolve(extFam.husb);
+  const extW = resolve(extFam.wife);
+  const extKids = (extFam.children || []).map(c => resolve(c)).filter(Boolean);
+
+  let bestMatch = null, bestScore = 0;
+  for (const [fid, ftlsFam] of Object.entries(ftlsFamilies)) {
+    const fH = ftlsFam.husband_id || ftlsFam.husb || null;
+    const fW = ftlsFam.wife_id || ftlsFam.wife || null;
+    const fKids = ftlsFam.children || [];
+
+    let score = 0;
+    // Spouse matches (strong signal)
+    if (extH && fH && extH === fH) score += 40;
+    if (extW && fW && extW === fW) score += 40;
+    // Cross-check: ext husband is ftls wife's ID or vice versa (shouldn't happen but safety)
+
+    // Children overlap
+    if (extKids.length > 0 && fKids.length > 0) {
+      const overlap = extKids.filter(k => fKids.includes(k)).length;
+      const maxKids = Math.max(extKids.length, fKids.length);
+      if (overlap > 0) score += Math.round(20 * overlap / maxKids);
+    }
+
+    // Need at least one spouse match + something else, or both spouses
+    if (score > bestScore && score >= 40) {
+      bestScore = score;
+      bestMatch = { family: ftlsFam, id: fid, score };
+    }
+  }
+  return bestMatch;
+}
+
 // Main diff function: compare external GEDCOM people/families against FTLS personMap/familyMap
 function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap) {
   const results = {
@@ -1140,6 +1183,7 @@ function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap)
     extOnly: [],       // in external only — can merge into FTLS
     ftlsOnly: [],      // in FTLS only — can export for external
     familyDiffs: [],   // family structure differences
+    fuzzyMatchedFamilies: [], // different family ID but same couple
     stats: {}
   };
   
@@ -1242,6 +1286,36 @@ function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap)
       results.familyDiffs.push({ id: fid, type: 'ftls_only', ftls: ftlsFam });
     }
   }
+
+  // ── Family Fuzzy Match: find ext_only families that match ftls_only families by members ──
+  // Build person fuzzy remap: extId → ftlsId (from fuzzy matched persons)
+  const personFuzzyMap = {};
+  results.fuzzyMatched.forEach(m => { personFuzzyMap[m.extId] = m.ftlsId; });
+
+  const extOnlyFamDiffs = results.familyDiffs.filter(f => f.type === 'ext_only');
+  const ftlsOnlyFamDiffs = results.familyDiffs.filter(f => f.type === 'ftls_only');
+  const ftlsOnlyFamMap = {};
+  ftlsOnlyFamDiffs.forEach(f => { ftlsOnlyFamMap[f.id] = f.ftls; });
+
+  const famFuzzyMatched = new Set(); // track matched family IDs from both sides
+  for (const extDiff of extOnlyFamDiffs) {
+    const match = fuzzyMatchFamily(extDiff.ext, ftlsOnlyFamMap, extPeople, ftlsPersonMap, personFuzzyMap);
+    if (match) {
+      results.fuzzyMatchedFamilies.push({
+        extId: extDiff.id,
+        ftlsId: match.id,
+        ext: extDiff.ext,
+        ftls: match.family,
+        score: match.score,
+      });
+      famFuzzyMatched.add(extDiff.id);
+      famFuzzyMatched.add(match.id);
+    }
+  }
+  // Remove fuzzy-matched families from ext_only and ftls_only in familyDiffs
+  if (famFuzzyMatched.size > 0) {
+    results.familyDiffs = results.familyDiffs.filter(f => !famFuzzyMatched.has(f.id));
+  }
   
   // Stats
   const totalChanged = results.matched.filter(m => m.diffs.length > 0).length;
@@ -1250,6 +1324,7 @@ function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap)
     ftlsTotal: Object.keys(ftlsPersonMap).length,
     exactMatch: results.matched.length,
     fuzzyMatch: results.fuzzyMatched.length,
+    fuzzyFamilyMatch: results.fuzzyMatchedFamilies.length,
     identical: results.matched.filter(m => m.diffs.length === 0).length,
     changed: totalChanged,
     extOnly: results.extOnly.length,
@@ -1504,7 +1579,55 @@ async function remapPersonId(oldId, newId, editUser) {
   } catch(e) { console.warn('Could not log remap:', e); }
 }
 
-// Export FTLS-only persons as a GEDCOM fragment for import into external tools
+// Remap a family ID: change FTLS family ID to match external GEDCOM ID
+// Simpler than person remap — families are only referenced by their own ID (PK)
+// No other table has FK references to families.id
+async function remapFamilyId(oldId, newId, editUser) {
+  if (!isAdmin()) throw new Error('Only admins can remap family IDs');
+
+  // Check new ID doesn't already exist
+  const existing = await sbFetch(`families?id=eq.${newId}&select=id`);
+  if (existing.length > 0) throw new Error('Target family ID ' + newId + ' already exists');
+
+  // Get old family record
+  const [fam] = await sbFetch(`families?id=eq.${oldId}&select=*`);
+  if (!fam) throw new Error('Family ' + oldId + ' not found');
+
+  // Create new record with new ID
+  const newFam = { ...fam, id: newId };
+  await sbFetch('families', {
+    method: 'POST',
+    body: JSON.stringify(newFam),
+    headers: { 'Prefer': 'return=minimal' }
+  });
+
+  // Delete old record
+  try {
+    await sbFetch(`families?id=eq.${oldId}`, {
+      method: 'DELETE',
+      headers: { 'Prefer': 'return=minimal' }
+    });
+  } catch(e) {
+    // Rollback: delete the new record
+    console.error('Delete old family failed, rolling back:', e);
+    try { await sbFetch(`families?id=eq.${newId}`, { method:'DELETE', headers:{'Prefer':'return=minimal'} }); } catch(rb) {}
+    throw e;
+  }
+
+  // Log the remap
+  try {
+    await sbFetch('edit_log', {
+      method: 'POST',
+      body: JSON.stringify({
+        person_id: (fam.husband_id || fam.wife_id || newId), // associate with a spouse for traceability
+        edited_by: editUser || 'GEDCOM merge',
+        changed_fields: { action: 'family_id_remap', old_id: oldId, new_id: newId },
+        previous_values: { family_id: oldId },
+      }),
+      headers: { 'Prefer': 'return=minimal' }
+    });
+  } catch(e) { console.warn('Could not log family remap:', e); }
+}
 // Smart export: only new families, existing families handled via FAMC/FAMS on persons
 function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap) {
   const extIds = extFamilyIds || new Set();
@@ -3997,6 +4120,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
   // extFamDir: { famId: 'import'|null }
   const [extFamDir, setExtFamDir] = useState({});
   const [fuzzyResolved, setFuzzyResolved] = useState({}); // { extId: 'remapped' | 'ignored' }
+  const [fuzzyFamResolved, setFuzzyFamResolved] = useState({}); // { extFamId: 'remapped' | 'ignored' }
   const [showAddrOnly, setShowAddrOnly] = useState(false);
   const [showOthers, setShowOthers] = useState(false);
 
@@ -4420,7 +4544,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
               {S.changed>0 && <span style={tabSt('changed')} onClick={()=>setTab('changed')}>Changed ({S.changed})</span>}
               {S.extOnly>0 && <span style={tabSt('ext_only')} onClick={()=>setTab('ext_only')}>External Only ({S.extOnly})</span>}
               {S.ftlsOnly>0 && <span style={tabSt('ftls_only')} onClick={()=>setTab('ftls_only')}>FTLS Only ({S.ftlsOnly})</span>}
-              {diffResult.fuzzyMatched.length>0 && <span style={tabSt('fuzzy')} onClick={()=>setTab('fuzzy')}>Fuzzy ({diffResult.fuzzyMatched.length})</span>}
+              {(diffResult.fuzzyMatched.length>0 || (diffResult.fuzzyMatchedFamilies||[]).length>0) && <span style={tabSt('fuzzy')} onClick={()=>setTab('fuzzy')}>Fuzzy ({diffResult.fuzzyMatched.length + (diffResult.fuzzyMatchedFamilies||[]).length})</span>}
               <span style={tabSt('basket')} onClick={()=>setTab('basket')}>🧺 Basket {basketCount>0 && <span style={badge('rgba(196,163,90,0.7)')}>{basketCount}</span>}</span>
               {mergeLog.length>0 && <span style={tabSt('log')} onClick={()=>setTab('log')}>Log ({mergeLog.length})</span>}
             </div>
@@ -4441,8 +4565,9 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
               </div>
               <div style={hdr}>Match Results</div>
               <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fill,minmax(150px,1fr))', gap:8 }}>
-                {[[S.identical,'#6b9e72','Identical'],[S.changed,'#c4a35a','Changed'],[S.extOnly,'#7eb8d0','External Only'],[S.ftlsOnly,'#9b82c4','FTLS Only'],...(S.fuzzyMatch>0?[[S.fuzzyMatch,'#d0a07e','Fuzzy']]:[])]
+                {[[S.identical,'#6b9e72','Identical'],[S.changed,'#c4a35a','Changed'],[S.extOnly,'#7eb8d0','External Only'],[S.ftlsOnly,'#9b82c4','FTLS Only'],...(S.fuzzyMatch>0?[[S.fuzzyMatch,'#d0a07e','Fuzzy (People)']]:[])]
                   .map(([v,c,l])=><div key={l} style={{ padding:10, background:'rgba(255,255,255,0.02)', borderRadius:6, border:'1px solid '+BR }}><div style={{ fontSize:22, color:c, fontWeight:600 }}>{v}</div><div style={{ fontSize:11, color:DM }}>{l}</div></div>)}
+                {(S.fuzzyFamilyMatch||0) > 0 && <div style={{ padding:10, background:'rgba(255,255,255,0.02)', borderRadius:6, border:'1px solid '+BR }}><div style={{ fontSize:22, color:'#7eb8d0', fontWeight:600 }}>{S.fuzzyFamilyMatch}</div><div style={{ fontSize:11, color:DM }}>Fuzzy (Families)</div></div>}
               </div>
               <div style={{ marginTop:20 }}><button onClick={handleFile} style={{ background:'transparent', border:'1px solid '+BR, color:DM, padding:'8px 16px', borderRadius:6, cursor:'pointer', fontSize:12 }}>📄 Load Different File</button></div>
             </div>)}
@@ -4845,7 +4970,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
                   Review the differences below. If they are the same person and the external has newer data, you can import the changed fields.
                 </div>
               </div>
-              {diffResult.fuzzyMatched.length === 0 && <div style={{ textAlign:'center', padding:20, color:DM }}>No fuzzy matches found.</div>}
+              {diffResult.fuzzyMatched.length === 0 && (diffResult.fuzzyMatchedFamilies||[]).length === 0 && <div style={{ textAlign:'center', padding:20, color:DM }}>No fuzzy matches found.</div>}
               {diffResult.fuzzyMatched.map(m => (<div key={m.extId} style={{ marginBottom:10, border:'1px solid rgba(208,160,126,0.3)', borderRadius:8, overflow:'hidden' }}>
                 <div style={{ padding:'10px 14px', background:'rgba(208,160,126,0.06)', display:'flex', alignItems:'center', justifyContent:'space-between' }}>
                   <div>
@@ -4903,6 +5028,88 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
                   </>)}
                 </div>
               </div>))}
+
+              {/* ── FAMILY FUZZY MATCHES ── */}
+              {diffResult.fuzzyMatchedFamilies && diffResult.fuzzyMatchedFamilies.length > 0 && (<>
+                <div style={{ padding:'10px 14px', background:'rgba(126,184,208,0.06)', borderRadius:8, border:'1px solid rgba(126,184,208,0.2)', marginTop:20, marginBottom:16 }}>
+                  <div style={{ fontSize:13, color:'#7eb8d0', fontWeight:500, marginBottom:4 }}>📎 Family ID Mismatches ({diffResult.fuzzyMatchedFamilies.length})</div>
+                  <div style={{ fontSize:12, color:DM, lineHeight:1.5 }}>
+                    These families have different IDs but the same husband/wife. They represent the same family unit in both systems.
+                    Use "Use External ID" to align the FTLS family ID with the GEDCOM, so future imports won't create duplicates.
+                  </div>
+                </div>
+                {diffResult.fuzzyMatchedFamilies.map(m => {
+                  const extH = m.ext.husb ? (extPeopleMap[m.ext.husb]?.dn || personMap[m.ext.husb]?.dn || m.ext.husb) : '—';
+                  const extW = m.ext.wife ? (extPeopleMap[m.ext.wife]?.dn || personMap[m.ext.wife]?.dn || m.ext.wife) : '—';
+                  const ftlsH = (m.ftls.husband_id||m.ftls.husb) ? (personMap[m.ftls.husband_id||m.ftls.husb]?.dn || (m.ftls.husband_id||m.ftls.husb)) : '—';
+                  const ftlsW = (m.ftls.wife_id||m.ftls.wife) ? (personMap[m.ftls.wife_id||m.ftls.wife]?.dn || (m.ftls.wife_id||m.ftls.wife)) : '—';
+                  const extKidCount = (m.ext.children||[]).length;
+                  const ftlsKidCount = (m.ftls.children||[]).length;
+                  return (<div key={m.extId} style={{ marginBottom:10, border:'1px solid rgba(126,184,208,0.25)', borderRadius:8, overflow:'hidden' }}>
+                    <div style={{ padding:'10px 14px', background:'rgba(126,184,208,0.04)', display:'flex', alignItems:'center', justifyContent:'space-between' }}>
+                      <div>
+                        <div style={{ fontSize:13, color:TX, fontWeight:500 }}>{extH} ⚭ {extW} <span style={{ fontSize:10, color:DM, fontWeight:400 }}>score: {m.score}</span></div>
+                        <div style={{ fontSize:11, color:DM, marginTop:2 }}>
+                          FTLS: <span style={{ color:GC }}>{m.ftlsId}</span> ← Ext: <span style={{ color:'#7eb8d0' }}>{m.extId}</span>
+                        </div>
+                      </div>
+                      <span style={{ fontSize:11, color:DM }}>{ftlsKidCount} / {extKidCount} children</span>
+                    </div>
+                    <div style={{ padding:'4px 14px 8px' }}>
+                      <table style={{ width:'100%', borderCollapse:'collapse', fontSize:12 }}>
+                        <thead><tr style={{ borderBottom:'1px solid '+BR }}>
+                          <th style={{ textAlign:'left', padding:'4px 0', color:DM, fontWeight:400, width:'25%' }}></th>
+                          <th style={{ textAlign:'left', padding:'4px 0', color:GC, fontWeight:400, width:'37%' }}>FTLS</th>
+                          <th style={{ textAlign:'left', padding:'4px 0', color:'#7eb8d0', fontWeight:400, width:'38%' }}>External</th>
+                        </tr></thead>
+                        <tbody>
+                          <tr style={{ borderBottom:'1px solid rgba(255,255,255,0.03)' }}>
+                            <td style={{ padding:'3px 0', color:DM }}>Husband</td>
+                            <td style={{ padding:'3px 0', color:TX }}>{ftlsH}</td>
+                            <td style={{ padding:'3px 0', color:TX }}>{extH}</td>
+                          </tr>
+                          <tr style={{ borderBottom:'1px solid rgba(255,255,255,0.03)' }}>
+                            <td style={{ padding:'3px 0', color:DM }}>Wife</td>
+                            <td style={{ padding:'3px 0', color:TX }}>{ftlsW}</td>
+                            <td style={{ padding:'3px 0', color:TX }}>{extW}</td>
+                          </tr>
+                          <tr>
+                            <td style={{ padding:'3px 0', color:DM }}>Children</td>
+                            <td style={{ padding:'3px 0', color:TX }}>{ftlsKidCount}</td>
+                            <td style={{ padding:'3px 0', color:TX }}>{extKidCount}</td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
+                    <div style={{ padding:'6px 14px 10px', display:'flex', gap:8, alignItems:'center' }}>
+                      {fuzzyFamResolved[m.extId] === 'remapped' ? (
+                        <span style={{ fontSize:12, color:'#6b9e72' }}>✓ Remapped to {m.extId}</span>
+                      ) : fuzzyFamResolved[m.extId] === 'ignored' ? (
+                        <span style={{ fontSize:12, color:DM }}>— Ignored</span>
+                      ) : (<>
+                        <button onClick={async () => {
+                          if (!confirm(`This will change the FTLS family ID from ${m.ftlsId} to ${m.extId}.\n\nThis ensures future GEDCOM imports from Rolson match this family correctly.\n\nContinue?`)) return;
+                          try {
+                            await remapFamilyId(m.ftlsId, m.extId, user?.email || 'GEDCOM merge');
+                            setFuzzyFamResolved(prev => ({...prev, [m.extId]: 'remapped'}));
+                            setMergeLog(prev => [...prev, '✓ Family remapped: ' + m.ftlsId + ' → ' + m.extId + ' (' + extH + ' ⚭ ' + extW + ')']);
+                          } catch(e) {
+                            alert('Family remap failed: ' + e.message);
+                            setMergeLog(prev => [...prev, '✗ Family remap failed: ' + e.message]);
+                          }
+                        }} style={{ background:'rgba(126,184,208,0.12)', border:'1px solid rgba(126,184,208,0.3)', color:'#7eb8d0', padding:'4px 12px', borderRadius:5, cursor:'pointer', fontSize:11 }}>
+                          🔄 Use External ID
+                        </button>
+                        <button onClick={() => setFuzzyFamResolved(prev => ({...prev, [m.extId]: 'ignored'}))}
+                          style={{ background:'transparent', border:'1px solid '+BR, color:DM, padding:'4px 12px', borderRadius:5, cursor:'pointer', fontSize:11 }}>
+                          Ignore
+                        </button>
+                        <span style={{ fontSize:10, color:DM }}>Aligns family IDs for future syncs</span>
+                      </>)}
+                    </div>
+                  </div>);
+                })}
+              </>)}
             </div>)}
 
             {/* ──── BASKET ──── */}
