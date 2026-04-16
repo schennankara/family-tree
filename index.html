@@ -844,15 +844,31 @@ function personToGedcomLines(person) {
   // Contact
   if (person.ph) L.push(`1 PHON ${person.ph}`);
   if (person.em) L.push(`1 EMAI ${person.em}`);
-  // Address — skip if _xg already has RESI or ADDR (avoid duplication)
-  const xgHasAddr = person._xg && (/^1 (RESI|ADDR)/m).test(person._xg);
-  if (!xgHasAddr && (person.a1 || person.ci || person.st || person.co)) {
+  // Address — if FTLS has address data, strip RESI/ADDR from _xg to avoid duplication (#11)
+  // FTLS address takes priority over _xg RESI
+  if (person.a1 || person.ci || person.st || person.co) {
     L.push(`1 ADDR ${person.a1 || ''}`);
     if (person.a2) L.push(`2 ADR2 ${person.a2}`);
     if (person.ci) L.push(`2 CITY ${person.ci}`);
     if (person.st) L.push(`2 STAE ${person.st}`);
     if (person.zp) L.push(`2 POST ${person.zp}`);
     if (person.co) L.push(`2 CTRY ${person.co}`);
+    // Strip RESI/ADDR blocks from _xg so they don't duplicate
+    if (person._xg && (/^1 (RESI|ADDR)/m).test(person._xg)) {
+      const xgLines = person._xg.split('\n');
+      const cleaned = [];
+      let skipping = false;
+      for (const xl of xgLines) {
+        const lvl = xl.match(/^(\d+)\s/);
+        if (lvl && lvl[1] === '1') {
+          skipping = /^1 (RESI|ADDR)/.test(xl);
+        }
+        if (!skipping) cleaned.push(xl);
+      }
+      person._xg = cleaned.join('\n');
+    }
+  } else if (person._xg && (/^1 (RESI|ADDR)/m).test(person._xg)) {
+    // No FTLS address — let _xg RESI/ADDR pass through
   }
   // Occupation
   if (person.prof) L.push(`1 OCCU ${person.prof}`);
