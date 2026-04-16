@@ -986,29 +986,19 @@ function exportTreeToGedcom(tree, personMap, familyMap) {
         ].filter(Boolean));
         if (spouse && spouse.id && !exportedPersons.has(spouse.id)) {
           exportedPersons.add(spouse.id);
-          const spIndi = [`0 ${spouse.id} INDI`];
-          const spGivn = ((spouse.fn||'') + (spouse.mn ? ' '+spouse.mn : '')).trim();
-          const spName = spouse.ln ? `${spGivn} /${spouse.ln}/` : (spGivn || spouse.dn || '?');
-          spIndi.push(`1 NAME ${spName}`);
-          if (spouse.g) spIndi.push(`1 SEX ${spouse.g}`);
-          if (spouse.dob) { spIndi.push('1 BIRT'); spIndi.push(`2 DATE ${spouse.dob}`); }
-          if (spouse.dod || spouse.dec) { spIndi.push('1 DEAT'); if(spouse.dod) spIndi.push(`2 DATE ${spouse.dod}`); }
+          const spIndi = personToGedcomLines(spouse);
           spIndi.push(`1 FAMS ${famId}`);
+          if (spouse._xg) { spouse._xg.split('\n').forEach(xl => { if (xl.trim()) spIndi.push(xl); }); }
           indis.push(spIndi);
         }
         children.forEach(child => processNode(child, famId));
       }
       if (!exportedPersons.has(node.id)) {
         exportedPersons.add(node.id);
-        const nIndi = [`0 ${node.id} INDI`];
-        const nGivn = ((node.fn||'') + (node.mn ? ' '+node.mn : '')).trim();
-        const nName = node.ln ? `${nGivn} /${node.ln}/` : (nGivn || node.dn || '?');
-        nIndi.push(`1 NAME ${nName}`);
-        if (node.g) nIndi.push(`1 SEX ${node.g}`);
-        if (node.dob) { nIndi.push('1 BIRT'); nIndi.push(`2 DATE ${node.dob}`); }
-        if (node.dod || node.dec) { nIndi.push('1 DEAT'); if(node.dod) nIndi.push(`2 DATE ${node.dod}`); }
+        const nIndi = personToGedcomLines(node);
         nodeRefs.forEach(ref => nIndi.push(`1 FAMS ${ref}`));
         if (parentFamId) nIndi.push(`1 FAMC ${parentFamId}`);
+        if (node._xg) { node._xg.split('\n').forEach(xl => { if (xl.trim()) nIndi.push(xl); }); }
         indis.push(nIndi);
       }
     }
