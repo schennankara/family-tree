@@ -1351,6 +1351,141 @@ async function mergeFieldsToDb(ftlsPerson, fieldsToApply, ext, editUser) {
   await savePerson(merged, editUser || 'GEDCOM merge');
 }
 
+// Remap a person's ID: INSERT new record → UPDATE all references → DELETE old
+// Used when fuzzy match confirms same person with different IDs
+// Must handle FK constraints: families.husband_id, families.wife_id, users.person_id,
+// access_requests.person_id, update_requests.person_id, family_members.person_id
+async function remapPersonId(oldId, newId, editUser) {
+  // Safety: only admins should run this
+  if (!isAdmin()) throw new Error('Only admins can remap person IDs');
+
+  // 0. Check new ID doesn't already exist
+  const existing = await sbFetch(`persons?id=eq.${newId}&select=id`);
+  if (existing.length > 0) throw new Error('Target ID ' + newId + ' already exists in the database');
+
+  // 1. Copy person record with new ID
+  const [person] = await sbFetch(`persons?id=eq.${oldId}&select=*`);
+  if (!person) throw new Error('Person ' + oldId + ' not found');
+  const newPerson = { ...person, id: newId };
+  await sbFetch('persons', {
+    method: 'POST',
+    body: JSON.stringify(newPerson),
+    headers: { 'Prefer': 'return=minimal' }
+  });
+
+  // From here, if anything fails, we should try to clean up the new record
+  try {
+    // 2. Update families — husband_id (FK constrained)
+    const famsH = await sbFetch(`families?husband_id=eq.${oldId}&select=id`);
+    for (const f of famsH) {
+      await sbFetch(`families?id=eq.${f.id}`, {
+        method: 'PATCH', body: JSON.stringify({ husband_id: newId }),
+        headers: { 'Prefer': 'return=minimal' }
+      });
+    }
+
+    // 3. Update families — wife_id (FK constrained)
+    const famsW = await sbFetch(`families?wife_id=eq.${oldId}&select=id`);
+    for (const f of famsW) {
+      await sbFetch(`families?id=eq.${f.id}`, {
+        method: 'PATCH', body: JSON.stringify({ wife_id: newId }),
+        headers: { 'Prefer': 'return=minimal' }
+      });
+    }
+
+    // 4. Update families — children arrays (no FK, but need updating)
+    const allFams = await sbFetch('families?select=id,children');
+    for (const fam of allFams) {
+      if ((fam.children || []).includes(oldId)) {
+        await sbFetch(`families?id=eq.${fam.id}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ children: fam.children.map(c => c === oldId ? newId : c) }),
+          headers: { 'Prefer': 'return=minimal' }
+        });
+      }
+    }
+
+    // 5. Update other referencing tables (best effort)
+    for (const tbl of ['users', 'family_members']) {
+      try {
+        const refs = await sbFetch(`${tbl}?person_id=eq.${oldId}&select=id`);
+        for (const r of refs) {
+          await sbFetch(`${tbl}?id=eq.${r.id}`, {
+            method: 'PATCH', body: JSON.stringify({ person_id: newId }),
+            headers: { 'Prefer': 'return=minimal' }
+          });
+        }
+      } catch(e) { console.warn('Could not update ' + tbl + ':', e); }
+    }
+    // access_requests and update_requests — admin can UPDATE per RLS
+    for (const tbl of ['access_requests', 'update_requests']) {
+      try {
+        const refs = await sbFetch(`${tbl}?person_id=eq.${oldId}&select=id`);
+        for (const r of refs) {
+          await sbFetch(`${tbl}?id=eq.${r.id}`, {
+            method: 'PATCH', body: JSON.stringify({ person_id: newId }),
+            headers: { 'Prefer': 'return=minimal' }
+          });
+        }
+      } catch(e) { console.warn('Could not update ' + tbl + ':', e); }
+    }
+
+    // 6. Update media.tagged_persons arrays
+    try {
+      const allMedia = await sbFetch('media?select=id,tagged_persons');
+      for (const m of allMedia) {
+        if ((m.tagged_persons || []).includes(oldId)) {
+          await sbFetch(`media?id=eq.${m.id}`, {
+            method: 'PATCH',
+            body: JSON.stringify({ tagged_persons: m.tagged_persons.map(t => t === oldId ? newId : t) }),
+            headers: { 'Prefer': 'return=minimal' }
+          });
+        }
+      }
+    } catch(e) { console.warn('Could not update media:', e); }
+
+    // 7. Delete old person record (all FK refs now point to new ID)
+    await sbFetch(`persons?id=eq.${oldId}`, {
+      method: 'DELETE',
+      headers: { 'Prefer': 'return=minimal' }
+    });
+
+  } catch(e) {
+    // Rollback: try to delete the new record we created
+    console.error('Remap failed after creating new record, attempting rollback:', e);
+    try {
+      // Move any FKs back before deleting
+      const famsH2 = await sbFetch(`families?husband_id=eq.${newId}&select=id`);
+      for (const f of famsH2) { await sbFetch(`families?id=eq.${f.id}`, { method:'PATCH', body:JSON.stringify({husband_id:oldId}), headers:{'Prefer':'return=minimal'} }); }
+      const famsW2 = await sbFetch(`families?wife_id=eq.${newId}&select=id`);
+      for (const f of famsW2) { await sbFetch(`families?id=eq.${f.id}`, { method:'PATCH', body:JSON.stringify({wife_id:oldId}), headers:{'Prefer':'return=minimal'} }); }
+      const allFams2 = await sbFetch('families?select=id,children');
+      for (const fam of allFams2) {
+        if ((fam.children||[]).includes(newId)) {
+          await sbFetch(`families?id=eq.${fam.id}`, { method:'PATCH', body:JSON.stringify({children:fam.children.map(c=>c===newId?oldId:c)}), headers:{'Prefer':'return=minimal'} });
+        }
+      }
+      await sbFetch(`persons?id=eq.${newId}`, { method:'DELETE', headers:{'Prefer':'return=minimal'} });
+      console.log('Rollback successful');
+    } catch(rb) { console.error('Rollback also failed — DB may be in inconsistent state:', rb); }
+    throw e;
+  }
+
+  // 8. Log the remap (INSERT only — edit_log has no UPDATE policy)
+  try {
+    await sbFetch('edit_log', {
+      method: 'POST',
+      body: JSON.stringify({
+        person_id: newId,
+        edited_by: editUser || 'GEDCOM merge',
+        changed_fields: { action: 'id_remap', old_id: oldId, new_id: newId },
+        previous_values: { id: oldId },
+      }),
+      headers: { 'Prefer': 'return=minimal' }
+    });
+  } catch(e) { console.warn('Could not log remap:', e); }
+}
+
 // Export FTLS-only persons as a GEDCOM fragment for import into external tools
 // Smart export: only new families, existing families handled via FAMC/FAMS on persons
 function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap) {
@@ -3843,6 +3978,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
   const [fieldDir, setFieldDir] = useState({});
   // extFamDir: { famId: 'import'|null }
   const [extFamDir, setExtFamDir] = useState({});
+  const [fuzzyResolved, setFuzzyResolved] = useState({}); // { extId: 'remapped' | 'ignored' }
   const [showAddrOnly, setShowAddrOnly] = useState(false);
   const [showOthers, setShowOthers] = useState(false);
 
@@ -4273,12 +4409,29 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
               const extOnlyAll = diffResult.extOnly || [];
               const extOnlyFams = (diffResult.familyDiffs || []).filter(f=>f.type==='ext_only');
               const isConnected = (p) => {
-                for (const [fid, fam] of Object.entries(extFamiliesMap)) {
-                  const hid = fam.husb||'', wid = fam.wife||'', kids = fam.children||[];
-                  if (kids.includes(p.id)) { if (personMap[hid] || personMap[wid]) return true; }
-                  if (hid === p.id || wid === p.id) { if (personMap[hid] || personMap[wid] || kids.some(k=>personMap[k])) return true; }
-                }
-                return false;
+                const visited = new Set();
+                const walk = (pid) => {
+                  if (!pid || visited.has(pid)) return false;
+                  visited.add(pid);
+                  if (personMap[pid] && pid !== p.id) return true;
+                  for (const [fid, fam] of Object.entries(extFamiliesMap)) {
+                    if ((fam.children||[]).includes(pid)) {
+                      if (walk(fam.husb||'') || walk(fam.wife||'')) return true;
+                    }
+                    if ((fam.husb === pid || fam.wife === pid)) {
+                      const spId = fam.husb === pid ? fam.wife : fam.husb;
+                      if (spId && personMap[spId]) return true;
+                    }
+                  }
+                  for (const [fid, fam] of Object.entries(familyMap)) {
+                    if ((fam.children||[]).includes(pid)) {
+                      if (fam.husband_id && personMap[fam.husband_id]) return true;
+                      if (fam.wife_id && personMap[fam.wife_id]) return true;
+                    }
+                  }
+                  return false;
+                };
+                return walk(p.id);
               };
               const extConnected = extOnlyAll.filter(isConnected);
               const extUnconnected = extOnlyAll.filter(p => !isConnected(p));
@@ -4429,18 +4582,42 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
                 return p ? (p.dn || p.fn || '?') : (personMap[id]?.dn || id);
               };
               
-              // Determine connection for each person
+              // Determine connection for each person — walks up through ext families until it finds someone in FTLS
+              const _connCache = {};
               const isConnected = (p) => {
-                for (const [fid, fam] of Object.entries(extFamiliesMap)) {
-                  const hid = fam.husb||'', wid = fam.wife||'', kids = fam.children||[];
-                  if (kids.includes(p.id)) { if (personMap[hid] || personMap[wid]) return extName(personMap[hid] ? hid : wid); }
-                  if (hid === p.id || wid === p.id) { 
-                    const spId = hid === p.id ? wid : hid;
-                    if (personMap[spId]) return extName(spId);
-                    for (const k of kids) { if (personMap[k]) return extName(k); }
+                if (_connCache[p.id] !== undefined) return _connCache[p.id];
+                const visited = new Set();
+                const walk = (pid) => {
+                  if (!pid || visited.has(pid)) return null;
+                  visited.add(pid);
+                  // Direct hit: this person is in FTLS
+                  if (personMap[pid] && pid !== p.id) return extName(pid);
+                  // Walk up through external families
+                  for (const [fid, fam] of Object.entries(extFamiliesMap)) {
+                    const hid = fam.husb||'', wid = fam.wife||'', kids = fam.children||[];
+                    if (kids.includes(pid)) {
+                      const fromH = walk(hid);
+                      if (fromH) return fromH;
+                      const fromW = walk(wid);
+                      if (fromW) return fromW;
+                    }
+                    if ((hid === pid || wid === pid)) {
+                      const spId = hid === pid ? wid : hid;
+                      if (spId && personMap[spId]) return extName(spId);
+                    }
                   }
-                }
-                return null;
+                  // Also check FTLS families (person might be in an existing family)
+                  for (const [fid, fam] of Object.entries(familyMap)) {
+                    if ((fam.children||[]).includes(pid)) {
+                      const par = fam.husband_id || fam.wife_id;
+                      if (par && personMap[par]) return extName(par);
+                    }
+                  }
+                  return null;
+                };
+                const result = walk(p.id);
+                _connCache[p.id] = result;
+                return result;
               };
               
               // Find what role this person plays (child of, spouse of, parent of)
@@ -4606,13 +4783,71 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
 
             {/* ──── FUZZY ──── */}
             {tab==='fuzzy' && (<div style={{ padding:'12px 0' }}>
-              <div style={{ fontSize:12, color:DM, marginBottom:12 }}>Matched by name/DOB with different IDs — likely same person added on both sides.</div>
-              {diffResult.fuzzyMatched.map(m => (<div key={m.extId} style={{ marginBottom:8, border:'1px solid rgba(208,160,126,0.3)', borderRadius:8, padding:12 }}>
-                <div style={{ fontSize:13, color:TX, marginBottom:4 }}>{m.ext.dn||'?'} <span style={{ fontSize:10, color:DM }}>score:{m.score}</span></div>
-                <div style={{ fontSize:11, color:DM }}>Ext: <span style={{ color:'#7eb8d0' }}>{m.extId}</span> → FTLS: <span style={{ color:GC }}>{m.ftlsId}</span></div>
-                <FamilyPath personId={m.ftlsId} />
-                <div style={{fontSize:10,color:'#6a8a70',marginTop:2,paddingLeft:4}}><span style={{color:'#7eb8d0',fontSize:9}}>EXT ID</span> {extBreadcrumb(m.extId)}</div>
-                {m.diffs.length>0 && <div style={{ fontSize:11, color:'#d0a07e', marginTop:4 }}>{m.diffs.map(d=>d.label).join(', ')}</div>}
+              <div style={{ padding:'10px 14px', background:'rgba(208,160,126,0.08)', borderRadius:8, border:'1px solid rgba(208,160,126,0.2)', marginBottom:16 }}>
+                <div style={{ fontSize:13, color:'#d0a07e', fontWeight:500, marginBottom:4 }}>⚠ Possible Duplicates</div>
+                <div style={{ fontSize:12, color:DM, lineHeight:1.5 }}>
+                  These people exist in BOTH systems but with different IDs — matched by name and birth date.
+                  They were likely added independently. They will NOT appear in External Only (already excluded).
+                  Review the differences below. If they are the same person and the external has newer data, you can import the changed fields.
+                </div>
+              </div>
+              {diffResult.fuzzyMatched.length === 0 && <div style={{ textAlign:'center', padding:20, color:DM }}>No fuzzy matches found.</div>}
+              {diffResult.fuzzyMatched.map(m => (<div key={m.extId} style={{ marginBottom:10, border:'1px solid rgba(208,160,126,0.3)', borderRadius:8, overflow:'hidden' }}>
+                <div style={{ padding:'10px 14px', background:'rgba(208,160,126,0.06)', display:'flex', alignItems:'center', justifyContent:'space-between' }}>
+                  <div>
+                    <div style={{ fontSize:13, color:TX, fontWeight:500 }}>{m.ext.dn||'?'} <span style={{ fontSize:10, color:DM, fontWeight:400 }}>match score: {m.score}</span></div>
+                    <div style={{ fontSize:11, color:DM, marginTop:2 }}>
+                      FTLS ID: <span style={{ color:GC }}>{m.ftlsId}</span> ← Ext ID: <span style={{ color:'#7eb8d0' }}>{m.extId}</span>
+                    </div>
+                  </div>
+                  {m.diffs.length > 0 && <span style={{ fontSize:11, color:'#d0a07e' }}>{m.diffs.length} diff{m.diffs.length>1?'s':''}</span>}
+                </div>
+                <div style={{ padding:'4px 14px 8px' }}>
+                  <FamilyPath personId={m.ftlsId} />
+                  <div style={{fontSize:10,color:'#6a8a70',marginTop:2,paddingLeft:20}}><span style={{color:'#7eb8d0',fontSize:9}}>EXT</span> {extBreadcrumb(m.extId).text}</div>
+                </div>
+                {m.diffs.length > 0 && <div style={{ padding:'0 14px 10px' }}>
+                  <table style={{ width:'100%', borderCollapse:'collapse', fontSize:12 }}>
+                    <thead><tr style={{ borderBottom:'1px solid '+BR }}>
+                      <th style={{ textAlign:'left', padding:'4px 0', color:DM, fontWeight:400, width:'30%' }}>Field</th>
+                      <th style={{ textAlign:'left', padding:'4px 0', color:GC, fontWeight:400, width:'35%' }}>FTLS</th>
+                      <th style={{ textAlign:'left', padding:'4px 0', color:'#6b9e72', fontWeight:400, width:'35%' }}>External</th>
+                    </tr></thead>
+                    <tbody>{m.diffs.map(d => (<tr key={d.key} style={{ borderBottom:'1px solid rgba(255,255,255,0.03)' }}>
+                      <td style={{ padding:'3px 0', color:DM }}>{d.label}</td>
+                      <td style={{ padding:'3px 0', color:d.ftls?TX:'#5a5548' }}>{d.ftls || '(empty)'}</td>
+                      <td style={{ padding:'3px 0', color:d.ext?'#6b9e72':'#5a5548', background:d.ext&&!d.ftls?'rgba(107,158,114,0.06)':'transparent' }}>{d.ext || '(empty)'}</td>
+                    </tr>))}</tbody>
+                  </table>
+                </div>}
+                {m.diffs.length === 0 && <div style={{ padding:'4px 14px 10px', fontSize:11, color:'#6b9e72' }}>✓ All fields match — just different IDs.</div>}
+                {/* Action buttons */}
+                <div style={{ padding:'6px 14px 10px', display:'flex', gap:8, alignItems:'center' }}>
+                  {fuzzyResolved[m.extId] === 'remapped' ? (
+                    <span style={{ fontSize:12, color:'#6b9e72' }}>✓ Remapped to {m.extId}</span>
+                  ) : fuzzyResolved[m.extId] === 'ignored' ? (
+                    <span style={{ fontSize:12, color:DM }}>— Ignored</span>
+                  ) : (<>
+                    <button onClick={async () => {
+                      if (!confirm(`This will change the FTLS ID from ${m.ftlsId} to ${m.extId} and update all family references.\n\nThis ensures future GEDCOM imports from Rolson won't create duplicates.\n\nContinue?`)) return;
+                      try {
+                        await remapPersonId(m.ftlsId, m.extId, user?.email || 'GEDCOM merge');
+                        setFuzzyResolved(prev => ({...prev, [m.extId]: 'remapped'}));
+                        setMergeLog(prev => [...prev, '✓ Remapped ' + (m.ext.dn||'?') + ': ' + m.ftlsId + ' → ' + m.extId]);
+                      } catch(e) {
+                        alert('Remap failed: ' + e.message);
+                        setMergeLog(prev => [...prev, '✗ Remap failed for ' + (m.ext.dn||'?') + ': ' + e.message]);
+                      }
+                    }} style={{ background:'rgba(126,184,208,0.12)', border:'1px solid rgba(126,184,208,0.3)', color:'#7eb8d0', padding:'4px 12px', borderRadius:5, cursor:'pointer', fontSize:11 }}>
+                      🔄 Use External ID
+                    </button>
+                    <button onClick={() => setFuzzyResolved(prev => ({...prev, [m.extId]: 'ignored'}))} 
+                      style={{ background:'transparent', border:'1px solid '+BR, color:DM, padding:'4px 12px', borderRadius:5, cursor:'pointer', fontSize:11 }}>
+                      Ignore
+                    </button>
+                    <span style={{ fontSize:10, color:DM }}>Use External ID aligns IDs for future syncs</span>
+                  </>)}
+                </div>
               </div>))}
             </div>)}
 
