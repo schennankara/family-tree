@@ -34,8 +34,8 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.7.0';
-    const BUILD_DATE = '2026-04-13';
+    const APP_VERSION = 'v4.7.1';
+    const BUILD_DATE = '2026-04-15';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
 
@@ -1281,14 +1281,26 @@ async function mergePersonToDb(ext, editUser) {
 // Merge a single external family into Supabase — ONLY if it doesn't already exist
 // If it exists, only ADD new children (don't overwrite)
 async function mergeFamilyToDb(extFam) {
+  // ── FK GUARD: verify spouse IDs exist in persons before INSERT/UPDATE ──
+  // Prevents FK constraint error 23503 when GEDCOM references persons not yet imported
+  const verifyPersonExists = async (pid) => {
+    if (!pid) return false;
+    try { const r = await sbFetch(`persons?id=eq.${pid}&select=id`); return r.length > 0; }
+    catch(e) { return false; }
+  };
+  const safeHusb = extFam.husb && (await verifyPersonExists(extFam.husb)) ? extFam.husb : null;
+  const safeWife = extFam.wife && (await verifyPersonExists(extFam.wife)) ? extFam.wife : null;
+  if (extFam.husb && !safeHusb) console.warn('mergeFamilyToDb: husband', extFam.husb, 'not in persons — setting null for family', extFam.id);
+  if (extFam.wife && !safeWife) console.warn('mergeFamilyToDb: wife', extFam.wife, 'not in persons — setting null for family', extFam.id);
+
   try {
     const existing = await sbFetch(`families?id=eq.${extFam.id}&select=*`);
     if (existing.length > 0) {
       // Family exists — update empty spouse slots + add new children
       const patch = {};
-      // Fill empty husband/wife slots (don't overwrite existing)
-      if (!existing[0].husband_id && extFam.husb) patch.husband_id = extFam.husb;
-      if (!existing[0].wife_id && extFam.wife) patch.wife_id = extFam.wife;
+      // Fill empty husband/wife slots (don't overwrite existing) — only if person exists
+      if (!existing[0].husband_id && safeHusb) patch.husband_id = safeHusb;
+      if (!existing[0].wife_id && safeWife) patch.wife_id = safeWife;
       // Add new children
       const existingKids = new Set(existing[0].children || []);
       const newKids = (extFam.children || []).filter(cid => !existingKids.has(cid));
@@ -1310,11 +1322,11 @@ async function mergeFamilyToDb(extFam) {
     }
   } catch(e) {}
   
-  // Family doesn't exist — create it
+  // Family doesn't exist — create it (using validated spouse IDs)
   const row = {
     id: extFam.id,
-    husband_id: extFam.husb || null,
-    wife_id: extFam.wife || null,
+    husband_id: safeHusb,
+    wife_id: safeWife,
     children: extFam.children || [],
     marriage_date: extFam.mdate || '',
     marriage_place: extFam.mplace || '',
@@ -1324,7 +1336,7 @@ async function mergeFamilyToDb(extFam) {
     body: JSON.stringify(row),
     headers: { 'Prefer': 'return=minimal,resolution=merge-duplicates' }
   });
-  return { skipped: false, action: 'created' };
+  return { skipped: false, action: 'created' + (extFam.husb && !safeHusb ? ' (husband missing)' : '') + (extFam.wife && !safeWife ? ' (wife missing)' : '') };
 }
 
 // Apply specific field updates from external to an existing FTLS person
@@ -4264,6 +4276,38 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
           if (result && !result.skipped) log.push('✓ Auto-updated family: ' + fid + ' — ' + (result.action || 'updated'));
         } catch(e) { log.push('⚠ Auto-family ' + fid + ': ' + e.message); }
       }
+    }
+    // ── ORPHAN REPAIR: find ext-only families whose members already exist in DB ──
+    // This handles the case where persons were imported but their families failed (FK error)
+    // or when re-running merge after persons already exist — no new persons = importedPersonIds empty
+    if (extFamiliesMap && diffResult) {
+      const extOnlyFamIds = new Set(
+        (diffResult.familyDiffs || []).filter(f => f.type === 'ext_only').map(f => f.id)
+      );
+      let orphanFixCount = 0;
+      for (const [fid, fam] of Object.entries(extFamiliesMap)) {
+        if (alreadyProcessedFams.has(fid)) continue;
+        if (!extOnlyFamIds.has(fid)) continue; // only process families that don't exist in FTLS
+        // Check if any member of this family exists in DB (not just newly imported ones)
+        const memberIds = [fam.husb, fam.wife, ...(fam.children || [])].filter(Boolean);
+        let hasDbMember = false;
+        for (const mid of memberIds) {
+          try {
+            const rows = await sbFetch(`persons?id=eq.${mid}&select=id`);
+            if (rows.length > 0) { hasDbMember = true; break; }
+          } catch(e) {}
+        }
+        if (!hasDbMember) continue;
+        try {
+          const result = await mergeFamilyToDb(fam);
+          if (result && !result.skipped) {
+            log.push('✓ Orphan-repair family: ' + fid + ' — ' + (result.action || 'created'));
+            orphanFixCount++;
+          }
+          alreadyProcessedFams.add(fid);
+        } catch(e) { log.push('⚠ Orphan-repair family ' + fid + ': ' + e.message); }
+      }
+      if (orphanFixCount > 0) log.push('── ' + orphanFixCount + ' orphan families reconnected');
     }
     // Post-import validation: check for orphan family links (#22)
     if (log.some(l => l.startsWith('✓'))) {
