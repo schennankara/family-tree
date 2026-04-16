@@ -34,8 +34,8 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.7.2';
-    const BUILD_DATE = '2026-04-15';
+    const APP_VERSION = 'v4.7.3';
+    const BUILD_DATE = '2026-04-16';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
 
@@ -1211,16 +1211,34 @@ function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap)
     return [hName, wName].filter(Boolean).join(' & ') || pf.familyId;
   }
 
+  // Helper: are these two parent families actually the same couple (just with different IDs)?
+  // Compares normalized names of husband and wife — handles cross-system ID mismatches
+  function sameParentFamily(ftlsParent, extParent) {
+    if (!ftlsParent && !extParent) return true;
+    if (!ftlsParent || !extParent) return false;
+    if (ftlsParent.familyId === extParent.familyId) return true;
+    const norm = s => (s||'').toLowerCase().replace(/[^a-z]/g,'');
+    const fhName = norm(ftlsPersonMap[ftlsParent.husband]?.dn || '');
+    const ehName = norm(extPeople[extParent.husband]?.dn || ftlsPersonMap[extParent.husband]?.dn || '');
+    const fwName = norm(ftlsPersonMap[ftlsParent.wife]?.dn || '');
+    const ewName = norm(extPeople[extParent.wife]?.dn || ftlsPersonMap[extParent.wife]?.dn || '');
+    // Match if both spouse names line up (allowing substring containment for name variants)
+    const matches = (a, b) => a && b && (a === b || a.includes(b) || b.includes(a));
+    const hMatch = !ftlsParent.husband && !extParent.husband ? true : matches(fhName, ehName);
+    const wMatch = !ftlsParent.wife && !extParent.wife ? true : matches(fwName, ewName);
+    return hMatch && wMatch;
+  }
+
   // Pass 1: Exact ID match
   for (const [id, ext] of Object.entries(extPeople)) {
     if (ftlsPersonMap[id]) {
       const diffs = diffPerson(ftlsPersonMap[id], ext);
-      // Compare parent family (FAMC)
+      // Compare parent family (FAMC) — checks ID AND spouse names (handles cross-system ID mismatches)
       const ftlsParent = findParentFamily(id, ftlsFamilyMap);
       const extParent = findParentFamily(id, extFamilies);
-      const ftlsFamId = ftlsParent?.familyId || '';
-      const extFamId = extParent?.familyId || '';
-      if (ftlsFamId !== extFamId) {
+      if (!sameParentFamily(ftlsParent, extParent)) {
+        const ftlsFamId = ftlsParent?.familyId || '';
+        const extFamId = extParent?.familyId || '';
         diffs.push({
           key: '_famc', label: 'Parent Family',
           ftls: ftlsParent ? parentLabel(ftlsParent, ftlsPersonMap) + ' (' + ftlsFamId + ')' : '(none)',
@@ -1240,12 +1258,12 @@ function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap)
     const match = fuzzyMatchPerson(ext, unmatchedFtls);
     if (match) {
       const diffs = diffPerson(match.person, ext);
-      // Compare parent family (FAMC) for fuzzy matches too
+      // Compare parent family (FAMC) for fuzzy matches too — name-aware comparison
       const ftlsParent = findParentFamily(match.person.id, ftlsFamilyMap);
       const extParent = findParentFamily(id, extFamilies);
-      const ftlsFamId = ftlsParent?.familyId || '';
-      const extFamId = extParent?.familyId || '';
-      if (ftlsFamId !== extFamId) {
+      if (!sameParentFamily(ftlsParent, extParent)) {
+        const ftlsFamId = ftlsParent?.familyId || '';
+        const extFamId = extParent?.familyId || '';
         diffs.push({
           key: '_famc', label: 'Parent Family',
           ftls: ftlsParent ? parentLabel(ftlsParent, ftlsPersonMap) + ' (' + ftlsFamId + ')' : '(none)',
@@ -4989,8 +5007,31 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
                   {m.diffs.length > 0 && <span style={{ fontSize:11, color:'#d0a07e' }}>{m.diffs.length} diff{m.diffs.length>1?'s':''}</span>}
                 </div>
                 <div style={{ padding:'4px 14px 8px' }}>
-                  <FamilyPath personId={m.ftlsId} />
-                  <div style={{fontSize:10,color:'#6a8a70',marginTop:2,paddingLeft:20}}><span style={{color:'#7eb8d0',fontSize:9}}>EXT</span> {extBreadcrumb(m.extId).text}</div>
+                  {(() => {
+                    const fbc = ftlsBreadcrumb(m.ftlsId);
+                    const ebc = extBreadcrumb(m.extId);
+                    // Normalize names for comparison: lowercase, strip non-letters
+                    const norm = s => (s||'').toLowerCase().replace(/[^a-z]/g,'');
+                    const fNames = fbc.ids.map(id => norm(personMap[id]?.dn || ''));
+                    const eNames = ebc.ids.map(id => norm(extPeopleMap[id]?.dn || personMap[id]?.dn || ''));
+                    // Lineages differ if normalized name sequences don't share significant overlap
+                    const sameLen = fNames.length === eNames.length;
+                    let sameLineage = sameLen && fNames.length > 0;
+                    if (sameLineage) {
+                      for (let i = 0; i < fNames.length; i++) {
+                        // Accept if one name contains the other (handles "GeeVarghese" vs "GeeVarghese Mathai")
+                        if (!fNames[i] || !eNames[i]) { sameLineage = false; break; }
+                        if (fNames[i] !== eNames[i] && !fNames[i].includes(eNames[i]) && !eNames[i].includes(fNames[i])) {
+                          sameLineage = false; break;
+                        }
+                      }
+                    }
+                    return (<div style={{fontSize:10, lineHeight:1.6, paddingLeft:20}}>
+                      {fbc.text && <div style={{color:'#8a8578'}}><span style={{color:'#c4a35a',fontSize:9}}>FTLS</span> {fbc.text}</div>}
+                      {ebc.text && <div style={{color:'#6a8a70'}}><span style={{color:'#7eb8d0',fontSize:9}}>EXT</span> {ebc.text}</div>}
+                      {fbc.text && ebc.text && !sameLineage && <div style={{color:'#d08050',fontSize:9,fontWeight:500}}>⚠ Lineages don't align — review carefully</div>}
+                    </div>);
+                  })()}
                 </div>
                 {m.diffs.length > 0 && <div style={{ padding:'0 14px 10px' }}>
                   <table style={{ width:'100%', borderCollapse:'collapse', fontSize:12 }}>
