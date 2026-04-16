@@ -1570,9 +1570,12 @@ async function remapPersonId(oldId, newId, editUser) {
       method: 'POST',
       body: JSON.stringify({
         person_id: newId,
+        action: 'id_remap',
         edited_by: editUser || 'GEDCOM merge',
-        changed_fields: { action: 'id_remap', old_id: oldId, new_id: newId },
-        previous_values: { id: oldId },
+        changes: {
+          changed_fields: { action: 'id_remap', old_id: oldId, new_id: newId },
+          previous_values: { id: oldId },
+        },
       }),
       headers: { 'Prefer': 'return=minimal' }
     });
@@ -1619,10 +1622,14 @@ async function remapFamilyId(oldId, newId, editUser) {
     await sbFetch('edit_log', {
       method: 'POST',
       body: JSON.stringify({
-        person_id: (fam.husband_id || fam.wife_id || newId), // associate with a spouse for traceability
+        person_id: (fam.husband_id || fam.wife_id || null), // associate with a spouse for traceability
+        family_id: newId,
+        action: 'family_id_remap',
         edited_by: editUser || 'GEDCOM merge',
-        changed_fields: { action: 'family_id_remap', old_id: oldId, new_id: newId },
-        previous_values: { family_id: oldId },
+        changes: {
+          changed_fields: { action: 'family_id_remap', old_id: oldId, new_id: newId },
+          previous_values: { family_id: oldId },
+        },
       }),
       headers: { 'Prefer': 'return=minimal' }
     });
