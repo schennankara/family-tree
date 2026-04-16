@@ -4208,7 +4208,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
 
   // ── Compute basket contents ──
   const basket = useMemo(() => {
-    if (!diffResult) return { imports: [], exports: [], importFams: [] };
+    if (!diffResult) return { imports: [], exports: [], importFams: [], orphanFams: [] };
     const imports = []; // { type, person, fields? }
     const exports = []; // { type, person, fields? }
     const importFams = [];
@@ -4233,8 +4233,44 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
       if (expFields.length > 0) exports.push({ type: 'changed_fields', person: m.ftls, fields: expFields });
     });
 
-    return { imports, exports, importFams };
-  }, [diffResult, extDir, ftlsDir, changedDir, fieldDir, extFamDir]);
+    // ── ORPHAN FAMILIES: ext-only families whose members already exist in FTLS DB ──
+    // These are families that failed to import (FK error) or were never selected
+    const markedFamIds = new Set(importFams.map(f => f.id));
+    const orphanFams = [];
+    diffResult.familyDiffs.filter(f => f.type === 'ext_only').forEach(f => {
+      if (markedFamIds.has(f.id)) return; // already in importFams
+      const fam = f.ext;
+      const memberIds = [fam.husb, fam.wife, ...(fam.children || [])].filter(Boolean);
+      const hasDbMember = memberIds.some(mid => !!personMap[mid]);
+      if (hasDbMember) orphanFams.push(fam);
+    });
+
+    return { imports, exports, importFams, orphanFams };
+  }, [diffResult, extDir, ftlsDir, changedDir, fieldDir, extFamDir, personMap]);
+
+  // ── REPAIR ORPHAN FAMILIES (standalone — no basket selection needed) ──
+  const repairOrphanFamilies = async () => {
+    if (basket.orphanFams.length === 0) return;
+    setMerging(true);
+    const log = [];
+    let fixed = 0;
+    for (const fam of basket.orphanFams) {
+      try {
+        const result = await mergeFamilyToDb(fam);
+        if (result && !result.skipped) {
+          const hName = fam.husb ? (extPeopleMap[fam.husb]?.dn || personMap[fam.husb]?.dn || fam.husb) : '?';
+          const wName = fam.wife ? (extPeopleMap[fam.wife]?.dn || personMap[fam.wife]?.dn || fam.wife) : '?';
+          log.push('✓ ' + hName + ' ⚭ ' + wName + ' — ' + (result.action || 'created'));
+          fixed++;
+        } else if (result?.skipped) {
+          log.push('⊘ Family ' + fam.id + ' (' + result.reason + ')');
+        }
+      } catch(e) { log.push('✗ Family ' + fam.id + ': ' + e.message); }
+    }
+    log.push('── ' + fixed + ' orphan families repaired');
+    setMergeLog(prev => [...prev, ...log]);
+    setMerging(false);
+  };
 
   // ── BATCH IMPORT (merge to DB) ──
   const batchImport = async () => {
@@ -4276,38 +4312,6 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
           if (result && !result.skipped) log.push('✓ Auto-updated family: ' + fid + ' — ' + (result.action || 'updated'));
         } catch(e) { log.push('⚠ Auto-family ' + fid + ': ' + e.message); }
       }
-    }
-    // ── ORPHAN REPAIR: find ext-only families whose members already exist in DB ──
-    // This handles the case where persons were imported but their families failed (FK error)
-    // or when re-running merge after persons already exist — no new persons = importedPersonIds empty
-    if (extFamiliesMap && diffResult) {
-      const extOnlyFamIds = new Set(
-        (diffResult.familyDiffs || []).filter(f => f.type === 'ext_only').map(f => f.id)
-      );
-      let orphanFixCount = 0;
-      for (const [fid, fam] of Object.entries(extFamiliesMap)) {
-        if (alreadyProcessedFams.has(fid)) continue;
-        if (!extOnlyFamIds.has(fid)) continue; // only process families that don't exist in FTLS
-        // Check if any member of this family exists in DB (not just newly imported ones)
-        const memberIds = [fam.husb, fam.wife, ...(fam.children || [])].filter(Boolean);
-        let hasDbMember = false;
-        for (const mid of memberIds) {
-          try {
-            const rows = await sbFetch(`persons?id=eq.${mid}&select=id`);
-            if (rows.length > 0) { hasDbMember = true; break; }
-          } catch(e) {}
-        }
-        if (!hasDbMember) continue;
-        try {
-          const result = await mergeFamilyToDb(fam);
-          if (result && !result.skipped) {
-            log.push('✓ Orphan-repair family: ' + fid + ' — ' + (result.action || 'created'));
-            orphanFixCount++;
-          }
-          alreadyProcessedFams.add(fid);
-        } catch(e) { log.push('⚠ Orphan-repair family ' + fid + ': ' + e.message); }
-      }
-      if (orphanFixCount > 0) log.push('── ' + orphanFixCount + ' orphan families reconnected');
     }
     // Post-import validation: check for orphan family links (#22)
     if (log.some(l => l.startsWith('✓'))) {
@@ -4385,7 +4389,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
     </span>);
   };
 
-  const basketCount = basket.imports.length + basket.importFams.length + basket.exports.length;
+  const basketCount = basket.imports.length + basket.importFams.length + basket.exports.length + basket.orphanFams.length;
 
   return (
     <div style={{ position:'fixed', inset:0, zIndex:200, display:'flex', alignItems:'center', justifyContent:'center' }}>
@@ -4903,13 +4907,41 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
 
             {/* ──── BASKET ──── */}
             {tab==='basket' && (<div style={{ padding:'12px 0' }}>
-              {basket.imports.length===0 && basket.exports.length===0 && basket.importFams.length===0 ? (
+              {basket.imports.length===0 && basket.exports.length===0 && basket.importFams.length===0 && basket.orphanFams.length===0 ? (
                 <div style={{ textAlign:'center', padding:'40px 20px', color:DM }}>
                   <div style={{ fontSize:36, marginBottom:12 }}>🧺</div>
                   <div style={{ fontSize:14 }}>Basket is empty</div>
                   <div style={{ fontSize:12, marginTop:8 }}>Go to Changed, External Only, or FTLS Only tabs and mark items for Import or Export.</div>
                 </div>
               ) : (<>
+                {/* ORPHAN FAMILY REPAIR — shown automatically, no selection needed */}
+                {basket.orphanFams.length > 0 && (<>
+                  <div style={{ fontSize:13, fontWeight:600, color:'#c49a6c', marginBottom:8, marginTop:8, display:'flex', alignItems:'center', gap:8 }}>
+                    🔧 Orphan Family Repair
+                    <span style={{ fontSize:10, fontWeight:400, color:DM }}>({basket.orphanFams.length} families missing from DB)</span>
+                  </div>
+                  <div style={{ fontSize:12, color:DM, marginBottom:12, lineHeight:1.6, background:'rgba(196,154,108,0.06)', border:'1px solid rgba(196,154,108,0.15)', borderRadius:6, padding:12 }}>
+                    These families exist in the GEDCOM and their members are already in the database, but the family records were never created (likely from a previous import that failed with FK constraint errors). This will create the missing family links.
+                  </div>
+                  {basket.orphanFams.map((fam, i) => {
+                    const hName = fam.husb ? (extPeopleMap[fam.husb]?.dn || personMap[fam.husb]?.dn || fam.husb) : '—';
+                    const wName = fam.wife ? (extPeopleMap[fam.wife]?.dn || personMap[fam.wife]?.dn || fam.wife) : '—';
+                    return (<div key={'orf'+i} style={{ ...rowSt, fontSize:12, color:TX, display:'flex', alignItems:'center', gap:8 }}>
+                      <span style={{ color:'#c49a6c' }}>📎</span> {hName} ⚭ {wName} — {(fam.children||[]).length} children <span style={badge('rgba(196,154,108,0.5)')}>orphan</span>
+                    </div>);
+                  })}
+                  <div style={{ marginTop:12, display:'flex', gap:10, alignItems:'center' }}>
+                    <button onClick={()=>{
+                      if (confirm(`This will create ${basket.orphanFams.length} missing family records in the database.\n\nThe persons already exist — this just creates the family links (husband/wife/children) that failed to import previously.\n\nContinue?`)) {
+                        repairOrphanFamilies();
+                      }
+                    }} disabled={merging} style={{ background:'rgba(196,154,108,0.15)', border:'1px solid rgba(196,154,108,0.5)', color:'#c49a6c', padding:'8px 20px', borderRadius:6, cursor:'pointer', fontSize:13 }}>
+                      {merging ? 'Repairing...' : '🔧 Repair ' + basket.orphanFams.length + ' Orphan Families'}
+                    </button>
+                    <span style={{ fontSize:10, color:DM }}>⚠ Creates family records in database</span>
+                  </div>
+                </>)}
+
                 {/* IMPORT SECTION */}
                 {(basket.imports.length>0 || basket.importFams.length>0) && (<>
                   <div style={hdr}>⬇ Import into FTLS ({basket.imports.length + basket.importFams.length} items)</div>
