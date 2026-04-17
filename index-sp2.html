@@ -1329,21 +1329,46 @@ function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap)
     return [hName, wName].filter(Boolean).join(' & ') || pf.familyId;
   }
 
+  const personFuzzyMap = {};
+
+  const resolveExtToFtls = (eid) => {
+    if (!eid) return null;
+    if (ftlsPersonMap[eid]) return eid;
+    return personFuzzyMap[eid] || null;
+  };
+
+  const normPersonName = (person) => {
+    const dn = (person?.dn || '').toLowerCase().replace(/[^a-z]/g,'');
+    if (dn) return dn;
+    const fn = (person?.fn || '').toLowerCase().replace(/[^a-z]/g,'');
+    const ln = (person?.ln || '').toLowerCase().replace(/[^a-z]/g,'');
+    return (fn + ln).replace(/[^a-z]/g,'');
+  };
+
+  const personsEquivalent = (ftlsId, extId) => {
+    if (!ftlsId && !extId) return true;
+    if (!ftlsId || !extId) return false;
+    if (ftlsId === extId) return true;
+    if (resolveExtToFtls(extId) === ftlsId) return true;
+    const ftlsPerson = ftlsPersonMap[ftlsId];
+    const extPerson = extPeople[extId] || (ftlsPersonMap[extId] || null);
+    if (!ftlsPerson || !extPerson) return false;
+    const fName = normPersonName(ftlsPerson);
+    const eName = normPersonName(extPerson);
+    if (!fName || !eName || fName !== eName) return false;
+    if (ftlsPerson.g && extPerson.g && ftlsPerson.g !== extPerson.g) return false;
+    if (ftlsPerson.dob && extPerson.dob && ftlsPerson.dob !== extPerson.dob) return false;
+    return true;
+  };
+
   // Helper: are these two parent families actually the same couple (just with different IDs)?
-  // Compares normalized names of husband and wife — handles cross-system ID mismatches
+  // Uses fuzzy person identity so parent-family diffs don't light up just because IDs drifted.
   function sameParentFamily(ftlsParent, extParent) {
     if (!ftlsParent && !extParent) return true;
     if (!ftlsParent || !extParent) return false;
     if (ftlsParent.familyId === extParent.familyId) return true;
-    const norm = s => (s||'').toLowerCase().replace(/[^a-z]/g,'');
-    const fhName = norm(ftlsPersonMap[ftlsParent.husband]?.dn || '');
-    const ehName = norm(extPeople[extParent.husband]?.dn || ftlsPersonMap[extParent.husband]?.dn || '');
-    const fwName = norm(ftlsPersonMap[ftlsParent.wife]?.dn || '');
-    const ewName = norm(extPeople[extParent.wife]?.dn || ftlsPersonMap[extParent.wife]?.dn || '');
-    // Match if both spouse names line up (allowing substring containment for name variants)
-    const matches = (a, b) => a && b && (a === b || a.includes(b) || b.includes(a));
-    const hMatch = !ftlsParent.husband && !extParent.husband ? true : matches(fhName, ehName);
-    const wMatch = !ftlsParent.wife && !extParent.wife ? true : matches(fwName, ewName);
+    const hMatch = personsEquivalent(ftlsParent.husband, extParent.husband);
+    const wMatch = personsEquivalent(ftlsParent.wife, extParent.wife);
     return hMatch && wMatch;
   }
 
@@ -1440,7 +1465,6 @@ function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap)
 
   // ── Family Fuzzy Match: find ext_only families that match ftls_only families by members ──
   // Build person fuzzy remap: extId → ftlsId (from fuzzy matched persons)
-  const personFuzzyMap = {};
   results.fuzzyMatched.forEach(m => { personFuzzyMap[m.extId] = m.ftlsId; });
 
   const extOnlyFamDiffs = results.familyDiffs.filter(f => f.type === 'ext_only');
