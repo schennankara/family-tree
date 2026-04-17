@@ -34,7 +34,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.7.7';
+    const APP_VERSION = 'v4.7.10';
     const BUILD_DATE = '2026-04-16';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
@@ -194,6 +194,7 @@ function buildTreeFromDB(persons, families) {
       pp:p.profile_photo, bio:p.bio, loc:p.location, prof:p.profession, emp:p.employer,
       stories:p.stories, notes:p.notes, pgl:p.photo_gallery_link, dl:p.documents_link,
       tp:p.title_prefix, burd:p.burial_date, _xg:p._extra_gedcom,
+      primaryFamId:p.primary_family_id||null,
       _fams: [], _famc: [],
     };
   });
@@ -302,6 +303,7 @@ async function savePerson(person, editUser) {
     photo_gallery_link: person.pgl||'', documents_link: person.dl||'',
     title_prefix: person.tp||'', burial_date: person.burd||'',
     _extra_gedcom: person._xg||'',
+    primary_family_id: person.primaryFamId||null,
     updated_by: editUser||'',
   };
   
@@ -394,13 +396,24 @@ async function deletePersonFromDB(personId, editUser) {
       body: JSON.stringify({ children: newChildren })
     });
   }
-  // Remove families where this person is husband or wife (if no children)
+  // Remove families where this person is husband or wife (if no children).
+  // Before deleting any family, null out any primary_family_id references to it
+  // so no person is left pointing to a non-existent family record.
   const asFams = await sbFetch(`families?select=*&or=(husband_id.eq.${personId},wife_id.eq.${personId})`);
   for (const f of asFams) {
     if (!f.children || f.children.length === 0) {
+      try {
+        await sbFetch(`persons?primary_family_id=eq.${f.id}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ primary_family_id: null })
+        });
+      } catch(e) { /* non-fatal, UI falls back to date-based resolution */ }
       await sbFetch(`families?id=eq.${f.id}`, { method: 'DELETE' });
     }
   }
+  // If this person had a primary_family_id pointing to a family they're still in
+  // (i.e., the family has children so it survives), that's someone else's concern.
+  // But if this person themselves had a primary_family_id, it goes away with them.
   // Delete person
   await sbFetch(`persons?id=eq.${personId}`, { method: 'DELETE' });
   // Log
@@ -3759,7 +3772,32 @@ function EditForm({node,onSave,onCancel,isNew,parentId,parentName}){
 }
 
 /* ───── TREE NODE ───── */
-function MarriagePopover({node, onEditSpouse, onDelSpouse, onAddMarriage}) {
+/* ── Marriage helpers ─────────────────────────────────────────────
+   currentMarriage(spouses, primaryFamId) — returns the marriage to treat as
+     "current" for display. Resolution order:
+       1. If primaryFamId is set and matches a marriage, that wins (explicit pick).
+       2. Otherwise, most recent non-divorced marriage by parsed year.
+       3. Otherwise, most recent overall by parsed year.
+     Dates vary: "1985", "12 JAN 1985", "ABT 1985", etc.
+   marriageYear(s) — best-effort 4-digit year extract; 0 if unknown.
+*/
+function marriageYear(s) {
+  if (!s) return 0;
+  const m = String(s).match(/\b(1[5-9]\d{2}|2\d{3})\b/);
+  return m ? parseInt(m[1], 10) : 0;
+}
+function currentMarriage(spouses, primaryFamId) {
+  if (!spouses || spouses.length === 0) return null;
+  if (primaryFamId) {
+    const explicit = spouses.find(m => m.famId === primaryFamId);
+    if (explicit) return explicit;
+    // If the primary ref is stale (family deleted), fall through to date logic.
+  }
+  const sorted = [...spouses].sort((a, b) => marriageYear(b.mdate) - marriageYear(a.mdate));
+  return sorted.find(m => !m.divorced) || sorted[0];
+}
+
+function MarriagePopover({node, onEditSpouse, onDelSpouse, onAddMarriage, onAddChild, onSetPrimary}) {
   const [open, setOpen] = React.useState(false);
   const ref = React.useRef(null);
   const marriages = node.spouses || (node.sp ? [{famId:null,sp:node.sp,mdate:node.mdate||'',divorced:false}] : []);
@@ -3770,8 +3808,10 @@ function MarriagePopover({node, onEditSpouse, onDelSpouse, onAddMarriage}) {
     return ()=>document.removeEventListener('mousedown', handler);
   },[open]);
   const currentLabel = marriages.length === 0 ? null
-    : marriages.length === 1 ? (marriages[0].sp?.dn || '(unknown partner)')
-    : marriages.length + ' marriages';
+    : (() => {
+        const cur = currentMarriage(marriages, node.primaryFamId);
+        return cur?.sp?.dn || (marriages.length === 1 ? '(unknown partner)' : null);
+      })();
   return (
     <span ref={ref} style={{position:'relative',display:'inline-flex',alignItems:'center',gap:4,fontSize:12,color:DM}}>
       <span
@@ -3785,19 +3825,22 @@ function MarriagePopover({node, onEditSpouse, onDelSpouse, onAddMarriage}) {
       {open && <div style={{position:'absolute',top:'100%',left:0,zIndex:50,marginTop:4,
         background:'#1a1a14',border:`1px solid ${BR}`,borderRadius:8,minWidth:240,boxShadow:'0 4px 20px rgba(0,0,0,0.5)',padding:8}}>
         {marriages.length===0 && <div style={{fontSize:12,color:DM,padding:'4px 8px'}}>No marriages recorded</div>}
-        {marriages.map((m,i)=>(
+        {marriages.map((m,i)=>{
+          const cur = currentMarriage(marriages, node.primaryFamId);
+          const isCurrent = m === cur;
+          const label = marriages.length === 1 ? null
+            : isCurrent ? 'Current' : 'Former';
+          return (
           <div key={m.famId||i} style={{padding:'6px 8px',borderRadius:6,marginBottom:2,
             background:'rgba(255,255,255,0.03)',border:`1px solid ${BR}`}}>
             <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:8}}>
               <div>
-                <span style={{fontSize:11,color:m.divorced?'#c07a7a':MC,fontWeight:500}}>
-                  {m.divorced ? '÷ divorced' : i===0 ? '✓ primary' : '⚭ marriage '+(i+1)}
-                </span>
+                {label&&<span style={{fontSize:11,color:DM,fontWeight:400}}>{label}</span>}
                 <div style={{fontSize:13,color:TX,marginTop:2}}>
                   {m.sp?.dn || <span style={{color:DM,fontStyle:'italic'}}>unknown partner</span>}
                 </div>
                 {m.mdate&&<div style={{fontSize:11,color:DM}}>m. {m.mdate}</div>}
-                {m.divorced&&m.divdate&&<div style={{fontSize:11,color:'#c07a7a'}}>div. {m.divdate}</div>}
+                {m.divorced&&m.divdate&&<div style={{fontSize:11,color:DM}}>Ended {marriageYear(m.divdate)||m.divdate}</div>}
                 <div style={{fontSize:11,color:DM,marginTop:2}}>{m.ch?.length||0} {(m.ch?.length||0)===1?'child':'children'}</div>
               </div>
               <div style={{display:'flex',flexDirection:'column',gap:3}}>
@@ -3805,6 +3848,16 @@ function MarriagePopover({node, onEditSpouse, onDelSpouse, onAddMarriage}) {
                   style={{background:'none',border:`1px solid ${BR}`,color:GD,cursor:'pointer',fontSize:11,padding:'2px 8px',borderRadius:4}}>
                   {m.sp ? 'Edit' : 'Add partner'}
                 </button>
+                {onAddChild&&<button onClick={e=>{e.stopPropagation();setOpen(false);onAddChild(node.id,m.famId);}}
+                  title={`Add a child to this marriage${m.sp?.dn?' with '+m.sp.dn:''}`}
+                  style={{background:'none',border:`1px solid rgba(168,201,173,0.3)`,color:MC,cursor:'pointer',fontSize:11,padding:'2px 8px',borderRadius:4}}>
+                  + child
+                </button>}
+                {onSetPrimary&&marriages.length>1&&!isCurrent&&m.sp&&<button onClick={e=>{e.stopPropagation();setOpen(false);onSetPrimary(node.id,m.famId);}}
+                  title="Show this marriage as the person's current — changes the tree label and card ordering, does not alter any dates"
+                  style={{background:'none',border:`1px solid ${BR}`,color:DM,cursor:'pointer',fontSize:11,padding:'2px 8px',borderRadius:4}}>
+                  Make primary
+                </button>}
                 {m.sp&&<button onClick={e=>{e.stopPropagation();setOpen(false);onDelSpouse(node.id,m.famId);}}
                   style={{background:'none',border:'1px solid rgba(160,80,80,0.3)',color:'#c07a7a',cursor:'pointer',fontSize:11,padding:'2px 8px',borderRadius:4}}>
                   Remove
@@ -3812,7 +3865,7 @@ function MarriagePopover({node, onEditSpouse, onDelSpouse, onAddMarriage}) {
               </div>
             </div>
           </div>
-        ))}
+        );})}
         <button onClick={e=>{e.stopPropagation();setOpen(false);onAddMarriage(node);}}
           style={{width:'100%',marginTop:4,background:'rgba(155,130,196,0.08)',border:`1px solid rgba(155,130,196,0.25)`,
             color:FC,cursor:'pointer',fontSize:12,padding:'6px',borderRadius:6}}>
@@ -3823,14 +3876,15 @@ function MarriagePopover({node, onEditSpouse, onDelSpouse, onAddMarriage}) {
   );
 }
 
-function TreeNode({node,exp,onTog,onSel,onEdit,onAdd,onDel,onEditSpouse,onDelSpouse,onAddMarriage,hl}){
+function TreeNode({node,exp,onTog,onSel,onEdit,onAdd,onDel,onEditSpouse,onDelSpouse,onAddMarriage,onAddChild,onSetPrimary,hl}){
   const has=node.ch&&node.ch.length>0;
   const open=exp.has(node.id);
   const isHL=hl===node.id;
-  // Build a set of child IDs that belong to the primary marriage, for * marking
-  // "Primary" = first non-divorced marriage; falls back to spouses[0] if all are divorced.
-  // This prevents the * marker from inverting when the earliest marriage ended in divorce.
-  const primaryMarriage = (node.spouses||[]).find(m=>!m.divorced) || (node.spouses||[])[0];
+  // Build a set of child IDs that belong to the primary marriage, for * marking.
+  // Primary resolution (via currentMarriage): explicit primaryFamId wins, then
+  // most-recent non-divorced, then most-recent overall. Kids of non-primary
+  // marriages get a subtle * marker indicating they're from a different union.
+  const primaryMarriage = currentMarriage(node.spouses||[], node.primaryFamId);
   const primaryChildIds = new Set((primaryMarriage?.ch||[]).map(c=>c.id));
   const hasMultipleMarriages = (node.spouses||[]).length > 1;
   return(
@@ -3851,7 +3905,7 @@ function TreeNode({node,exp,onTog,onSel,onEdit,onAdd,onDel,onEditSpouse,onDelSpo
         <span onClick={()=>onSel(node)} title="View details" style={{fontSize:14,color:node.dec?'#6b6560':'#f0ebe0',cursor:'pointer',
           whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{node.dn}</span>
         {node.nk&&node.nk!==node.dn&&<span style={{fontSize:11,color:DM,fontStyle:'italic'}}>"{node.nk}"</span>}
-        <MarriagePopover node={node} onEditSpouse={onEditSpouse} onDelSpouse={onDelSpouse} onAddMarriage={onAddMarriage}/>
+        <MarriagePopover node={node} onEditSpouse={onEditSpouse} onDelSpouse={onDelSpouse} onAddMarriage={onAddMarriage} onAddChild={onAddChild} onSetPrimary={onSetPrimary}/>
         {node.dob&&<span style={{fontSize:11,color:DM,marginLeft:'auto',opacity:0.6}}>b.{node.dob}</span>}
         {has&&<span title={node.ch.length+' children'} style={{fontSize:10,color:GD,background:'rgba(196,163,90,0.08)',padding:'1px 6px',borderRadius:8,flexShrink:0}}>{node.ch.length}</span>}
         <span style={{display:'flex',gap:2,marginLeft:has?0:'auto',opacity:0.4,transition:'opacity 0.2s'}}
@@ -3866,7 +3920,7 @@ function TreeNode({node,exp,onTog,onSel,onEdit,onAdd,onDel,onEditSpouse,onDelSpo
           const isPrior = hasMultipleMarriages && !primaryChildIds.has(c.id);
           return <div key={c.id} style={{position:'relative'}}>
             {isPrior&&<span title="Child from a previous marriage" style={{position:'absolute',left:-14,top:8,fontSize:9,color:GD,fontWeight:600,opacity:0.8}}>*</span>}
-            <TreeNode node={c} exp={exp} onTog={onTog} onSel={onSel} onEdit={onEdit} onAdd={onAdd} onDel={onDel} onEditSpouse={onEditSpouse} onDelSpouse={onDelSpouse} onAddMarriage={onAddMarriage} hl={hl}/>
+            <TreeNode node={c} exp={exp} onTog={onTog} onSel={onSel} onEdit={onEdit} onAdd={onAdd} onDel={onDel} onEditSpouse={onEditSpouse} onDelSpouse={onDelSpouse} onAddMarriage={onAddMarriage} onAddChild={onAddChild} onSetPrimary={onSetPrimary} hl={hl}/>
           </div>;
         })}
       </div>}
@@ -3875,7 +3929,7 @@ function TreeNode({node,exp,onTog,onSel,onEdit,onAdd,onDel,onEditSpouse,onDelSpo
 }
 
 /* ───── DETAIL ───── */
-function Detail({node,onClose,onEdit,onEditSpouse,onDelSpouse,onMove,onAddChild,onAddMarriage,root}){
+function Detail({node,onClose,onEdit,onEditSpouse,onDelSpouse,onMove,onAddChild,onAddMarriage,onSetPrimary,root}){
   const [personMedia,setPersonMedia]=useState([]);
   const [mediaLoaded,setMediaLoaded]=useState(false);
   const [lightbox,setLightbox]=useState(null);
@@ -3936,22 +3990,31 @@ function Detail({node,onClose,onEdit,onEditSpouse,onDelSpouse,onMove,onAddChild,
             {marriages.map((m,i)=>{
               const sp = m.sp;
               const spPp = sp?.pp ? cldImg(sp.pp,'c_fill,w_32,h_32,g_face,r_max') : null;
+              const cur = currentMarriage(marriages, node.primaryFamId);
+              const isCurrent = m === cur;
+              const label = marriages.length === 1 ? null
+                : isCurrent ? 'Current' : 'Former';
               return <div key={m.famId||i} style={{marginBottom:12,padding:'10px 12px',borderRadius:8,
-                background:'rgba(255,255,255,0.025)',border:`1px solid ${m.divorced?'rgba(160,80,80,0.25)':BR}`}}>
+                background:'rgba(255,255,255,0.025)',border:`1px solid ${BR}`}}>
                 {/* Marriage header */}
                 <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:8}}>
                   <div>
-                    <span style={{fontSize:10,color:m.divorced?'#c07a7a':i===0?MC:GD,textTransform:'uppercase',letterSpacing:1.5,fontWeight:500}}>
-                      {m.divorced ? '÷ divorced' : i===0 ? '✓ primary' : 'marriage '+(i+1)}
-                    </span>
-                    {m.mdate&&<span style={{fontSize:11,color:DM,marginLeft:8}}>m. {m.mdate}</span>}
-                    {m.divorced&&m.divdate&&<span style={{fontSize:11,color:'#c07a7a',marginLeft:8}}>div. {m.divdate}</span>}
+                    {label&&<span style={{fontSize:10,color:DM,textTransform:'uppercase',letterSpacing:1.5,fontWeight:400}}>
+                      {label}
+                    </span>}
+                    {m.mdate&&<span style={{fontSize:11,color:DM,marginLeft:label?8:0}}>m. {m.mdate}</span>}
+                    {m.divorced&&m.divdate&&<span style={{fontSize:11,color:DM,marginLeft:8}}>· Ended {marriageYear(m.divdate)||m.divdate}</span>}
                   </div>
-                  <div style={{display:'flex',gap:6}}>
+                  <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
                     <button onClick={()=>onEditSpouse(node,m.famId,m.sp)}
                       style={{background:'none',border:`1px solid ${BR}`,color:GD,padding:'2px 9px',borderRadius:5,cursor:'pointer',fontSize:11}}>
                       {sp ? 'Edit' : 'Add partner'}
                     </button>
+                    {onSetPrimary&&marriages.length>1&&!isCurrent&&sp&&<button onClick={()=>onSetPrimary(node.id,m.famId)}
+                      title="Show this marriage as current"
+                      style={{background:'none',border:`1px solid ${BR}`,color:DM,padding:'2px 9px',borderRadius:5,cursor:'pointer',fontSize:11}}>
+                      Make primary
+                    </button>}
                     {sp&&<button onClick={()=>onDelSpouse(node.id,m.famId)}
                       style={{background:'none',border:'1px solid rgba(160,80,80,0.3)',color:'#c07a7a',padding:'2px 9px',borderRadius:5,cursor:'pointer',fontSize:11}}>
                       Remove
@@ -6096,6 +6159,7 @@ function App(){
   const [adding,setAdding]=useState(null);
   const [spouseEditing,setSpouseEditing]=useState(null); // {parentId, famId, spouse}
   const [addingToFam,setAddingToFam]=useState(null); // famId when adding child to specific marriage
+  const [choosingFamFor,setChoosingFamFor]=useState(null); // node whose + was clicked but has >1 marriage
   const [msg,setMsg]=useState('');
   const [showLogin,setShowLogin]=useState(false);
   const [showRequestAccount,setShowRequestAccount]=useState(false);
@@ -6400,6 +6464,22 @@ function App(){
     setTimeout(()=>setMsg(''),2000);
   };
 
+  // Called when user clicks + on a tree row. If the person has multiple marriages,
+  // show a chooser so they can pick which marriage the new child belongs to.
+  // Single-marriage / no-marriage nodes skip the chooser and go straight to EditForm.
+  const handleTreeAdd=(id)=>{
+    const node=findNodeById(tree,id);
+    const marriages=(node?.spouses||[]).filter(m=>m); // defensive
+    if(marriages.length>1){
+      setChoosingFamFor(node);
+    }else{
+      // Single marriage or none — use best-guess (famId=null). addPersonToDB will
+      // attach to the only family, or create one if there are none.
+      setAdding(id);
+      setAddingToFam(null);
+    }
+  };
+
   const handleAdd=(data)=>{
     if (needsApproval(adding)) {
       const parentNode = findNodeById(tree, adding);
@@ -6620,6 +6700,45 @@ function App(){
     });
   };
 
+  // Mark a specific marriage as the person's primary (display-only preference).
+  // Stored as persons.primary_family_id. Null means "use date-based fallback."
+  const handleSetPrimary=(personId, famId)=>{
+    requireAuth(async()=>{
+      const prevPrimary = findNodeById(tree,personId)?.primaryFamId || null;
+      // Optimistic tree update
+      setTree(prev=>updateNode(prev,personId,(existing)=>({...existing, primaryFamId:famId})));
+      setPersonMap(prev=>({...prev, [personId]:{...(prev[personId]||{}), primaryFamId:famId}}));
+      try{
+        await sbFetch(`persons?id=eq.${personId}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ primary_family_id: famId })
+        });
+        // Log the change for audit
+        try{
+          await sbFetch('edit_log', {
+            method: 'POST',
+            headers: { 'Prefer': 'return=minimal' },
+            body: JSON.stringify({
+              person_id: personId,
+              action: 'set_primary_marriage',
+              edited_by: user?.name||user?.email||'',
+              diff: { primary_family_id: famId, previous: prevPrimary }
+            })
+          });
+        }catch(e){/* non-fatal */}
+        setMsg('Primary marriage updated');
+        setTimeout(()=>setMsg(''),2000);
+      }catch(e){
+        console.error('Set primary error:',e);
+        // Rollback
+        setTree(prev=>updateNode(prev,personId,(existing)=>({...existing, primaryFamId:prevPrimary})));
+        setPersonMap(prev=>({...prev, [personId]:{...(prev[personId]||{}), primaryFamId:prevPrimary}}));
+        setMsg('Failed to update primary: '+(e?.message||'unknown error'));
+        setTimeout(()=>setMsg(''),3000);
+      }
+    });
+  };
+
   const total=tree?cnt(tree):0;
   const btnS={background:CD,border:`1px solid ${BR}`,color:DM,padding:'6px 12px',borderRadius:5,fontSize:12,cursor:'pointer',whiteSpace:'nowrap'};
   const gateInp={width:'100%',background:'#1a1a14',border:'1px solid '+BR,color:TX,padding:'10px 14px',borderRadius:6,fontSize:15,outline:'none',fontFamily:'inherit',textAlign:'center',letterSpacing:1};
@@ -6744,11 +6863,13 @@ function App(){
         <TreeNode node={tree} exp={exp} onTog={toggle}
           onSel={(node)=>setSel(findNodeById(tree,node.id)||node)}
           onEdit={(node)=>requireAuth(()=>openEditForNode(node))}
-          onAdd={(id)=>requireAuth(()=>{setAdding(id);setAddingToFam(null);})}
+          onAdd={(id)=>requireAuth(()=>handleTreeAdd(id))}
           onDel={(id)=>requireAuth(()=>handleDelete(id))}
           onEditSpouse={(node,famId,sp)=>requireAuth(()=>setSpouseEditing({parentId:node.id,famId:famId||null,spouse:sp||null}))}
           onDelSpouse={(id,famId)=>requireAuth(()=>handleDeleteSpouse(id,famId))}
           onAddMarriage={(node)=>handleAddMarriage(node)}
+          onAddChild={(parentId,famId)=>requireAuth(()=>{setAdding(parentId);setAddingToFam(famId||null);})}
+          onSetPrimary={(personId,famId)=>handleSetPrimary(personId,famId)}
           hl={hl}/>
       </div>
       {sel&&!editing&&<Detail
@@ -6760,10 +6881,52 @@ function App(){
           onDelSpouse={(id,famId)=>requireAuth(()=>handleDeleteSpouse(id,famId))}
           onAddChild={(parentId,famId)=>requireAuth(()=>{setAdding(parentId);setAddingToFam(famId||null);})}
           onAddMarriage={(node)=>handleAddMarriage(node)}
+          onSetPrimary={(personId,famId)=>handleSetPrimary(personId,famId)}
         />}
       {editing&&<EditForm node={findNodeById(tree,editing.id)||editing} onSave={handleSaveEdit} onCancel={()=>setEditing(null)} isNew={false}/>}
       {spouseEditing&&<EditForm node={spouseEditing.spouse||empty()} onSave={handleSaveSpouse} onCancel={()=>setSpouseEditing(null)} isNew={false}/>}
       {adding&&<EditForm node={empty()} onSave={handleAdd} onCancel={()=>{setAdding(null);setAddingToFam(null);}} isNew={true} parentId={adding} parentName={flat.find(n=>n.id===adding)?._n}/>}
+      {choosingFamFor&&(()=>{
+        const node=choosingFamFor;
+        const marriages=node.spouses||[];
+        const close=()=>setChoosingFamFor(null);
+        const pick=(famId)=>{close();setAdding(node.id);setAddingToFam(famId);};
+        return <>
+          <div onClick={close} style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.55)',zIndex:200}}/>
+          <div style={{position:'fixed',top:'50%',left:'50%',transform:'translate(-50%,-50%)',zIndex:201,
+            background:'#1a1a14',border:`1px solid ${BR}`,borderRadius:10,padding:20,minWidth:320,maxWidth:'90vw',
+            boxShadow:'0 8px 40px rgba(0,0,0,0.6)'}}>
+            <div style={{fontSize:13,color:GC,marginBottom:4}}>Add a child to {node.dn}</div>
+            <div style={{fontSize:12,color:DM,marginBottom:14}}>Which marriage does this child belong to?</div>
+            {marriages.map((m,i)=>{
+              const cur = currentMarriage(marriages, node.primaryFamId);
+              const isCurrent = m === cur;
+              const label = isCurrent ? 'Current' : 'Former';
+              return (
+              <div key={m.famId||i} onClick={()=>pick(m.famId)}
+                style={{padding:'10px 12px',borderRadius:6,marginBottom:6,background:'rgba(255,255,255,0.03)',
+                  border:`1px solid ${BR}`,cursor:'pointer',transition:'background 0.15s'}}
+                onMouseEnter={e=>e.currentTarget.style.background='rgba(196,163,90,0.1)'}
+                onMouseLeave={e=>e.currentTarget.style.background='rgba(255,255,255,0.03)'}>
+                <div style={{fontSize:11,color:DM,fontWeight:400,textTransform:'uppercase',letterSpacing:1.2}}>
+                  {label}
+                </div>
+                <div style={{fontSize:14,color:TX,marginTop:3}}>
+                  {m.sp?.dn || <span style={{color:DM,fontStyle:'italic'}}>unknown partner</span>}
+                </div>
+                <div style={{fontSize:11,color:DM,marginTop:2}}>
+                  {m.mdate && 'm. '+m.mdate+' · '}
+                  {m.divorced && m.divdate && 'ended '+(marriageYear(m.divdate)||m.divdate)+' · '}
+                  {m.ch?.length||0} {(m.ch?.length||0)===1?'child':'children'}
+                </div>
+              </div>
+              );
+            })}
+            <button onClick={close} style={{width:'100%',marginTop:8,background:'none',border:`1px solid ${BR}`,
+              color:DM,padding:'6px',borderRadius:6,cursor:'pointer',fontSize:12}}>Cancel</button>
+          </div>
+        </>;
+      })()}
       </>}
       {activeTab==='admin'&&user&&isAdmin()&&<AdminPanel onReloadTree={()=>reloadTree(true)} onShowMigrate={()=>setShowMigrate(true)} onShowDiff={()=>setShowDiff(true)} onShowBackfill={()=>setShowBackfill(true)}/>}
       
