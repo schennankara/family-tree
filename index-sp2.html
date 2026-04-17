@@ -1192,20 +1192,62 @@ function fuzzyMatchPerson(person, candidates) {
   return bestMatch;
 }
 
-// Fuzzy match FAMILIES: match by spouse person IDs and children overlap
-// Two families are "the same" if they share the same husband+wife (or one spouse + significant child overlap)
+// Fuzzy match FAMILIES: match by spouse identity and child overlap.
+// This needs to survive cross-system ID drift, partial spouse data, and
+// newly-created child IDs that only match by fuzzy person identity.
 function fuzzyMatchFamily(extFam, ftlsFamilies, extPeople, ftlsPersonMap, personFuzzyMap) {
-  // personFuzzyMap: { extPersonId: ftlsPersonId } from person fuzzy matches
-  // Resolve ext person ID to FTLS person ID (handles both exact match and fuzzy remap)
+  const normName = (person) => {
+    const dn = (person?.dn || '').toLowerCase().replace(/[^a-z]/g, '');
+    if (dn) return dn;
+    const fn = (person?.fn || '').toLowerCase().replace(/[^a-z]/g, '');
+    const ln = (person?.ln || '').toLowerCase().replace(/[^a-z]/g, '');
+    return (fn + ln).replace(/[^a-z]/g, '');
+  };
+
+  // personFuzzyMap: { extPersonId: ftlsPersonId } from person fuzzy matches.
+  // Resolve ext person ID to FTLS person ID (handles both exact match and fuzzy remap).
   const resolve = (eid) => {
     if (!eid) return null;
     if (ftlsPersonMap[eid]) return eid; // exact match
     return personFuzzyMap[eid] || null; // fuzzy remapped
   };
 
+  const extPersonFor = (eid) => extPeople[eid] || null;
+  const ftlsPersonFor = (fid) => ftlsPersonMap[fid] || null;
+  const samePerson = (extId, ftlsId) => {
+    if (!extId || !ftlsId) return false;
+    if (resolve(extId) === ftlsId) return true;
+    const extP = extPersonFor(extId);
+    const ftlsP = ftlsPersonFor(ftlsId);
+    if (!extP || !ftlsP) return false;
+    const eName = normName(extP);
+    const fName = normName(ftlsP);
+    if (!eName || !fName || eName !== fName) return false;
+    if (extP.g && ftlsP.g && extP.g !== ftlsP.g) return false;
+    if (extP.dob && ftlsP.dob && extP.dob !== ftlsP.dob) return false;
+    return true;
+  };
+
+  const countChildOverlap = (extKids, ftlsKids) => {
+    if (!extKids.length || !ftlsKids.length) return 0;
+    let overlap = 0;
+    const used = new Set();
+    for (const extKid of extKids) {
+      for (const ftlsKid of ftlsKids) {
+        if (used.has(ftlsKid)) continue;
+        if (samePerson(extKid, ftlsKid)) {
+          overlap++;
+          used.add(ftlsKid);
+          break;
+        }
+      }
+    }
+    return overlap;
+  };
+
   const extH = resolve(extFam.husb);
   const extW = resolve(extFam.wife);
-  const extKids = (extFam.children || []).map(c => resolve(c)).filter(Boolean);
+  const extKids = extFam.children || [];
 
   let bestMatch = null, bestScore = 0;
   for (const [fid, ftlsFam] of Object.entries(ftlsFamilies)) {
@@ -1214,20 +1256,36 @@ function fuzzyMatchFamily(extFam, ftlsFamilies, extPeople, ftlsPersonMap, person
     const fKids = ftlsFam.children || [];
 
     let score = 0;
-    // Spouse matches (strong signal)
-    if (extH && fH && extH === fH) score += 40;
-    if (extW && fW && extW === fW) score += 40;
-    // Cross-check: ext husband is ftls wife's ID or vice versa (shouldn't happen but safety)
+    let spouseMatches = 0;
 
-    // Children overlap
-    if (extKids.length > 0 && fKids.length > 0) {
-      const overlap = extKids.filter(k => fKids.includes(k)).length;
-      const maxKids = Math.max(extKids.length, fKids.length);
-      if (overlap > 0) score += Math.round(20 * overlap / maxKids);
+    // Prefer same-role spouse matches, but tolerate husband/wife swaps when
+    // external data is incomplete or roles differ between systems.
+    if (samePerson(extFam.husb, fH)) { score += 45; spouseMatches++; }
+    else if (samePerson(extFam.husb, fW)) { score += 32; spouseMatches++; }
+
+    if (samePerson(extFam.wife, fW)) { score += 45; spouseMatches++; }
+    else if (samePerson(extFam.wife, fH)) { score += 32; spouseMatches++; }
+
+    // Give a small bonus when the remapped spouse IDs line up exactly.
+    if (extH && fH && extH === fH) score += 5;
+    if (extW && fW && extW === fW) score += 5;
+
+    const overlap = countChildOverlap(extKids, fKids);
+    const maxKids = Math.max(extKids.length, fKids.length);
+    if (overlap > 0 && maxKids > 0) {
+      score += Math.round(25 * overlap / maxKids);
     }
 
-    // Need at least one spouse match + something else, or both spouses
-    if (score > bestScore && score >= 40) {
+    // Accept:
+    // - both spouses match, or
+    // - one spouse plus a matching child, or
+    // - a strong child-only overlap for single-parent/partial families
+    const strongEnough =
+      spouseMatches >= 2 ||
+      (spouseMatches >= 1 && overlap >= 1) ||
+      (spouseMatches === 0 && overlap >= 2);
+
+    if (strongEnough && score > bestScore && score >= 45) {
       bestScore = score;
       bestMatch = { family: ftlsFam, id: fid, score };
     }
