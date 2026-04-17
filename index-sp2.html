@@ -1400,6 +1400,7 @@ function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap)
     if (extMatched.has(id)) continue;
     const match = fuzzyMatchPerson(ext, unmatchedFtls);
     if (match) {
+      personFuzzyMap[id] = match.person.id;
       const diffs = diffPerson(match.person, ext);
       // Compare parent family (FAMC) for fuzzy matches too — name-aware comparison
       const ftlsParent = findParentFamily(match.person.id, ftlsFamilyMap);
