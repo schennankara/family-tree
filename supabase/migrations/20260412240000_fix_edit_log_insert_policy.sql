@@ -4,7 +4,6 @@
 -- =============================================================================
 
 DROP POLICY IF EXISTS "Allow insert edit_log" ON public.edit_log;
-
 CREATE POLICY "Allow insert edit_log"
   ON public.edit_log FOR INSERT
   TO anon, authenticated

@@ -20,7 +20,6 @@
 DROP POLICY IF EXISTS "Allow insert persons" ON public.persons;
 DROP POLICY IF EXISTS "Allow update persons" ON public.persons;
 DROP POLICY IF EXISTS "Allow delete persons" ON public.persons;
-
 -- What remains (already in schema):
 --   "Admin write persons"   → INSERT, admin/super_admin only     ✓
 --   "Admin update persons"  → UPDATE, admin/super_admin only     ✓
@@ -36,7 +35,6 @@ DROP POLICY IF EXISTS "Allow delete persons" ON public.persons;
 DROP POLICY IF EXISTS "Allow insert families" ON public.families;
 DROP POLICY IF EXISTS "Allow update families" ON public.families;
 DROP POLICY IF EXISTS "Allow delete families" ON public.families;
-
 -- What remains (already in schema):
 --   "Admin write families"  → INSERT, admin/super_admin only     ✓
 --   "Admin update families" → UPDATE, admin/super_admin only     ✓
@@ -51,7 +49,6 @@ DROP POLICY IF EXISTS "Allow delete families" ON public.families;
 DROP POLICY IF EXISTS "Allow insert media" ON public.media;
 DROP POLICY IF EXISTS "Allow update media" ON public.media;
 DROP POLICY IF EXISTS "Allow delete media" ON public.media;
-
 -- Add admin-only write policies for media (none existed before)
 CREATE POLICY "Admin write media"
   ON public.media FOR INSERT
@@ -61,7 +58,6 @@ CREATE POLICY "Admin write media"
     WHERE users.id = auth.uid()
     AND users.role = ANY (ARRAY['admin', 'super_admin'])
   ));
-
 CREATE POLICY "Admin update media"
   ON public.media FOR UPDATE
   TO authenticated
@@ -70,7 +66,6 @@ CREATE POLICY "Admin update media"
     WHERE users.id = auth.uid()
     AND users.role = ANY (ARRAY['admin', 'super_admin'])
   ));
-
 CREATE POLICY "Admin delete media"
   ON public.media FOR DELETE
   TO authenticated
@@ -79,7 +74,6 @@ CREATE POLICY "Admin delete media"
     WHERE users.id = auth.uid()
     AND users.role = ANY (ARRAY['admin', 'super_admin'])
   ));
-
 -- What remains:
 --   "Admin write/update/delete media" → admin/super_admin only   ✓
 --   "Public read media"               → SELECT, everyone         ✓
@@ -95,7 +89,6 @@ DROP POLICY IF EXISTS "Anon delete family_members"  ON public.family_members;
 DROP POLICY IF EXISTS "Auth write family_members"   ON public.family_members;
 DROP POLICY IF EXISTS "Auth update family_members"  ON public.family_members;
 DROP POLICY IF EXISTS "Auth delete family_members"  ON public.family_members;
-
 -- Add admin-only write policies
 CREATE POLICY "Admin write family_members"
   ON public.family_members FOR INSERT
@@ -105,7 +98,6 @@ CREATE POLICY "Admin write family_members"
     WHERE users.id = auth.uid()
     AND users.role = ANY (ARRAY['admin', 'super_admin'])
   ));
-
 CREATE POLICY "Admin update family_members"
   ON public.family_members FOR UPDATE
   TO authenticated
@@ -114,7 +106,6 @@ CREATE POLICY "Admin update family_members"
     WHERE users.id = auth.uid()
     AND users.role = ANY (ARRAY['admin', 'super_admin'])
   ));
-
 CREATE POLICY "Admin delete family_members"
   ON public.family_members FOR DELETE
   TO authenticated
@@ -123,7 +114,6 @@ CREATE POLICY "Admin delete family_members"
     WHERE users.id = auth.uid()
     AND users.role = ANY (ARRAY['admin', 'super_admin'])
   ));
-
 -- What remains:
 --   "Admin write/update/delete family_members" → admin/super_admin only  ✓
 --   "Public read family_members"               → SELECT, everyone        ✓
@@ -134,7 +124,6 @@ CREATE POLICY "Admin delete family_members"
 -- Tighten read access — raw audit log should be admin-only, not public
 -- ─────────────────────────────────────────────────────────────────────────────
 DROP POLICY IF EXISTS "Public read edit_log" ON public.edit_log;
-
 CREATE POLICY "Admin read edit_log"
   ON public.edit_log FOR SELECT
   TO authenticated
@@ -143,7 +132,6 @@ CREATE POLICY "Admin read edit_log"
     WHERE users.id = auth.uid()
     AND users.role = ANY (ARRAY['admin', 'super_admin'])
   ));
-
 -- NOTE: "Allow insert edit_log" (insert to public, no check) remains.
 -- This is intentional — the app writes log entries for all role actions.
 -- There is no UPDATE or DELETE policy, keeping the log append-only. ✓
@@ -154,7 +142,6 @@ CREATE POLICY "Admin read edit_log"
 -- Remove anon read — user list (emails, roles) shouldn't be public
 -- ─────────────────────────────────────────────────────────────────────────────
 DROP POLICY IF EXISTS "Anon read users" ON public.users;
-
 -- "Authenticated read users" remains — logged-in users can see the list,
 -- which the app needs for the admin panel user management view. ✓
 
@@ -166,7 +153,6 @@ DROP POLICY IF EXISTS "Anon read users" ON public.users;
 -- ─────────────────────────────────────────────────────────────────────────────
 ALTER TABLE public.users
   DROP CONSTRAINT IF EXISTS users_role_check;
-
 ALTER TABLE public.users
   ADD CONSTRAINT users_role_check
   CHECK (role = ANY (ARRAY[
@@ -175,7 +161,6 @@ ALTER TABLE public.users
     'admin'::text,
     'super_admin'::text
   ]));
-
 -- =============================================================================
 -- SUMMARY OF NET EFFECT
 -- =============================================================================
@@ -186,4 +171,4 @@ ALTER TABLE public.users
 -- edit_log:       public read REMOVED. Admin read only. Insert still open.
 -- users:          anon read REMOVED. Authenticated read only.
 -- users role:     viewer role added to CHECK constraint.
--- =============================================================================
+-- =============================================================================;

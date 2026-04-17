@@ -8,11 +8,10 @@
 -- =============================================================================
 
 DROP POLICY IF EXISTS "Test authenticated insert" ON public.persons;
-
 -- Verify final state (informational comment):
 -- persons:        SELECT public | INSERT/UPDATE/DELETE admin+editor only ✓
 -- families:       SELECT public | INSERT/UPDATE/DELETE admin only ✓
 -- edit_log:       SELECT admin only | INSERT open ✓
 -- media:          SELECT public | INSERT/UPDATE/DELETE admin only ✓
 -- family_members: SELECT public | INSERT/UPDATE/DELETE admin only ✓
--- users:          SELECT authenticated | INSERT/UPDATE/DELETE super_admin ✓
+-- users:          SELECT authenticated | INSERT/UPDATE/DELETE super_admin ✓;

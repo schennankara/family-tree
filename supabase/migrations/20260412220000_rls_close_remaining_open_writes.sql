@@ -17,20 +17,17 @@
 DROP POLICY IF EXISTS "Allow insert persons" ON public.persons;
 DROP POLICY IF EXISTS "Allow update persons" ON public.persons;
 DROP POLICY IF EXISTS "Allow delete persons" ON public.persons;
-
 -- ─────────────────────────────────────────────────────────────────────────────
 -- FAMILIES: drop the 3 open policies
 -- ─────────────────────────────────────────────────────────────────────────────
 DROP POLICY IF EXISTS "Allow insert families" ON public.families;
 DROP POLICY IF EXISTS "Allow update families" ON public.families;
 DROP POLICY IF EXISTS "Allow delete families" ON public.families;
-
 -- ─────────────────────────────────────────────────────────────────────────────
 -- EDIT_LOG: restrict read to admins only
 -- ─────────────────────────────────────────────────────────────────────────────
 DROP POLICY IF EXISTS "Public read edit_log" ON public.edit_log;
 DROP POLICY IF EXISTS "Admin read edit_log" ON public.edit_log;
-
 CREATE POLICY "Admin read edit_log"
   ON public.edit_log FOR SELECT
   TO authenticated
@@ -39,7 +36,6 @@ CREATE POLICY "Admin read edit_log"
     WHERE users.id = auth.uid()
     AND users.role = ANY (ARRAY['admin'::text, 'super_admin'::text])
   ));
-
 -- =============================================================================
 -- RESULT after this migration:
 --   persons:        SELECT public | INSERT/UPDATE/DELETE admin+editor only ✓
@@ -48,4 +44,4 @@ CREATE POLICY "Admin read edit_log"
 --   media:          SELECT public | INSERT/UPDATE/DELETE admin only ✓
 --   family_members: SELECT public | INSERT/UPDATE/DELETE admin only ✓
 --   users:          SELECT authenticated | INSERT/UPDATE/DELETE super_admin ✓
--- =============================================================================
+-- =============================================================================;

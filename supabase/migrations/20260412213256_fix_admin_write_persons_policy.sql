@@ -1,9 +1,4 @@
--- Already applied to production on 2026-04-12
--- Placeholder to keep migration history in sync
--- Fixed Admin write persons policy WITH CHECK clause that was missing
-
 DROP POLICY IF EXISTS "Admin write persons" ON public.persons;
-
 CREATE POLICY "Admin write persons"
   ON public.persons FOR INSERT
   TO authenticated

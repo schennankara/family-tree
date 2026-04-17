@@ -1,17 +1,10 @@
 drop extension if exists "pg_net";
-
 create sequence "public"."access_requests_id_seq";
-
 create sequence "public"."edit_log_id_seq";
-
 create sequence "public"."family_members_id_seq";
-
 create sequence "public"."media_id_seq";
-
 create sequence "public"."update_requests_id_seq";
-
-
-  create table "public"."access_requests" (
+create table "public"."access_requests" (
     "id" bigint not null default nextval('public.access_requests_id_seq'::regclass),
     "name" text not null,
     "email" text not null,
@@ -24,12 +17,8 @@ create sequence "public"."update_requests_id_seq";
     "created_at" timestamp with time zone default now(),
     "resolved_at" timestamp with time zone
       );
-
-
 alter table "public"."access_requests" enable row level security;
-
-
-  create table "public"."edit_log" (
+create table "public"."edit_log" (
     "id" bigint not null default nextval('public.edit_log_id_seq'::regclass),
     "person_id" text,
     "family_id" text,
@@ -38,12 +27,8 @@ alter table "public"."access_requests" enable row level security;
     "edited_by" text default ''::text,
     "created_at" timestamp with time zone default now()
       );
-
-
 alter table "public"."edit_log" enable row level security;
-
-
-  create table "public"."families" (
+create table "public"."families" (
     "id" text not null,
     "husband_id" text,
     "wife_id" text,
@@ -53,12 +38,8 @@ alter table "public"."edit_log" enable row level security;
     "created_at" timestamp with time zone default now(),
     "updated_at" timestamp with time zone default now()
       );
-
-
 alter table "public"."families" enable row level security;
-
-
-  create table "public"."family_members" (
+create table "public"."family_members" (
     "id" bigint not null default nextval('public.family_members_id_seq'::regclass),
     "family_id" text not null,
     "person_id" text not null,
@@ -66,12 +47,8 @@ alter table "public"."families" enable row level security;
     "birth_order" integer default 0,
     "created_at" timestamp with time zone default now()
       );
-
-
 alter table "public"."family_members" enable row level security;
-
-
-  create table "public"."media" (
+create table "public"."media" (
     "id" bigint not null default nextval('public.media_id_seq'::regclass),
     "cloudinary_url" text not null,
     "cloudinary_id" text default ''::text,
@@ -84,12 +61,8 @@ alter table "public"."family_members" enable row level security;
     "event_date" text default ''::text,
     "created_at" timestamp with time zone default now()
       );
-
-
 alter table "public"."media" enable row level security;
-
-
-  create table "public"."persons" (
+create table "public"."persons" (
     "id" text not null,
     "first_name" text default ''::text,
     "middle_name" text default ''::text,
@@ -127,21 +100,13 @@ alter table "public"."media" enable row level security;
     "updated_at" timestamp with time zone default now(),
     "updated_by" text default ''::text
       );
-
-
 alter table "public"."persons" enable row level security;
-
-
-  create table "public"."settings" (
+create table "public"."settings" (
     "key" text not null,
     "value" text not null default ''::text
       );
-
-
 alter table "public"."settings" enable row level security;
-
-
-  create table "public"."update_requests" (
+create table "public"."update_requests" (
     "id" bigint not null default nextval('public.update_requests_id_seq'::regclass),
     "person_id" text,
     "person_name" text default ''::text,
@@ -155,12 +120,8 @@ alter table "public"."settings" enable row level security;
     "created_at" timestamp with time zone default now(),
     "resolved_at" timestamp with time zone
       );
-
-
 alter table "public"."update_requests" enable row level security;
-
-
-  create table "public"."users" (
+create table "public"."users" (
     "id" uuid not null,
     "person_id" text,
     "name" text not null default ''::text,
@@ -170,148 +131,76 @@ alter table "public"."update_requests" enable row level security;
     "created_at" timestamp with time zone default now(),
     "updated_at" timestamp with time zone default now()
       );
-
-
 alter table "public"."users" enable row level security;
-
 alter sequence "public"."access_requests_id_seq" owned by "public"."access_requests"."id";
-
 alter sequence "public"."edit_log_id_seq" owned by "public"."edit_log"."id";
-
 alter sequence "public"."family_members_id_seq" owned by "public"."family_members"."id";
-
 alter sequence "public"."media_id_seq" owned by "public"."media"."id";
-
 alter sequence "public"."update_requests_id_seq" owned by "public"."update_requests"."id";
-
 CREATE UNIQUE INDEX access_requests_pkey ON public.access_requests USING btree (id);
-
 CREATE UNIQUE INDEX edit_log_pkey ON public.edit_log USING btree (id);
-
 CREATE UNIQUE INDEX families_pkey ON public.families USING btree (id);
-
 CREATE UNIQUE INDEX family_members_family_id_person_id_key ON public.family_members USING btree (family_id, person_id);
-
 CREATE UNIQUE INDEX family_members_pkey ON public.family_members USING btree (id);
-
 CREATE INDEX idx_access_requests_status ON public.access_requests USING btree (status);
-
 CREATE INDEX idx_edit_log_created ON public.edit_log USING btree (created_at);
-
 CREATE INDEX idx_edit_log_person ON public.edit_log USING btree (person_id);
-
 CREATE INDEX idx_families_husband ON public.families USING btree (husband_id);
-
 CREATE INDEX idx_families_wife ON public.families USING btree (wife_id);
-
 CREATE UNIQUE INDEX idx_family_one_husband ON public.family_members USING btree (family_id) WHERE (role = 'husband'::text);
-
 CREATE UNIQUE INDEX idx_family_one_wife ON public.family_members USING btree (family_id) WHERE (role = 'wife'::text);
-
 CREATE INDEX idx_fm_family ON public.family_members USING btree (family_id);
-
 CREATE INDEX idx_fm_family_role ON public.family_members USING btree (family_id, role);
-
 CREATE INDEX idx_fm_person ON public.family_members USING btree (person_id);
-
 CREATE INDEX idx_persons_first_name_lower ON public.persons USING btree (lower(first_name));
-
 CREATE INDEX idx_persons_last_name ON public.persons USING btree (last_name);
-
 CREATE INDEX idx_update_requests_status ON public.update_requests USING btree (status);
-
 CREATE INDEX idx_users_person ON public.users USING btree (person_id);
-
 CREATE INDEX idx_users_role ON public.users USING btree (role);
-
 CREATE UNIQUE INDEX media_pkey ON public.media USING btree (id);
-
 CREATE UNIQUE INDEX persons_pkey ON public.persons USING btree (id);
-
 CREATE UNIQUE INDEX settings_pkey ON public.settings USING btree (key);
-
 CREATE UNIQUE INDEX update_requests_pkey ON public.update_requests USING btree (id);
-
 CREATE UNIQUE INDEX users_pkey ON public.users USING btree (id);
-
 alter table "public"."access_requests" add constraint "access_requests_pkey" PRIMARY KEY using index "access_requests_pkey";
-
 alter table "public"."edit_log" add constraint "edit_log_pkey" PRIMARY KEY using index "edit_log_pkey";
-
 alter table "public"."families" add constraint "families_pkey" PRIMARY KEY using index "families_pkey";
-
 alter table "public"."family_members" add constraint "family_members_pkey" PRIMARY KEY using index "family_members_pkey";
-
 alter table "public"."media" add constraint "media_pkey" PRIMARY KEY using index "media_pkey";
-
 alter table "public"."persons" add constraint "persons_pkey" PRIMARY KEY using index "persons_pkey";
-
 alter table "public"."settings" add constraint "settings_pkey" PRIMARY KEY using index "settings_pkey";
-
 alter table "public"."update_requests" add constraint "update_requests_pkey" PRIMARY KEY using index "update_requests_pkey";
-
 alter table "public"."users" add constraint "users_pkey" PRIMARY KEY using index "users_pkey";
-
 alter table "public"."access_requests" add constraint "access_requests_person_id_fkey" FOREIGN KEY (person_id) REFERENCES public.persons(id) not valid;
-
 alter table "public"."access_requests" validate constraint "access_requests_person_id_fkey";
-
 alter table "public"."access_requests" add constraint "access_requests_resolved_by_fkey" FOREIGN KEY (resolved_by) REFERENCES auth.users(id) not valid;
-
 alter table "public"."access_requests" validate constraint "access_requests_resolved_by_fkey";
-
 alter table "public"."access_requests" add constraint "access_requests_status_check" CHECK ((status = ANY (ARRAY['pending'::text, 'approved'::text, 'rejected'::text]))) not valid;
-
 alter table "public"."access_requests" validate constraint "access_requests_status_check";
-
 alter table "public"."families" add constraint "families_husband_id_fkey" FOREIGN KEY (husband_id) REFERENCES public.persons(id) ON DELETE SET NULL not valid;
-
 alter table "public"."families" validate constraint "families_husband_id_fkey";
-
 alter table "public"."families" add constraint "families_wife_id_fkey" FOREIGN KEY (wife_id) REFERENCES public.persons(id) ON DELETE SET NULL not valid;
-
 alter table "public"."families" validate constraint "families_wife_id_fkey";
-
 alter table "public"."family_members" add constraint "family_members_family_id_fkey" FOREIGN KEY (family_id) REFERENCES public.families(id) ON DELETE CASCADE not valid;
-
 alter table "public"."family_members" validate constraint "family_members_family_id_fkey";
-
 alter table "public"."family_members" add constraint "family_members_family_id_person_id_key" UNIQUE using index "family_members_family_id_person_id_key";
-
 alter table "public"."family_members" add constraint "family_members_person_id_fkey" FOREIGN KEY (person_id) REFERENCES public.persons(id) ON DELETE CASCADE not valid;
-
 alter table "public"."family_members" validate constraint "family_members_person_id_fkey";
-
 alter table "public"."family_members" add constraint "family_members_role_check" CHECK ((role = ANY (ARRAY['husband'::text, 'wife'::text, 'child'::text]))) not valid;
-
 alter table "public"."family_members" validate constraint "family_members_role_check";
-
 alter table "public"."update_requests" add constraint "update_requests_person_id_fkey" FOREIGN KEY (person_id) REFERENCES public.persons(id) not valid;
-
 alter table "public"."update_requests" validate constraint "update_requests_person_id_fkey";
-
 alter table "public"."update_requests" add constraint "update_requests_resolved_by_fkey" FOREIGN KEY (resolved_by) REFERENCES auth.users(id) not valid;
-
 alter table "public"."update_requests" validate constraint "update_requests_resolved_by_fkey";
-
 alter table "public"."update_requests" add constraint "update_requests_status_check" CHECK ((status = ANY (ARRAY['pending'::text, 'approved'::text, 'rejected'::text, 'clarification'::text]))) not valid;
-
 alter table "public"."update_requests" validate constraint "update_requests_status_check";
-
 alter table "public"."users" add constraint "users_id_fkey" FOREIGN KEY (id) REFERENCES auth.users(id) ON DELETE CASCADE not valid;
-
 alter table "public"."users" validate constraint "users_id_fkey";
-
 alter table "public"."users" add constraint "users_person_id_fkey" FOREIGN KEY (person_id) REFERENCES public.persons(id) ON DELETE SET NULL not valid;
-
 alter table "public"."users" validate constraint "users_person_id_fkey";
-
 alter table "public"."users" add constraint "users_role_check" CHECK ((role = ANY (ARRAY['editor'::text, 'admin'::text, 'super_admin'::text]))) not valid;
-
 alter table "public"."users" validate constraint "users_role_check";
-
 set check_function_bodies = off;
-
 CREATE OR REPLACE FUNCTION public.create_family_user(p_email text, p_name text, p_person_id text DEFAULT NULL::text, p_role text DEFAULT 'editor'::text)
  RETURNS json
  LANGUAGE plpgsql
@@ -368,9 +257,7 @@ BEGIN
     'role', p_role
   );
 END;
-$function$
-;
-
+$function$;
 CREATE OR REPLACE FUNCTION public.is_in_edit_scope(editor_person_id text, target_person_id text)
  RETURNS boolean
  LANGUAGE plpgsql
@@ -408,9 +295,7 @@ BEGIN
   
   RETURN COALESCE(desc_check, FALSE);
 END;
-$function$
-;
-
+$function$;
 CREATE OR REPLACE FUNCTION public.revert_to_snapshot(p_log_id bigint)
  RETURNS boolean
  LANGUAGE plpgsql
@@ -486,9 +371,7 @@ BEGIN
   
   RETURN TRUE;
 END;
-$function$
-;
-
+$function$;
 CREATE OR REPLACE FUNCTION public.snapshot_person(p_person_id text, p_reason text DEFAULT 'before_approve'::text)
  RETURNS bigint
  LANGUAGE plpgsql
@@ -519,9 +402,7 @@ BEGIN
   
   RETURN log_id;
 END;
-$function$
-;
-
+$function$;
 CREATE OR REPLACE FUNCTION public.update_updated_at()
  RETURNS trigger
  LANGUAGE plpgsql
@@ -530,389 +411,197 @@ BEGIN
   NEW.updated_at = NOW();
   RETURN NEW;
 END;
-$function$
-;
-
+$function$;
 grant delete on table "public"."access_requests" to "anon";
-
 grant insert on table "public"."access_requests" to "anon";
-
 grant references on table "public"."access_requests" to "anon";
-
 grant select on table "public"."access_requests" to "anon";
-
 grant trigger on table "public"."access_requests" to "anon";
-
 grant truncate on table "public"."access_requests" to "anon";
-
 grant update on table "public"."access_requests" to "anon";
-
 grant delete on table "public"."access_requests" to "authenticated";
-
 grant insert on table "public"."access_requests" to "authenticated";
-
 grant references on table "public"."access_requests" to "authenticated";
-
 grant select on table "public"."access_requests" to "authenticated";
-
 grant trigger on table "public"."access_requests" to "authenticated";
-
 grant truncate on table "public"."access_requests" to "authenticated";
-
 grant update on table "public"."access_requests" to "authenticated";
-
 grant delete on table "public"."access_requests" to "service_role";
-
 grant insert on table "public"."access_requests" to "service_role";
-
 grant references on table "public"."access_requests" to "service_role";
-
 grant select on table "public"."access_requests" to "service_role";
-
 grant trigger on table "public"."access_requests" to "service_role";
-
 grant truncate on table "public"."access_requests" to "service_role";
-
 grant update on table "public"."access_requests" to "service_role";
-
 grant delete on table "public"."edit_log" to "anon";
-
 grant insert on table "public"."edit_log" to "anon";
-
 grant references on table "public"."edit_log" to "anon";
-
 grant select on table "public"."edit_log" to "anon";
-
 grant trigger on table "public"."edit_log" to "anon";
-
 grant truncate on table "public"."edit_log" to "anon";
-
 grant update on table "public"."edit_log" to "anon";
-
 grant delete on table "public"."edit_log" to "authenticated";
-
 grant insert on table "public"."edit_log" to "authenticated";
-
 grant references on table "public"."edit_log" to "authenticated";
-
 grant select on table "public"."edit_log" to "authenticated";
-
 grant trigger on table "public"."edit_log" to "authenticated";
-
 grant truncate on table "public"."edit_log" to "authenticated";
-
 grant update on table "public"."edit_log" to "authenticated";
-
 grant delete on table "public"."edit_log" to "service_role";
-
 grant insert on table "public"."edit_log" to "service_role";
-
 grant references on table "public"."edit_log" to "service_role";
-
 grant select on table "public"."edit_log" to "service_role";
-
 grant trigger on table "public"."edit_log" to "service_role";
-
 grant truncate on table "public"."edit_log" to "service_role";
-
 grant update on table "public"."edit_log" to "service_role";
-
 grant delete on table "public"."families" to "anon";
-
 grant insert on table "public"."families" to "anon";
-
 grant references on table "public"."families" to "anon";
-
 grant select on table "public"."families" to "anon";
-
 grant trigger on table "public"."families" to "anon";
-
 grant truncate on table "public"."families" to "anon";
-
 grant update on table "public"."families" to "anon";
-
 grant delete on table "public"."families" to "authenticated";
-
 grant insert on table "public"."families" to "authenticated";
-
 grant references on table "public"."families" to "authenticated";
-
 grant select on table "public"."families" to "authenticated";
-
 grant trigger on table "public"."families" to "authenticated";
-
 grant truncate on table "public"."families" to "authenticated";
-
 grant update on table "public"."families" to "authenticated";
-
 grant delete on table "public"."families" to "service_role";
-
 grant insert on table "public"."families" to "service_role";
-
 grant references on table "public"."families" to "service_role";
-
 grant select on table "public"."families" to "service_role";
-
 grant trigger on table "public"."families" to "service_role";
-
 grant truncate on table "public"."families" to "service_role";
-
 grant update on table "public"."families" to "service_role";
-
 grant delete on table "public"."family_members" to "anon";
-
 grant insert on table "public"."family_members" to "anon";
-
 grant references on table "public"."family_members" to "anon";
-
 grant select on table "public"."family_members" to "anon";
-
 grant trigger on table "public"."family_members" to "anon";
-
 grant truncate on table "public"."family_members" to "anon";
-
 grant update on table "public"."family_members" to "anon";
-
 grant delete on table "public"."family_members" to "authenticated";
-
 grant insert on table "public"."family_members" to "authenticated";
-
 grant references on table "public"."family_members" to "authenticated";
-
 grant select on table "public"."family_members" to "authenticated";
-
 grant trigger on table "public"."family_members" to "authenticated";
-
 grant truncate on table "public"."family_members" to "authenticated";
-
 grant update on table "public"."family_members" to "authenticated";
-
 grant delete on table "public"."family_members" to "service_role";
-
 grant insert on table "public"."family_members" to "service_role";
-
 grant references on table "public"."family_members" to "service_role";
-
 grant select on table "public"."family_members" to "service_role";
-
 grant trigger on table "public"."family_members" to "service_role";
-
 grant truncate on table "public"."family_members" to "service_role";
-
 grant update on table "public"."family_members" to "service_role";
-
 grant delete on table "public"."media" to "anon";
-
 grant insert on table "public"."media" to "anon";
-
 grant references on table "public"."media" to "anon";
-
 grant select on table "public"."media" to "anon";
-
 grant trigger on table "public"."media" to "anon";
-
 grant truncate on table "public"."media" to "anon";
-
 grant update on table "public"."media" to "anon";
-
 grant delete on table "public"."media" to "authenticated";
-
 grant insert on table "public"."media" to "authenticated";
-
 grant references on table "public"."media" to "authenticated";
-
 grant select on table "public"."media" to "authenticated";
-
 grant trigger on table "public"."media" to "authenticated";
-
 grant truncate on table "public"."media" to "authenticated";
-
 grant update on table "public"."media" to "authenticated";
-
 grant delete on table "public"."media" to "service_role";
-
 grant insert on table "public"."media" to "service_role";
-
 grant references on table "public"."media" to "service_role";
-
 grant select on table "public"."media" to "service_role";
-
 grant trigger on table "public"."media" to "service_role";
-
 grant truncate on table "public"."media" to "service_role";
-
 grant update on table "public"."media" to "service_role";
-
 grant delete on table "public"."persons" to "anon";
-
 grant insert on table "public"."persons" to "anon";
-
 grant references on table "public"."persons" to "anon";
-
 grant select on table "public"."persons" to "anon";
-
 grant trigger on table "public"."persons" to "anon";
-
 grant truncate on table "public"."persons" to "anon";
-
 grant update on table "public"."persons" to "anon";
-
 grant delete on table "public"."persons" to "authenticated";
-
 grant insert on table "public"."persons" to "authenticated";
-
 grant references on table "public"."persons" to "authenticated";
-
 grant select on table "public"."persons" to "authenticated";
-
 grant trigger on table "public"."persons" to "authenticated";
-
 grant truncate on table "public"."persons" to "authenticated";
-
 grant update on table "public"."persons" to "authenticated";
-
 grant delete on table "public"."persons" to "service_role";
-
 grant insert on table "public"."persons" to "service_role";
-
 grant references on table "public"."persons" to "service_role";
-
 grant select on table "public"."persons" to "service_role";
-
 grant trigger on table "public"."persons" to "service_role";
-
 grant truncate on table "public"."persons" to "service_role";
-
 grant update on table "public"."persons" to "service_role";
-
 grant delete on table "public"."settings" to "anon";
-
 grant insert on table "public"."settings" to "anon";
-
 grant references on table "public"."settings" to "anon";
-
 grant select on table "public"."settings" to "anon";
-
 grant trigger on table "public"."settings" to "anon";
-
 grant truncate on table "public"."settings" to "anon";
-
 grant update on table "public"."settings" to "anon";
-
 grant delete on table "public"."settings" to "authenticated";
-
 grant insert on table "public"."settings" to "authenticated";
-
 grant references on table "public"."settings" to "authenticated";
-
 grant select on table "public"."settings" to "authenticated";
-
 grant trigger on table "public"."settings" to "authenticated";
-
 grant truncate on table "public"."settings" to "authenticated";
-
 grant update on table "public"."settings" to "authenticated";
-
 grant delete on table "public"."settings" to "service_role";
-
 grant insert on table "public"."settings" to "service_role";
-
 grant references on table "public"."settings" to "service_role";
-
 grant select on table "public"."settings" to "service_role";
-
 grant trigger on table "public"."settings" to "service_role";
-
 grant truncate on table "public"."settings" to "service_role";
-
 grant update on table "public"."settings" to "service_role";
-
 grant delete on table "public"."update_requests" to "anon";
-
 grant insert on table "public"."update_requests" to "anon";
-
 grant references on table "public"."update_requests" to "anon";
-
 grant select on table "public"."update_requests" to "anon";
-
 grant trigger on table "public"."update_requests" to "anon";
-
 grant truncate on table "public"."update_requests" to "anon";
-
 grant update on table "public"."update_requests" to "anon";
-
 grant delete on table "public"."update_requests" to "authenticated";
-
 grant insert on table "public"."update_requests" to "authenticated";
-
 grant references on table "public"."update_requests" to "authenticated";
-
 grant select on table "public"."update_requests" to "authenticated";
-
 grant trigger on table "public"."update_requests" to "authenticated";
-
 grant truncate on table "public"."update_requests" to "authenticated";
-
 grant update on table "public"."update_requests" to "authenticated";
-
 grant delete on table "public"."update_requests" to "service_role";
-
 grant insert on table "public"."update_requests" to "service_role";
-
 grant references on table "public"."update_requests" to "service_role";
-
 grant select on table "public"."update_requests" to "service_role";
-
 grant trigger on table "public"."update_requests" to "service_role";
-
 grant truncate on table "public"."update_requests" to "service_role";
-
 grant update on table "public"."update_requests" to "service_role";
-
 grant delete on table "public"."users" to "anon";
-
 grant insert on table "public"."users" to "anon";
-
 grant references on table "public"."users" to "anon";
-
 grant select on table "public"."users" to "anon";
-
 grant trigger on table "public"."users" to "anon";
-
 grant truncate on table "public"."users" to "anon";
-
 grant update on table "public"."users" to "anon";
-
 grant delete on table "public"."users" to "authenticated";
-
 grant insert on table "public"."users" to "authenticated";
-
 grant references on table "public"."users" to "authenticated";
-
 grant select on table "public"."users" to "authenticated";
-
 grant trigger on table "public"."users" to "authenticated";
-
 grant truncate on table "public"."users" to "authenticated";
-
 grant update on table "public"."users" to "authenticated";
-
 grant delete on table "public"."users" to "service_role";
-
 grant insert on table "public"."users" to "service_role";
-
 grant references on table "public"."users" to "service_role";
-
 grant select on table "public"."users" to "service_role";
-
 grant trigger on table "public"."users" to "service_role";
-
 grant truncate on table "public"."users" to "service_role";
-
 grant update on table "public"."users" to "service_role";
-
-
-  create policy "Admin resolve access requests"
+create policy "Admin resolve access requests"
   on "public"."access_requests"
   as permissive
   for update
@@ -920,46 +609,31 @@ grant update on table "public"."users" to "service_role";
 using ((EXISTS ( SELECT 1
    FROM public.users
   WHERE ((users.id = auth.uid()) AND (users.role = ANY (ARRAY['admin'::text, 'super_admin'::text]))))));
-
-
-
-  create policy "Anyone can request access"
+create policy "Anyone can request access"
   on "public"."access_requests"
   as permissive
   for insert
   to public
 with check (true);
-
-
-
-  create policy "Read access requests"
+create policy "Read access requests"
   on "public"."access_requests"
   as permissive
   for select
   to public
 using (true);
-
-
-
-  create policy "Allow insert edit_log"
+create policy "Allow insert edit_log"
   on "public"."edit_log"
   as permissive
   for insert
   to public
 with check (true);
-
-
-
-  create policy "Public read edit_log"
+create policy "Public read edit_log"
   on "public"."edit_log"
   as permissive
   for select
   to public
 using (true);
-
-
-
-  create policy "Admin delete families"
+create policy "Admin delete families"
   on "public"."families"
   as permissive
   for delete
@@ -967,10 +641,7 @@ using (true);
 using ((EXISTS ( SELECT 1
    FROM public.users
   WHERE ((users.id = auth.uid()) AND (users.role = ANY (ARRAY['admin'::text, 'super_admin'::text]))))));
-
-
-
-  create policy "Admin update families"
+create policy "Admin update families"
   on "public"."families"
   as permissive
   for update
@@ -978,10 +649,7 @@ using ((EXISTS ( SELECT 1
 using ((EXISTS ( SELECT 1
    FROM public.users
   WHERE ((users.id = auth.uid()) AND (users.role = ANY (ARRAY['admin'::text, 'super_admin'::text]))))));
-
-
-
-  create policy "Admin write families"
+create policy "Admin write families"
   on "public"."families"
   as permissive
   for insert
@@ -989,145 +657,97 @@ using ((EXISTS ( SELECT 1
 with check ((EXISTS ( SELECT 1
    FROM public.users
   WHERE ((users.id = auth.uid()) AND (users.role = ANY (ARRAY['admin'::text, 'super_admin'::text]))))));
-
-
-
-  create policy "Allow delete families"
+create policy "Allow delete families"
   on "public"."families"
   as permissive
   for delete
   to anon, authenticated
 using (true);
-
-
-
-  create policy "Allow insert families"
+create policy "Allow insert families"
   on "public"."families"
   as permissive
   for insert
   to anon, authenticated
 with check (true);
-
-
-
-  create policy "Allow update families"
+create policy "Allow update families"
   on "public"."families"
   as permissive
   for update
   to anon, authenticated
 using (true);
-
-
-
-  create policy "Public read families"
+create policy "Public read families"
   on "public"."families"
   as permissive
   for select
   to public
 using (true);
-
-
-
-  create policy "Anon delete family_members"
+create policy "Anon delete family_members"
   on "public"."family_members"
   as permissive
   for delete
   to anon
 using (true);
-
-
-
-  create policy "Anon update family_members"
+create policy "Anon update family_members"
   on "public"."family_members"
   as permissive
   for update
   to anon
 using (true);
-
-
-
-  create policy "Anon write family_members"
+create policy "Anon write family_members"
   on "public"."family_members"
   as permissive
   for insert
   to anon
 with check (true);
-
-
-
-  create policy "Auth delete family_members"
+create policy "Auth delete family_members"
   on "public"."family_members"
   as permissive
   for delete
   to authenticated
 using (true);
-
-
-
-  create policy "Auth update family_members"
+create policy "Auth update family_members"
   on "public"."family_members"
   as permissive
   for update
   to authenticated
 using (true);
-
-
-
-  create policy "Auth write family_members"
+create policy "Auth write family_members"
   on "public"."family_members"
   as permissive
   for insert
   to authenticated
 with check (true);
-
-
-
-  create policy "Public read family_members"
+create policy "Public read family_members"
   on "public"."family_members"
   as permissive
   for select
   to public
 using (true);
-
-
-
-  create policy "Allow delete media"
+create policy "Allow delete media"
   on "public"."media"
   as permissive
   for delete
   to anon, authenticated
 using (true);
-
-
-
-  create policy "Allow insert media"
+create policy "Allow insert media"
   on "public"."media"
   as permissive
   for insert
   to anon, authenticated
 with check (true);
-
-
-
-  create policy "Allow update media"
+create policy "Allow update media"
   on "public"."media"
   as permissive
   for update
   to anon, authenticated
 using (true);
-
-
-
-  create policy "Public read media"
+create policy "Public read media"
   on "public"."media"
   as permissive
   for select
   to public
 using (true);
-
-
-
-  create policy "Admin delete persons"
+create policy "Admin delete persons"
   on "public"."persons"
   as permissive
   for delete
@@ -1135,10 +755,7 @@ using (true);
 using ((EXISTS ( SELECT 1
    FROM public.users
   WHERE ((users.id = auth.uid()) AND (users.role = ANY (ARRAY['admin'::text, 'super_admin'::text]))))));
-
-
-
-  create policy "Admin update persons"
+create policy "Admin update persons"
   on "public"."persons"
   as permissive
   for update
@@ -1146,10 +763,7 @@ using ((EXISTS ( SELECT 1
 using ((EXISTS ( SELECT 1
    FROM public.users
   WHERE ((users.id = auth.uid()) AND (users.role = ANY (ARRAY['admin'::text, 'super_admin'::text]))))));
-
-
-
-  create policy "Admin write persons"
+create policy "Admin write persons"
   on "public"."persons"
   as permissive
   for insert
@@ -1157,37 +771,25 @@ using ((EXISTS ( SELECT 1
 with check ((EXISTS ( SELECT 1
    FROM public.users
   WHERE ((users.id = auth.uid()) AND (users.role = ANY (ARRAY['admin'::text, 'super_admin'::text]))))));
-
-
-
-  create policy "Allow delete persons"
+create policy "Allow delete persons"
   on "public"."persons"
   as permissive
   for delete
   to anon, authenticated
 using (true);
-
-
-
-  create policy "Allow insert persons"
+create policy "Allow insert persons"
   on "public"."persons"
   as permissive
   for insert
   to anon, authenticated
 with check (true);
-
-
-
-  create policy "Allow update persons"
+create policy "Allow update persons"
   on "public"."persons"
   as permissive
   for update
   to anon, authenticated
 using (true);
-
-
-
-  create policy "Editor update persons"
+create policy "Editor update persons"
   on "public"."persons"
   as permissive
   for update
@@ -1195,28 +797,19 @@ using (true);
 using ((EXISTS ( SELECT 1
    FROM public.users u
   WHERE ((u.id = auth.uid()) AND (u.role = 'editor'::text) AND public.is_in_edit_scope(u.person_id, persons.id)))));
-
-
-
-  create policy "Public read persons"
+create policy "Public read persons"
   on "public"."persons"
   as permissive
   for select
   to public
 using (true);
-
-
-
-  create policy "Public read settings"
+create policy "Public read settings"
   on "public"."settings"
   as permissive
   for select
   to public
 using (true);
-
-
-
-  create policy "Super admin modify settings"
+create policy "Super admin modify settings"
   on "public"."settings"
   as permissive
   for all
@@ -1224,10 +817,7 @@ using (true);
 using ((EXISTS ( SELECT 1
    FROM public.users
   WHERE ((users.id = auth.uid()) AND (users.role = 'super_admin'::text)))));
-
-
-
-  create policy "Admin resolve update requests"
+create policy "Admin resolve update requests"
   on "public"."update_requests"
   as permissive
   for update
@@ -1235,46 +825,31 @@ using ((EXISTS ( SELECT 1
 using ((EXISTS ( SELECT 1
    FROM public.users
   WHERE ((users.id = auth.uid()) AND (users.role = ANY (ARRAY['admin'::text, 'super_admin'::text]))))));
-
-
-
-  create policy "Anyone can submit updates"
+create policy "Anyone can submit updates"
   on "public"."update_requests"
   as permissive
   for insert
   to public
 with check (true);
-
-
-
-  create policy "Read update requests"
+create policy "Read update requests"
   on "public"."update_requests"
   as permissive
   for select
   to public
 using (true);
-
-
-
-  create policy "Anon read users"
+create policy "Anon read users"
   on "public"."users"
   as permissive
   for select
   to anon
 using (true);
-
-
-
-  create policy "Authenticated read users"
+create policy "Authenticated read users"
   on "public"."users"
   as permissive
   for select
   to authenticated
 using (true);
-
-
-
-  create policy "Super admin delete users"
+create policy "Super admin delete users"
   on "public"."users"
   as permissive
   for delete
@@ -1282,10 +857,7 @@ using (true);
 using ((EXISTS ( SELECT 1
    FROM public.users users_1
   WHERE ((users_1.id = auth.uid()) AND (users_1.role = 'super_admin'::text)))));
-
-
-
-  create policy "Super admin manage users"
+create policy "Super admin manage users"
   on "public"."users"
   as permissive
   for insert
@@ -1293,10 +865,7 @@ using ((EXISTS ( SELECT 1
 with check ((EXISTS ( SELECT 1
    FROM public.users users_1
   WHERE ((users_1.id = auth.uid()) AND (users_1.role = 'super_admin'::text)))));
-
-
-
-  create policy "Super admin update users"
+create policy "Super admin update users"
   on "public"."users"
   as permissive
   for update
@@ -1304,10 +873,5 @@ with check ((EXISTS ( SELECT 1
 using ((EXISTS ( SELECT 1
    FROM public.users users_1
   WHERE ((users_1.id = auth.uid()) AND (users_1.role = ANY (ARRAY['super_admin'::text, 'admin'::text]))))));
-
-
 CREATE TRIGGER families_updated_at BEFORE UPDATE ON public.families FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
-
 CREATE TRIGGER persons_updated_at BEFORE UPDATE ON public.persons FOR EACH ROW EXECUTE FUNCTION public.update_updated_at();
-
-

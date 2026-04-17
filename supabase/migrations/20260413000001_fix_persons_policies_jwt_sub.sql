@@ -16,7 +16,6 @@ CREATE POLICY "Admin update persons"
     WHERE users.id = (auth.jwt()->>'sub')::uuid
     AND users.role = ANY (ARRAY['admin'::text, 'super_admin'::text])
   ));
-
 -- Admin delete persons
 DROP POLICY IF EXISTS "Admin delete persons" ON public.persons;
 CREATE POLICY "Admin delete persons"
@@ -27,7 +26,6 @@ CREATE POLICY "Admin delete persons"
     WHERE users.id = (auth.jwt()->>'sub')::uuid
     AND users.role = ANY (ARRAY['admin'::text, 'super_admin'::text])
   ));
-
 -- Editor update persons
 DROP POLICY IF EXISTS "Editor update persons" ON public.persons;
 CREATE POLICY "Editor update persons"
