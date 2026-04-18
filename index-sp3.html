@@ -1173,24 +1173,133 @@ function diffPerson(ftls, ext) {
   return diffs;
 }
 
+function normalizeNameText(value) {
+  return (value || '')
+    .toLowerCase()
+    .replace(/\([^)]*\)/g, ' ')
+    .replace(/\bhouse\b/g, ' ')
+    .replace(/[^a-z\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function normalizeNameToken(token) {
+  return (token || '')
+    .toLowerCase()
+    .replace(/[^a-z]/g, '')
+    .replace(/ny$/g, 'ni')
+    .trim();
+}
+
+const LOW_SIGNAL_NAME_TOKENS = new Set([
+  'ammachi', 'appachan', 'achan', 'amma', 'appa', 'house'
+]);
+
+function isOneEditAway(a, b) {
+  if (!a || !b) return false;
+  if (Math.abs(a.length - b.length) > 1) return false;
+  if (a === b) return true;
+
+  let i = 0, j = 0, edits = 0;
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) {
+      i++;
+      j++;
+      continue;
+    }
+    edits++;
+    if (edits > 1) return false;
+    if (a.length > b.length) i++;
+    else if (b.length > a.length) j++;
+    else {
+      i++;
+      j++;
+    }
+  }
+  if (i < a.length || j < b.length) edits++;
+  return edits <= 1;
+}
+
+function nameTokensEquivalent(a, b) {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  if (a.length >= 4 && b.length >= 4 && (a.startsWith(b) || b.startsWith(a)) && Math.abs(a.length - b.length) <= 2) {
+    return true;
+  }
+  return isOneEditAway(a, b);
+}
+
+function getNameSignals(person) {
+  const raw = [person?.dn, person?.fn, person?.mn, person?.ln, person?.nk, person?.md]
+    .filter(Boolean)
+    .map(normalizeNameText)
+    .filter(Boolean);
+  const tokens = [...new Set(raw.flatMap(v => v.split(' ').map(normalizeNameToken).filter(Boolean)))];
+  const coreTokens = tokens.filter(t => !LOW_SIGNAL_NAME_TOKENS.has(t));
+  return {
+    allKey: tokens.join(''),
+    coreKey: coreTokens.join(''),
+    tokens,
+    coreTokens,
+    fn: normalizeNameToken(person?.fn || ''),
+    ln: normalizeNameToken(person?.ln || '')
+  };
+}
+
+function countEquivalentTokens(aTokens, bTokens) {
+  if (!aTokens.length || !bTokens.length) return 0;
+  const used = new Set();
+  let count = 0;
+  for (const a of aTokens) {
+    const idx = bTokens.findIndex((b, i) => !used.has(i) && nameTokensEquivalent(a, b));
+    if (idx >= 0) {
+      used.add(idx);
+      count++;
+    }
+  }
+  return count;
+}
+
+function namesEquivalent(aPerson, bPerson) {
+  const a = getNameSignals(aPerson);
+  const b = getNameSignals(bPerson);
+  if (a.allKey && b.allKey && nameTokensEquivalent(a.allKey, b.allKey)) return true;
+  if (a.coreKey && b.coreKey && nameTokensEquivalent(a.coreKey, b.coreKey)) return true;
+  const sharedCore = countEquivalentTokens(a.coreTokens, b.coreTokens);
+  if (sharedCore >= 2) return true;
+  if (sharedCore === 1 && a.coreTokens.length === 1 && b.coreTokens.length === 1) return true;
+  return false;
+}
+
 // Fuzzy match: try name+gender+DOB when IDs don't match
 function fuzzyMatchPerson(person, candidates) {
-  const name = (person.dn||'').toLowerCase().replace(/[^a-z]/g,'');
-  const fn = (person.fn||'').toLowerCase();
-  const ln = (person.ln||'').toLowerCase();
-  if (!name && !fn) return null;
+  const sig = getNameSignals(person);
+  if (!sig.allKey && !sig.fn) return null;
   
   let bestMatch = null, bestScore = 0;
   for (const c of candidates) {
     let score = 0;
-    const cName = (c.dn||'').toLowerCase().replace(/[^a-z]/g,'');
-    const cFn = (c.fn||'').toLowerCase();
-    const cLn = (c.ln||'').toLowerCase();
+    const cSig = getNameSignals(c);
     
-    if (name && cName && name === cName) score += 50;
-    else {
-      if (fn && cFn && fn === cFn) score += 25;
-      if (ln && cLn && ln === cLn) score += 15;
+    if (sig.allKey && cSig.allKey) {
+      if (sig.allKey === cSig.allKey) score += 50;
+      else if (nameTokensEquivalent(sig.allKey, cSig.allKey)) score += 38;
+    }
+    if (sig.coreKey && cSig.coreKey) {
+      if (sig.coreKey === cSig.coreKey) score += 35;
+      else if (nameTokensEquivalent(sig.coreKey, cSig.coreKey)) score += 26;
+    }
+
+    const sharedCore = countEquivalentTokens(sig.coreTokens, cSig.coreTokens);
+    if (sharedCore > 0) score += Math.min(24, sharedCore * 12);
+
+    if (sig.fn && cSig.fn) {
+      if (sig.fn === cSig.fn) score += 25;
+      else if (nameTokensEquivalent(sig.fn, cSig.fn)) score += 18;
+    }
+    if (sig.ln && cSig.ln) {
+      if (sig.ln === cSig.ln) score += 15;
+      else if (nameTokensEquivalent(sig.ln, cSig.ln)) score += 10;
     }
     if (person.g && c.g && person.g === c.g) score += 5;
     if (person.dob && c.dob && person.dob === c.dob) score += 20;
@@ -1208,11 +1317,8 @@ function fuzzyMatchPerson(person, candidates) {
 // newly-created child IDs that only match by fuzzy person identity.
 function fuzzyMatchFamily(extFam, ftlsFamilies, extPeople, ftlsPersonMap, personFuzzyMap) {
   const normName = (person) => {
-    const dn = (person?.dn || '').toLowerCase().replace(/[^a-z]/g, '');
-    if (dn) return dn;
-    const fn = (person?.fn || '').toLowerCase().replace(/[^a-z]/g, '');
-    const ln = (person?.ln || '').toLowerCase().replace(/[^a-z]/g, '');
-    return (fn + ln).replace(/[^a-z]/g, '');
+    const sig = getNameSignals(person);
+    return sig.coreKey || sig.allKey;
   };
 
   // personFuzzyMap: { extPersonId: ftlsPersonId } from person fuzzy matches.
@@ -1233,7 +1339,7 @@ function fuzzyMatchFamily(extFam, ftlsFamilies, extPeople, ftlsPersonMap, person
     if (!extP || !ftlsP) return false;
     const eName = normName(extP);
     const fName = normName(ftlsP);
-    if (!eName || !fName || eName !== fName) return false;
+    if (!eName || !fName || !namesEquivalent(extP, ftlsP)) return false;
     if (extP.g && ftlsP.g && extP.g !== ftlsP.g) return false;
     if (extP.dob && ftlsP.dob && extP.dob !== ftlsP.dob) return false;
     return true;
@@ -1349,11 +1455,8 @@ function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap)
   };
 
   const normPersonName = (person) => {
-    const dn = (person?.dn || '').toLowerCase().replace(/[^a-z]/g,'');
-    if (dn) return dn;
-    const fn = (person?.fn || '').toLowerCase().replace(/[^a-z]/g,'');
-    const ln = (person?.ln || '').toLowerCase().replace(/[^a-z]/g,'');
-    return (fn + ln).replace(/[^a-z]/g,'');
+    const sig = getNameSignals(person);
+    return sig.coreKey || sig.allKey;
   };
 
   const personsEquivalent = (ftlsId, extId) => {
@@ -1366,7 +1469,7 @@ function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap)
     if (!ftlsPerson || !extPerson) return false;
     const fName = normPersonName(ftlsPerson);
     const eName = normPersonName(extPerson);
-    if (!fName || !eName || fName !== eName) return false;
+    if (!fName || !eName || !namesEquivalent(ftlsPerson, extPerson)) return false;
     if (ftlsPerson.g && extPerson.g && ftlsPerson.g !== extPerson.g) return false;
     if (ftlsPerson.dob && extPerson.dob && ftlsPerson.dob !== extPerson.dob) return false;
     return true;
