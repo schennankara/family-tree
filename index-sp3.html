@@ -1415,6 +1415,7 @@ function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap)
   const results = {
     matched: [],      // same ID, with field diffs
     fuzzyMatched: [],  // different ID but same person (by name)
+    duplicateExactMatches: [], // external ID exists, but another FTLS row also looks like the same person
     extOnly: [],       // in external only — can merge into FTLS
     ftlsOnly: [],      // in FTLS only — can export for external
     familyDiffs: [],   // family structure differences
@@ -1436,6 +1437,21 @@ function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap)
       }
     }
     return null;
+  }
+
+  function personRelationStatus(personId) {
+    let isChild = false;
+    let isSpouse = false;
+    for (const fam of Object.values(ftlsFamilyMap)) {
+      if ((fam.children || []).includes(personId)) isChild = true;
+      if ((fam.husband_id || fam.husb || '') === personId) isSpouse = true;
+      if ((fam.wife_id || fam.wife || '') === personId) isSpouse = true;
+      if (isChild && isSpouse) break;
+    }
+    if (isChild && isSpouse) return 'child + spouse';
+    if (isChild) return 'child';
+    if (isSpouse) return 'spouse';
+    return 'orphan';
   }
 
   // Helper: get a readable label for a parent family
@@ -1541,6 +1557,46 @@ function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap)
   for (const [id, ftls] of Object.entries(ftlsPersonMap)) {
     if (!ftlsMatched.has(id)) results.ftlsOnly.push(ftls);
   }
+
+  // Pass 3b: Duplicate search for exact-ID matches.
+  // This catches cases where an external GEDCOM ID is already in FTLS, but an older
+  // FTLS row still exists under a different ID for what is likely the same person.
+  const seenDuplicatePairs = new Set();
+  for (const match of results.matched) {
+    const duplicateCandidates = Object.values(ftlsPersonMap).filter(p => p.id !== match.id);
+    const dup = fuzzyMatchPerson(match.ext, duplicateCandidates);
+    if (!dup || dup.score < 42) continue;
+    const pairKey = [match.id, dup.person.id].sort().join('|');
+    if (seenDuplicatePairs.has(pairKey)) continue;
+    seenDuplicatePairs.add(pairKey);
+
+    const diffs = diffPerson(match.ftls, dup.person);
+    const currentParent = findParentFamily(match.id, ftlsFamilyMap);
+    const duplicateParent = findParentFamily(dup.person.id, ftlsFamilyMap);
+    if (!sameParentFamily(currentParent, duplicateParent)) {
+      const currentFamId = currentParent?.familyId || '';
+      const duplicateFamId = duplicateParent?.familyId || '';
+      diffs.push({
+        key: '_famc',
+        label: 'Parent Family',
+        ftls: currentParent ? parentLabel(currentParent, ftlsPersonMap) + ' (' + currentFamId + ')' : '(none)',
+        ext: duplicateParent ? parentLabel(duplicateParent, ftlsPersonMap) + ' (' + duplicateFamId + ')' : '(none)'
+      });
+    }
+
+    results.duplicateExactMatches.push({
+      extId: match.id,
+      currentId: match.id,
+      duplicateId: dup.person.id,
+      ext: match.ext,
+      current: match.ftls,
+      duplicate: dup.person,
+      score: dup.score,
+      diffs,
+      currentStatus: personRelationStatus(match.id),
+      duplicateStatus: personRelationStatus(dup.person.id)
+    });
+  }
   
   // Family diffs
   // Phantom family filter (webtrees strategy): skip families with no named spouse AND no named children.
@@ -1614,6 +1670,7 @@ function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap)
     ftlsTotal: Object.keys(ftlsPersonMap).length,
     exactMatch: results.matched.length,
     fuzzyMatch: results.fuzzyMatched.length,
+    duplicateExactMatch: results.duplicateExactMatches.length,
     fuzzyFamilyMatch: results.fuzzyMatchedFamilies.length,
     identical: results.matched.filter(m => m.diffs.length === 0).length,
     changed: totalChanged,
@@ -3369,6 +3426,13 @@ function TreeHealthTab({ personMap, familyMap, flat, tree, user, onPlaceOrphan }
           if (fam.wife_id) spouseOf.add(fam.wife_id);
         }
 
+        const relationStatus = (pid) => {
+          const parts = [];
+          if (childOf.has(pid)) parts.push('child');
+          if (spouseOf.has(pid)) parts.push('spouse');
+          return parts.length ? parts.join(' + ') : 'orphan';
+        };
+
         // 1a. Orphans — not in any family as child, husband, or wife
         const orphans = [];
         for (const [pid, p] of Object.entries(persons)) {
@@ -3390,9 +3454,25 @@ function TreeHealthTab({ personMap, familyMap, flat, tree, user, onPlaceOrphan }
                 }
               }
             }
+            const duplicateCandidates = Object.values(persons)
+              .filter(other => other.id !== pid)
+              .map(other => {
+                const match = fuzzyMatchPerson(p, [other]);
+                if (!match || match.score < 42) return null;
+                return {
+                  id: other.id,
+                  dn: other.dn || other.fn || other.id,
+                  score: match.score,
+                  status: relationStatus(other.id)
+                };
+              })
+              .filter(Boolean)
+              .sort((a, b) => b.score - a.score || a.dn.localeCompare(b.dn))
+              .slice(0, 3);
             orphans.push({
               id: pid, dn: p.dn || p.fn || pid, gender: p.g,
               dob: p.dob || '', ln,
+              duplicateCandidates,
               candidates: candidates.slice(0, 3), // top 3 suggestions
             });
           }
@@ -3573,6 +3653,19 @@ function TreeHealthTab({ personMap, familyMap, flat, tree, user, onPlaceOrphan }
               {item.candidates.length === 0 && (
                 <div style={{ marginTop: 4, marginLeft: 16, fontSize: 10, color: '#8a6040', fontStyle: 'italic' }}>
                   No family name match found — may need manual lookup
+                </div>
+              )}
+              {item.duplicateCandidates.length > 0 && (
+                <div style={{ marginTop: 6, marginLeft: 16, padding: '6px 10px', background: 'rgba(208,160,126,0.05)', border: '1px solid rgba(208,160,126,0.15)', borderRadius: 6 }}>
+                  <div style={{ fontSize: 10, color: '#d0a07e', fontWeight: 500, marginBottom: 4 }}>Possible duplicate people already in DB:</div>
+                  {item.duplicateCandidates.map((c, ci) => (
+                    <div key={ci} style={{ fontSize: 11, color: DM, marginTop: 2, lineHeight: 1.5 }}>
+                      <span style={{ color: TX }}>{c.dn}</span>
+                      <span style={{ marginLeft: 6, color: '#d0a07e' }}>score {c.score}</span>
+                      <span style={{ marginLeft: 6 }}>{c.status}</span>
+                      <span style={{ marginLeft: 6, color: '#7a7568' }}>{c.id}</span>
+                    </div>
+                  ))}
                 </div>
               )}
             </div>
@@ -5343,7 +5436,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
               {S.changed>0 && <span style={tabSt('changed')} onClick={()=>setTab('changed')}>Changed ({S.changed})</span>}
               {S.extOnly>0 && <span style={tabSt('ext_only')} onClick={()=>setTab('ext_only')}>External Only ({S.extOnly})</span>}
               {S.ftlsOnly>0 && <span style={tabSt('ftls_only')} onClick={()=>setTab('ftls_only')}>FTLS Only ({S.ftlsOnly})</span>}
-              {(diffResult.fuzzyMatched.length>0 || (diffResult.fuzzyMatchedFamilies||[]).length>0) && <span style={tabSt('fuzzy')} onClick={()=>setTab('fuzzy')}>Fuzzy ({diffResult.fuzzyMatched.length + (diffResult.fuzzyMatchedFamilies||[]).length})</span>}
+              {(diffResult.fuzzyMatched.length>0 || (diffResult.duplicateExactMatches||[]).length>0 || (diffResult.fuzzyMatchedFamilies||[]).length>0) && <span style={tabSt('fuzzy')} onClick={()=>setTab('fuzzy')}>Fuzzy ({diffResult.fuzzyMatched.length + (diffResult.duplicateExactMatches||[]).length + (diffResult.fuzzyMatchedFamilies||[]).length})</span>}
               <span style={tabSt('basket')} onClick={()=>setTab('basket')}>🧺 Basket {basketCount>0 && <span style={badge('rgba(196,163,90,0.7)')}>{basketCount}</span>}</span>
               {mergeLog.length>0 && <span style={tabSt('log')} onClick={()=>setTab('log')}>Log ({mergeLog.length})</span>}
             </div>
@@ -5366,6 +5459,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
               <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fill,minmax(150px,1fr))', gap:8 }}>
                 {[[S.identical,'#6b9e72','Identical'],[S.changed,'#c4a35a','Changed'],[S.extOnly,'#7eb8d0','External Only'],[S.ftlsOnly,'#9b82c4','FTLS Only'],...(S.fuzzyMatch>0?[[S.fuzzyMatch,'#d0a07e','Fuzzy (People)']]:[])]
                   .map(([v,c,l])=><div key={l} style={{ padding:10, background:'rgba(255,255,255,0.02)', borderRadius:6, border:'1px solid '+BR }}><div style={{ fontSize:22, color:c, fontWeight:600 }}>{v}</div><div style={{ fontSize:11, color:DM }}>{l}</div></div>)}
+                {(S.duplicateExactMatch||0) > 0 && <div style={{ padding:10, background:'rgba(255,255,255,0.02)', borderRadius:6, border:'1px solid '+BR }}><div style={{ fontSize:22, color:'#d0a07e', fontWeight:600 }}>{S.duplicateExactMatch}</div><div style={{ fontSize:11, color:DM }}>Duplicate IDs</div></div>}
                 {(S.fuzzyFamilyMatch||0) > 0 && <div style={{ padding:10, background:'rgba(255,255,255,0.02)', borderRadius:6, border:'1px solid '+BR }}><div style={{ fontSize:22, color:'#7eb8d0', fontWeight:600 }}>{S.fuzzyFamilyMatch}</div><div style={{ fontSize:11, color:DM }}>Fuzzy (Families)</div></div>}
               </div>
               <div style={{ marginTop:20 }}><button onClick={handleFile} style={{ background:'transparent', border:'1px solid '+BR, color:DM, padding:'8px 16px', borderRadius:6, cursor:'pointer', fontSize:12 }}>📄 Load Different File</button></div>
@@ -5769,7 +5863,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
                   Review the differences below. If they are the same person and the external has newer data, you can import the changed fields.
                 </div>
               </div>
-              {diffResult.fuzzyMatched.length === 0 && (diffResult.fuzzyMatchedFamilies||[]).length === 0 && <div style={{ textAlign:'center', padding:20, color:DM }}>No fuzzy matches found.</div>}
+              {diffResult.fuzzyMatched.length === 0 && (diffResult.duplicateExactMatches||[]).length === 0 && (diffResult.fuzzyMatchedFamilies||[]).length === 0 && <div style={{ textAlign:'center', padding:20, color:DM }}>No fuzzy matches found.</div>}
               {diffResult.fuzzyMatched.map(m => (<div key={m.extId} style={{ marginBottom:10, border:'1px solid rgba(208,160,126,0.3)', borderRadius:8, overflow:'hidden' }}>
                 <div style={{ padding:'10px 14px', background:'rgba(208,160,126,0.06)', display:'flex', alignItems:'center', justifyContent:'space-between' }}>
                   <div>
@@ -5850,6 +5944,48 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
                   </>)}
                 </div>
               </div>))}
+
+              {diffResult.duplicateExactMatches && diffResult.duplicateExactMatches.length > 0 && (<>
+                <div style={{ padding:'10px 14px', background:'rgba(208,160,126,0.06)', borderRadius:8, border:'1px solid rgba(208,160,126,0.2)', marginTop:20, marginBottom:16 }}>
+                  <div style={{ fontSize:13, color:'#d0a07e', fontWeight:500, marginBottom:4 }}>🧬 Duplicate People Already In FTLS ({diffResult.duplicateExactMatches.length})</div>
+                  <div style={{ fontSize:12, color:DM, lineHeight:1.5 }}>
+                    These external GEDCOM IDs already exist in FTLS, but another FTLS row also looks like the same person.
+                    This usually means an older import created a duplicate before fuzzy matching caught it.
+                    They are shown here so you can review them during merge/diff instead of losing sight of them.
+                  </div>
+                </div>
+                {diffResult.duplicateExactMatches.map(m => (<div key={m.currentId + '|' + m.duplicateId} style={{ marginBottom:10, border:'1px solid rgba(208,160,126,0.3)', borderRadius:8, overflow:'hidden' }}>
+                  <div style={{ padding:'10px 14px', background:'rgba(208,160,126,0.04)', display:'flex', alignItems:'center', justifyContent:'space-between' }}>
+                    <div>
+                      <div style={{ fontSize:13, color:TX, fontWeight:500 }}>{m.current.dn||m.ext.dn||'?'} <span style={{ fontSize:10, color:DM, fontWeight:400 }}>duplicate score: {m.score}</span></div>
+                      <div style={{ fontSize:11, color:DM, marginTop:2 }}>
+                        External / current FTLS ID: <span style={{ color:'#7eb8d0' }}>{m.currentId}</span> · Possible duplicate FTLS ID: <span style={{ color:GC }}>{m.duplicateId}</span>
+                      </div>
+                    </div>
+                    <span style={{ fontSize:11, color:'#d0a07e' }}>{m.currentStatus} ↔ {m.duplicateStatus}</span>
+                  </div>
+                  <div style={{ padding:'0 14px 10px' }}>
+                    <table style={{ width:'100%', borderCollapse:'collapse', fontSize:12 }}>
+                      <thead><tr style={{ borderBottom:'1px solid '+BR }}>
+                        <th style={{ textAlign:'left', padding:'4px 0', color:DM, fontWeight:400, width:'30%' }}>Field</th>
+                        <th style={{ textAlign:'left', padding:'4px 0', color:'#7eb8d0', fontWeight:400, width:'35%' }}>External / Current ID</th>
+                        <th style={{ textAlign:'left', padding:'4px 0', color:GC, fontWeight:400, width:'35%' }}>Other FTLS ID</th>
+                      </tr></thead>
+                      <tbody>{m.diffs.map(d => (<tr key={d.key} style={{ borderBottom:'1px solid rgba(255,255,255,0.03)' }}>
+                        <td style={{ padding:'3px 0', color:DM }}>{d.label}</td>
+                        <td style={{ padding:'3px 0', color:d.ftls?TX:'#5a5548' }}>{d.ftls || '(empty)'}</td>
+                        <td style={{ padding:'3px 0', color:d.ext?GC:'#5a5548' }}>{d.ext || '(empty)'}</td>
+                      </tr>))}</tbody>
+                    </table>
+                    {m.diffs.length === 0 && <div style={{ paddingTop:8, fontSize:11, color:'#6b9e72' }}>✓ These two FTLS rows look identical apart from the ID.</div>}
+                  </div>
+                  <div style={{ padding:'0 14px 10px', display:'flex', gap:8, alignItems:'center' }}>
+                    <span style={{ fontSize:10, color:DM }}>
+                      Review-only for now: the external GEDCOM ID already exists in FTLS, so automatic "Use External ID" remap is not offered here.
+                    </span>
+                  </div>
+                </div>))}
+              </>)}
 
               {/* ── FAMILY FUZZY MATCHES ── */}
               {diffResult.fuzzyMatchedFamilies && diffResult.fuzzyMatchedFamilies.length > 0 && (<>
