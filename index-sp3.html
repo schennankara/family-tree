@@ -1271,6 +1271,12 @@ function namesEquivalent(aPerson, bPerson) {
   return false;
 }
 
+function isLikelyGedcomPersonId(id) {
+  if (!id) return false;
+  if (!/^@.*@$/.test(id)) return false;
+  return !/^@I\d+@$/i.test(id);
+}
+
 // Fuzzy match: try name+gender+DOB when IDs don't match
 function fuzzyMatchPerson(person, candidates) {
   const sig = getNameSignals(person);
@@ -1796,14 +1802,11 @@ async function mergeFieldsToDb(ftlsPerson, fieldsToApply, ext, editUser) {
 // Must handle FK constraints: families.husband_id, families.wife_id, users.person_id,
 // access_requests.person_id, update_requests.person_id, family_members.person_id
 async function remapPersonId(oldId, newId, editUser) {
-  // Safety: only admins should run this
   if (!isAdmin()) throw new Error('Only admins can remap person IDs');
 
-  // 0. Check new ID doesn't already exist
   const existing = await sbFetch(`persons?id=eq.${newId}&select=id`);
   if (existing.length > 0) throw new Error('Target ID ' + newId + ' already exists in the database');
 
-  // 1. Copy person record with new ID
   const [person] = await sbFetch(`persons?id=eq.${oldId}&select=*`);
   if (!person) throw new Error('Person ' + oldId + ' not found');
   const newPerson = { ...person, id: newId };
@@ -1813,9 +1816,7 @@ async function remapPersonId(oldId, newId, editUser) {
     headers: { 'Prefer': 'return=minimal' }
   });
 
-  // From here, if anything fails, we should try to clean up the new record
   try {
-    // 2. Update families — husband_id (FK constrained)
     const famsH = await sbFetch(`families?husband_id=eq.${oldId}&select=id`);
     for (const f of famsH) {
       await sbFetch(`families?id=eq.${f.id}`, {
@@ -1824,7 +1825,6 @@ async function remapPersonId(oldId, newId, editUser) {
       });
     }
 
-    // 3. Update families — wife_id (FK constrained)
     const famsW = await sbFetch(`families?wife_id=eq.${oldId}&select=id`);
     for (const f of famsW) {
       await sbFetch(`families?id=eq.${f.id}`, {
@@ -1833,7 +1833,6 @@ async function remapPersonId(oldId, newId, editUser) {
       });
     }
 
-    // 4. Update families — children arrays (no FK, but need updating)
     const allFams = await sbFetch('families?select=id,children');
     for (const fam of allFams) {
       if ((fam.children || []).includes(oldId)) {
@@ -1845,7 +1844,6 @@ async function remapPersonId(oldId, newId, editUser) {
       }
     }
 
-    // 5. Update other referencing tables (best effort)
     for (const tbl of ['users', 'family_members']) {
       try {
         const refs = await sbFetch(`${tbl}?person_id=eq.${oldId}&select=id`);
@@ -1857,7 +1855,6 @@ async function remapPersonId(oldId, newId, editUser) {
         }
       } catch(e) { console.warn('Could not update ' + tbl + ':', e); }
     }
-    // access_requests and update_requests — admin can UPDATE per RLS
     for (const tbl of ['access_requests', 'update_requests']) {
       try {
         const refs = await sbFetch(`${tbl}?person_id=eq.${oldId}&select=id`);
@@ -1870,7 +1867,6 @@ async function remapPersonId(oldId, newId, editUser) {
       } catch(e) { console.warn('Could not update ' + tbl + ':', e); }
     }
 
-    // 6. Update media.tagged_persons arrays
     try {
       const allMedia = await sbFetch('media?select=id,tagged_persons');
       for (const m of allMedia) {
@@ -1884,25 +1880,37 @@ async function remapPersonId(oldId, newId, editUser) {
       }
     } catch(e) { console.warn('Could not update media:', e); }
 
-    // 7. Delete old person record (all FK refs now point to new ID)
     await sbFetch(`persons?id=eq.${oldId}`, {
       method: 'DELETE',
       headers: { 'Prefer': 'return=minimal' }
     });
-
   } catch(e) {
-    // Rollback: try to delete the new record we created
     console.error('Remap failed after creating new record, attempting rollback:', e);
     try {
-      // Move any FKs back before deleting
       const famsH2 = await sbFetch(`families?husband_id=eq.${newId}&select=id`);
-      for (const f of famsH2) { await sbFetch(`families?id=eq.${f.id}`, { method:'PATCH', body:JSON.stringify({husband_id:oldId}), headers:{'Prefer':'return=minimal'} }); }
+      for (const f of famsH2) {
+        await sbFetch(`families?id=eq.${f.id}`, {
+          method:'PATCH',
+          body:JSON.stringify({husband_id:oldId}),
+          headers:{'Prefer':'return=minimal'}
+        });
+      }
       const famsW2 = await sbFetch(`families?wife_id=eq.${newId}&select=id`);
-      for (const f of famsW2) { await sbFetch(`families?id=eq.${f.id}`, { method:'PATCH', body:JSON.stringify({wife_id:oldId}), headers:{'Prefer':'return=minimal'} }); }
+      for (const f of famsW2) {
+        await sbFetch(`families?id=eq.${f.id}`, {
+          method:'PATCH',
+          body:JSON.stringify({wife_id:oldId}),
+          headers:{'Prefer':'return=minimal'}
+        });
+      }
       const allFams2 = await sbFetch('families?select=id,children');
       for (const fam of allFams2) {
         if ((fam.children||[]).includes(newId)) {
-          await sbFetch(`families?id=eq.${fam.id}`, { method:'PATCH', body:JSON.stringify({children:fam.children.map(c=>c===newId?oldId:c)}), headers:{'Prefer':'return=minimal'} });
+          await sbFetch(`families?id=eq.${fam.id}`, {
+            method:'PATCH',
+            body:JSON.stringify({children:fam.children.map(c=>c===newId?oldId:c)}),
+            headers:{'Prefer':'return=minimal'}
+          });
         }
       }
       await sbFetch(`persons?id=eq.${newId}`, { method:'DELETE', headers:{'Prefer':'return=minimal'} });
@@ -1911,7 +1919,6 @@ async function remapPersonId(oldId, newId, editUser) {
     throw e;
   }
 
-  // 8. Log the remap (INSERT only — edit_log has no UPDATE policy)
   try {
     await sbFetch('edit_log', {
       method: 'POST',
@@ -1927,6 +1934,146 @@ async function remapPersonId(oldId, newId, editUser) {
       headers: { 'Prefer': 'return=minimal' }
     });
   } catch(e) { console.warn('Could not log remap:', e); }
+}
+
+async function mergeDuplicatePeople(keepId, removeId, editUser, preferSource='keep') {
+  if (!isAdmin()) throw new Error('Only admins can merge duplicate people');
+  if (!keepId || !removeId || keepId === removeId) throw new Error('Pick two different person IDs to merge');
+
+  const keepRows = await sbFetch(`persons?id=eq.${keepId}&select=*`);
+  const removeRows = await sbFetch(`persons?id=eq.${removeId}&select=*`);
+  const keepRow = keepRows[0];
+  const removeRow = removeRows[0];
+  if (!keepRow) throw new Error('Keep record ' + keepId + ' not found');
+  if (!removeRow) throw new Error('Duplicate record ' + removeId + ' not found');
+
+  const merged = { ...keepRow };
+  const skipMerge = new Set(['id', 'created_at', 'updated_at']);
+  for (const key of Object.keys(removeRow)) {
+    if (skipMerge.has(key)) continue;
+    const keepVal = keepRow[key];
+    const removeVal = removeRow[key];
+    if (Array.isArray(keepVal) || Array.isArray(removeVal)) continue;
+    const keepEmpty = keepVal === null || keepVal === undefined || String(keepVal).trim() === '';
+    const removeEmpty = removeVal === null || removeVal === undefined || String(removeVal).trim() === '';
+    if (preferSource === 'remove') {
+      merged[key] = !removeEmpty ? removeVal : keepVal;
+    } else if (keepEmpty && !removeEmpty) {
+      merged[key] = removeVal;
+    }
+  }
+  if (!merged.primary_family_id && removeRow.primary_family_id) merged.primary_family_id = removeRow.primary_family_id;
+  merged.updated_by = editUser || 'GEDCOM duplicate merge';
+
+  await sbFetch(`persons?id=eq.${keepId}`, {
+    method: 'PATCH',
+    body: JSON.stringify(merged),
+    headers: { 'Prefer': 'return=minimal' }
+  });
+
+  const famsH = await sbFetch(`families?husband_id=eq.${removeId}&select=id`);
+  for (const f of famsH) {
+    await sbFetch(`families?id=eq.${f.id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ husband_id: keepId }),
+      headers: { 'Prefer': 'return=minimal' }
+    });
+  }
+
+  const famsW = await sbFetch(`families?wife_id=eq.${removeId}&select=id`);
+  for (const f of famsW) {
+    await sbFetch(`families?id=eq.${f.id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ wife_id: keepId }),
+      headers: { 'Prefer': 'return=minimal' }
+    });
+  }
+
+  const allFams = await sbFetch('families?select=id,children');
+  for (const fam of allFams) {
+    if ((fam.children || []).includes(removeId)) {
+      const nextChildren = [...new Set((fam.children || []).map(cid => cid === removeId ? keepId : cid))];
+      await sbFetch(`families?id=eq.${fam.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ children: nextChildren }),
+        headers: { 'Prefer': 'return=minimal' }
+      });
+    }
+  }
+
+  for (const tbl of ['users', 'access_requests', 'update_requests']) {
+    try {
+      const refs = await sbFetch(`${tbl}?person_id=eq.${removeId}&select=id`);
+      for (const r of refs) {
+        await sbFetch(`${tbl}?id=eq.${r.id}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ person_id: keepId }),
+          headers: { 'Prefer': 'return=minimal' }
+        });
+      }
+    } catch(e) { console.warn('Could not update ' + tbl + ':', e); }
+  }
+
+  try {
+    const fmRefs = await sbFetch(`family_members?person_id=eq.${removeId}&select=id,family_id,role`);
+    for (const r of fmRefs) {
+      try {
+        await sbFetch(`family_members?id=eq.${r.id}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ person_id: keepId }),
+          headers: { 'Prefer': 'return=minimal' }
+        });
+      } catch(e) {
+        const msg = e?.message || '';
+        if (msg.includes('duplicate') || msg.includes('unique')) {
+          await sbFetch(`family_members?id=eq.${r.id}`, {
+            method: 'DELETE',
+            headers: { 'Prefer': 'return=minimal' }
+          });
+        } else {
+          throw e;
+        }
+      }
+    }
+  } catch(e) { console.warn('Could not update family_members:', e); }
+
+  try {
+    const allMedia = await sbFetch('media?select=id,tagged_persons');
+    for (const m of allMedia) {
+      if ((m.tagged_persons || []).includes(removeId)) {
+        const nextTags = [...new Set((m.tagged_persons || []).map(t => t === removeId ? keepId : t))];
+        await sbFetch(`media?id=eq.${m.id}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ tagged_persons: nextTags }),
+          headers: { 'Prefer': 'return=minimal' }
+        });
+      }
+    }
+  } catch(e) { console.warn('Could not update media:', e); }
+
+  await sbFetch(`persons?id=eq.${removeId}`, {
+    method: 'DELETE',
+    headers: { 'Prefer': 'return=minimal' }
+  });
+
+  try {
+    await sbFetch('edit_log', {
+      method: 'POST',
+      body: JSON.stringify({
+        person_id: keepId,
+        action: 'merge_duplicate_person',
+        edited_by: editUser || '',
+        changes: {
+          kept_id: keepId,
+          removed_id: removeId,
+          prefer_source: preferSource,
+          kept_name: keepRow.display_name || keepId,
+          removed_name: removeRow.display_name || removeId
+        }
+      }),
+      headers: { 'Prefer': 'return=minimal' }
+    });
+  } catch(e) { console.warn('Edit log failed:', e); }
 }
 
 // Remap a family ID: change FTLS family ID to match external GEDCOM ID
@@ -3634,7 +3781,7 @@ function TreeHealthTab({ personMap, familyMap, flat, tree, user, onPlaceOrphan }
                 <button onClick={(e) => { e.stopPropagation(); onPlaceOrphan(item); }}
                   style={{ background: 'rgba(107,158,114,0.1)', border: '1px solid rgba(107,158,114,0.3)', color: MC,
                     padding: '4px 12px', borderRadius: 5, cursor: 'pointer', fontSize: 11, whiteSpace: 'nowrap' }}>
-                  📌 Place in family…
+                  {item.duplicateCandidates.length > 0 ? '🧬 Resolve / Place…' : '📌 Place in family…'}
                 </button>
               </div>
               <div style={{ fontSize: 10, color: DM, marginTop: 2, marginLeft: 16 }}>{item.id}</div>
@@ -6176,13 +6323,15 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
 }
 
 /* ───── MOVE BRANCH MODAL ───── */
-function MoveBranchModal({ node, personMap, familyMap, flat, tree, user, onMove, onRequestMove, onClose }) {
+function MoveBranchModal({ node, personMap, familyMap, flat, tree, user, onMove, onRequestMove, onResolveDuplicate, onClose }) {
   const [targetSearch, setTargetSearch] = useState('');
   const [selectedTarget, setSelectedTarget] = useState(null);
   const [selectedFamily, setSelectedFamily] = useState(null);
   const [reason, setReason] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [ignoredDuplicateIds, setIgnoredDuplicateIds] = useState([]);
+  const [showManualPlacement, setShowManualPlacement] = useState(false);
 
   // Find current parent family (the family this person is a child of)
   const currentFamily = useMemo(() => {
@@ -6233,6 +6382,37 @@ function MoveBranchModal({ node, personMap, familyMap, flat, tree, user, onMove,
   const isOrphan = !currentFamily;
   const canSubmit = selectedFamily && (isOrphan || selectedFamily.id !== currentFamily?.id);
   const isAdmin = user && ['admin', 'super_admin'].includes(user.role);
+  const duplicateCandidates = (node.duplicateCandidates || []).filter(c => !ignoredDuplicateIds.includes(c.id));
+
+  const duplicateFamilyOptions = useMemo(() => {
+    if (!isOrphan || duplicateCandidates.length === 0) return [];
+    const options = [];
+    for (const c of duplicateCandidates) {
+      for (const [fid, fam] of Object.entries(familyMap)) {
+        const kids = fam.children || [];
+        const hid = fam.husband_id || '';
+        const wid = fam.wife_id || '';
+        if (!kids.includes(c.id) && hid !== c.id && wid !== c.id) continue;
+        const hName = hid && personMap[hid] ? personMap[hid].dn : '';
+        const wName = wid && personMap[wid] ? personMap[wid].dn : '';
+        options.push({
+          id: fid,
+          label: [hName, wName].filter(Boolean).join(' & ') || fid,
+          kidCount: kids.length,
+          viaPersonId: c.id,
+          viaPersonName: c.dn,
+          relationship: kids.includes(c.id) ? 'parent family' : 'spouse family'
+        });
+      }
+    }
+    return options.filter((opt, idx, arr) => arr.findIndex(other => other.id === opt.id) === idx);
+  }, [isOrphan, duplicateCandidates, familyMap, personMap]);
+
+  useEffect(() => {
+    if (isOrphan && (node.duplicateCandidates || []).length > 0 && duplicateCandidates.length === 0) {
+      setShowManualPlacement(true);
+    }
+  }, [isOrphan, node.duplicateCandidates, duplicateCandidates.length]);
 
   const handleSubmit = async () => {
     if (!canSubmit) return;
@@ -6249,6 +6429,37 @@ function MoveBranchModal({ node, personMap, familyMap, flat, tree, user, onMove,
       setBusy(false);
     }
   };
+
+  const resolveDuplicate = async (keepId, removeId, preferSource) => {
+    if (!onResolveDuplicate) return;
+    setBusy(true);
+    setError('');
+    try {
+      await onResolveDuplicate(keepId, removeId, preferSource);
+      onClose();
+    } catch (e) {
+      setError(e.message || 'Duplicate resolution failed');
+      setBusy(false);
+    }
+  };
+
+  const duplicateKeepId = (candidateId, mode) => {
+    if (mode === 'gedcom') {
+      if (isLikelyGedcomPersonId(node.id) && !isLikelyGedcomPersonId(candidateId)) return node.id;
+      if (isLikelyGedcomPersonId(candidateId) && !isLikelyGedcomPersonId(node.id)) return candidateId;
+      return node.id;
+    }
+    if (mode === 'merge') {
+      const candidate = duplicateCandidates.find(c => c.id === candidateId);
+      if (candidate && candidate.status !== 'orphan') return candidateId;
+      if (isLikelyGedcomPersonId(node.id) && !isLikelyGedcomPersonId(candidateId)) return node.id;
+      if (isLikelyGedcomPersonId(candidateId) && !isLikelyGedcomPersonId(node.id)) return candidateId;
+      return node.id;
+    }
+    return node.id;
+  };
+
+  const showDuplicateWorkflow = isOrphan && duplicateCandidates.length > 0 && !showManualPlacement;
 
   return (
     <div style={{ position:'fixed', inset:0, zIndex:200, display:'flex', alignItems:'center', justifyContent:'center' }}>
@@ -6284,7 +6495,64 @@ function MoveBranchModal({ node, personMap, familyMap, flat, tree, user, onMove,
         {/* TO */}
         <div style={{ marginBottom:16 }}>
           <div style={{ fontSize:11, color:DM, textTransform:'uppercase', letterSpacing:2, marginBottom:6 }}>To (new parent)</div>
-          <div style={{ position:'relative' }}>
+          {showDuplicateWorkflow && (
+            <div style={{ marginBottom:12, padding:12, background:'rgba(208,160,126,0.05)', border:'1px solid rgba(208,160,126,0.18)', borderRadius:8 }}>
+              <div style={{ fontSize:13, color:'#d0a07e', fontWeight:500, marginBottom:4 }}>Possible Duplicate Found</div>
+              <div style={{ fontSize:12, color:DM, lineHeight:1.5, marginBottom:10 }}>
+                This orphan looks like someone already in FTLS. Reconcile the duplicate here first, or ignore it and place the person manually.
+              </div>
+              {duplicateCandidates.map(c => {
+                const keepGedcomId = duplicateKeepId(c.id, 'gedcom');
+                const removeForGedcom = keepGedcomId === node.id ? c.id : node.id;
+                const keepMergeId = duplicateKeepId(c.id, 'merge');
+                const removeForMerge = keepMergeId === node.id ? c.id : node.id;
+                return (
+                  <div key={c.id} style={{ marginTop:8, padding:10, background:'rgba(255,255,255,0.02)', border:'1px solid '+BR, borderRadius:8 }}>
+                    <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', gap:10 }}>
+                      <div>
+                        <div style={{ color:TX, fontSize:13 }}>{c.dn}</div>
+                        <div style={{ color:DM, fontSize:10, marginTop:2 }}>{c.id} · score {c.score} · {c.status}</div>
+                      </div>
+                      <div style={{ display:'flex', gap:6, flexWrap:'wrap', justifyContent:'flex-end' }}>
+                        <button disabled={busy} onClick={() => resolveDuplicate(keepMergeId, removeForMerge, keepMergeId === node.id ? 'keep' : 'remove')}
+                          style={{ background:'rgba(107,158,114,0.12)', border:'1px solid rgba(107,158,114,0.3)', color:MC, padding:'4px 10px', borderRadius:5, cursor:'pointer', fontSize:11 }}>
+                          Merge
+                        </button>
+                        <button disabled={busy} onClick={() => resolveDuplicate(keepGedcomId, removeForGedcom, keepGedcomId === node.id ? 'keep' : 'remove')}
+                          style={{ background:'rgba(126,184,208,0.12)', border:'1px solid rgba(126,184,208,0.3)', color:'#7eb8d0', padding:'4px 10px', borderRadius:5, cursor:'pointer', fontSize:11 }}>
+                          Replace with GEDCOM
+                        </button>
+                        <button disabled={busy} onClick={() => setIgnoredDuplicateIds(prev => [...prev, c.id])}
+                          style={{ background:'transparent', border:'1px solid '+BR, color:DM, padding:'4px 10px', borderRadius:5, cursor:'pointer', fontSize:11 }}>
+                          Ignore
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+              {duplicateFamilyOptions.length > 0 && (
+                <div style={{ marginTop:10, paddingTop:10, borderTop:'1px solid '+BR }}>
+                  <div style={{ fontSize:11, color:DM, marginBottom:6 }}>Or use an existing family from the duplicate automatically:</div>
+                  {duplicateFamilyOptions.map(f => (
+                    <div key={f.id} onClick={() => { setSelectedFamily(f); setSelectedTarget({ id: f.viaPersonId, dn: f.viaPersonName, g: personMap[f.viaPersonId]?.g }); setShowManualPlacement(true); }}
+                      style={{ padding:8, marginTop:4, cursor:'pointer', borderRadius:6, background:'rgba(255,255,255,0.02)', border:'1px solid '+BR }}>
+                      <span style={{ color:TX }}>{f.label}</span>
+                      <span style={{ color:DM, fontSize:11, marginLeft:8 }}>{f.relationship} via {f.viaPersonName}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div style={{ marginTop:10 }}>
+                <button onClick={() => setShowManualPlacement(true)}
+                  style={{ background:'transparent', border:'1px solid '+BR, color:DM, padding:'6px 12px', borderRadius:6, cursor:'pointer', fontSize:11 }}>
+                  Not a duplicate — place manually
+                </button>
+              </div>
+            </div>
+          )}
+
+          {(!showDuplicateWorkflow) && <div style={{ position:'relative' }}>
             <input value={targetSearch} onChange={e=>{setTargetSearch(e.target.value);setSelectedTarget(null);setSelectedFamily(null)}}
               placeholder="Search for new parent..."
               style={{ width:'100%', background:'#0a0a08', border:'1px solid '+BR, color:TX, padding:'8px 12px', borderRadius:6, fontSize:13, outline:'none', boxSizing:'border-box' }} />
@@ -6307,10 +6575,10 @@ function MoveBranchModal({ node, personMap, familyMap, flat, tree, user, onMove,
                 })}
               </div>
             )}
-          </div>
+          </div>}
 
           {/* Family selector (if target has multiple families) */}
-          {selectedTarget && targetFamilies.length > 1 && (
+          {(!showDuplicateWorkflow) && selectedTarget && targetFamilies.length > 1 && (
             <div style={{ marginTop:8 }}>
               <div style={{ fontSize:11, color:DM, marginBottom:4 }}>Select which family:</div>
               {targetFamilies.map(f => (
@@ -6325,7 +6593,7 @@ function MoveBranchModal({ node, personMap, familyMap, flat, tree, user, onMove,
             </div>
           )}
 
-          {selectedTarget && targetFamilies.length === 0 && (
+          {(!showDuplicateWorkflow) && selectedTarget && targetFamilies.length === 0 && (
             <div style={{ marginTop:8, padding:8, background:'rgba(192,80,80,0.06)', borderRadius:6, fontSize:12, color:'#c07a7a' }}>
               {selectedTarget.dn} has no family record. They need a family (as husband or wife) before you can move a child to them.
             </div>
@@ -7198,6 +7466,14 @@ function App(){
     setTimeout(() => setMsg(''), 3000);
   };
 
+  const handleResolveDuplicate = async (keepId, removeId, preferSource) => {
+    await mergeDuplicatePeople(keepId, removeId, user?.name || user?.email || 'GEDCOM duplicate merge', preferSource || 'keep');
+    setMovingBranch(null);
+    setMsg('Duplicate reconciled — refreshing...');
+    await reloadTree(false);
+    setTimeout(() => setMsg(''), 3000);
+  };
+
   // Move branch: viewer/editor request
   const handleRequestMove = async (personId, personName, fromFamily, toFamily, reason) => {
     await submitUpdateRequest(
@@ -7567,7 +7843,7 @@ function App(){
         </>;
       })()}
       </>}
-      {activeTab==='admin'&&user&&isAdmin()&&<AdminPanel onReloadTree={()=>reloadTree(true)} onShowMigrate={()=>setShowMigrate(true)} onShowDiff={()=>setShowDiff(true)} onShowBackfill={()=>setShowBackfill(true)} personMap={personMap} familyMap={familyMap} flat={flat} tree={tree} user={user} onPlaceOrphan={(person)=>setMovingBranch({id:person.id,dn:person.dn,g:person.gender})}/>}
+      {activeTab==='admin'&&user&&isAdmin()&&<AdminPanel onReloadTree={()=>reloadTree(true)} onShowMigrate={()=>setShowMigrate(true)} onShowDiff={()=>setShowDiff(true)} onShowBackfill={()=>setShowBackfill(true)} personMap={personMap} familyMap={familyMap} flat={flat} tree={tree} user={user} onPlaceOrphan={(person)=>setMovingBranch(person)}/>}
       
       {/* ───── PHOTOS GALLERY TAB ───── */}
       {activeTab==='photos'&&user&&<PhotoGallery flat={flat} user={user}/>}
@@ -7577,7 +7853,7 @@ function App(){
       {showMigrate&&<MigrateDialog onDone={()=>setShowMigrate(false)} onCancel={()=>setShowMigrate(false)}/>}
       {showDiff&&<GedcomDiffModal onClose={()=>setShowDiff(false)} personMap={personMap} familyMap={familyMap} user={user} onMergeComplete={()=>{setShowDiff(false);setMsg('Merging complete — refreshing...');reloadTree(false)}}/>}
       {showBackfill&&<BackfillModal onClose={()=>setShowBackfill(false)} onComplete={()=>{setShowBackfill(false);setMsg('Backfill complete — refreshing...');reloadTree(false)}}/>}
-      {movingBranch&&<MoveBranchModal node={movingBranch} personMap={personMap} familyMap={familyMap} flat={flat} tree={tree} user={user} onMove={handleMove} onRequestMove={handleRequestMove} onClose={()=>setMovingBranch(null)}/>}
+      {movingBranch&&<MoveBranchModal node={movingBranch} personMap={personMap} familyMap={familyMap} flat={flat} tree={tree} user={user} onMove={handleMove} onRequestMove={handleRequestMove} onResolveDuplicate={handleResolveDuplicate} onClose={()=>setMovingBranch(null)}/>}
       {user&&user.role!=='viewer'&&<div style={{position:'fixed',bottom:16,right:16,background:CD,border:'1px solid '+BR,borderRadius:8,padding:'8px 14px',fontSize:11,color:DM,zIndex:80,display:'flex',alignItems:'center',gap:8}}>
         <span style={{width:6,height:6,borderRadius:'50%',background:MC}}/>
         <span>Signed in as <strong style={{color:TX}}>{user.name||user.email}</strong></span>
