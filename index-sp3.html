@@ -1304,6 +1304,52 @@ function namesEquivalent(aPerson, bPerson) {
   return false;
 }
 
+function hasStrongDuplicateNameEvidence(aPerson, bPerson) {
+  const a = getNameSignals(aPerson);
+  const b = getNameSignals(bPerson);
+  const sharedCore = countEquivalentTokens(a.coreTokens, b.coreTokens);
+
+  if (a.allKey && b.allKey && a.allKey === b.allKey) return true;
+  if (a.coreKey && b.coreKey && a.coreKey === b.coreKey) return true;
+  if (sharedCore >= 2) return true;
+
+  // Single-token names need to be much stricter so we don't match short names like Ron/Mon.
+  if (sharedCore === 1 && a.coreTokens.length === 1 && b.coreTokens.length === 1) {
+    const aTok = a.coreTokens[0] || '';
+    const bTok = b.coreTokens[0] || '';
+    if (aTok === bTok) return true;
+    if (Math.min(aTok.length, bTok.length) >= 5 && nameTokensEquivalent(aTok, bTok)) return true;
+    return false;
+  }
+
+  const fnMatch = a.fn && b.fn && nameTokensEquivalent(a.fn, b.fn);
+  const lnMatch = a.ln && b.ln && nameTokensEquivalent(a.ln, b.ln);
+  if (fnMatch && lnMatch) return true;
+
+  return false;
+}
+
+function isStrongDuplicatePersonMatch(aPerson, bPerson, score=0) {
+  if (!aPerson || !bPerson) return false;
+  if (!hasStrongDuplicateNameEvidence(aPerson, bPerson)) return false;
+  if (aPerson.g && bPerson.g && aPerson.g !== bPerson.g) return false;
+  if (aPerson.dob && bPerson.dob && aPerson.dob !== bPerson.dob) return false;
+
+  const a = getNameSignals(aPerson);
+  const b = getNameSignals(bPerson);
+  const sharedCore = countEquivalentTokens(a.coreTokens, b.coreTokens);
+  const fnMatch = a.fn && b.fn && nameTokensEquivalent(a.fn, b.fn);
+  const lnMatch = a.ln && b.ln && nameTokensEquivalent(a.ln, b.ln);
+  const dobMatch = !!(aPerson.dob && bPerson.dob && aPerson.dob === bPerson.dob);
+
+  if (dobMatch) return true;
+  if (sharedCore >= 2) return true;
+  if (fnMatch && lnMatch) return true;
+  if (score >= 70 && (sharedCore >= 1 || fnMatch)) return true;
+
+  return false;
+}
+
 function isLikelyGedcomPersonId(id) {
   if (!id) return false;
   if (!/^@.*@$/.test(id)) return false;
@@ -1317,6 +1363,8 @@ function fuzzyMatchPerson(person, candidates) {
   
   let bestMatch = null, bestScore = 0;
   for (const c of candidates) {
+    if (person.g && c.g && person.g !== c.g) continue;
+    if (person.dob && c.dob && person.dob !== c.dob) continue;
     let score = 0;
     const cSig = getNameSignals(c);
     
@@ -1604,7 +1652,7 @@ function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap)
   for (const match of results.matched) {
     const duplicateCandidates = Object.values(ftlsPersonMap).filter(p => p.id !== match.id);
     const dup = fuzzyMatchPerson(match.ext, duplicateCandidates);
-    if (!dup || dup.score < 42) continue;
+    if (!dup || dup.score < 42 || !isStrongDuplicatePersonMatch(match.ext, dup.person, dup.score)) continue;
     const pairKey = [match.id, dup.person.id].sort().join('|');
     if (seenDuplicatePairs.has(pairKey)) continue;
     seenDuplicatePairs.add(pairKey);
@@ -3671,7 +3719,7 @@ function TreeHealthTab({ personMap, familyMap, flat, tree, user, onPlaceOrphan }
               .filter(other => other.id !== pid)
               .map(other => {
                 const match = fuzzyMatchPerson(p, [other]);
-                if (!match || match.score < 42) return null;
+                if (!match || match.score < 42 || !isStrongDuplicatePersonMatch(p, other, match.score)) return null;
                 return {
                   id: other.id,
                   dn: other.dn || other.fn || other.id,
