@@ -3270,11 +3270,32 @@ function TreeHealthTab({ personMap, familyMap, flat, tree, user, onPlaceOrphan }
         const orphans = [];
         for (const [pid, p] of Object.entries(persons)) {
           if (!childOf.has(pid) && !spouseOf.has(pid)) {
-            orphans.push({ id: pid, dn: p.dn || p.fn || pid, gender: p.g, dob: p.dob || '' });
+            const ln = (p.ln || '').trim();
+            // Find candidate families: families where a spouse shares last name
+            const candidates = [];
+            if (ln) {
+              for (const [fid, fam] of Object.entries(families)) {
+                const h = fam.husband_id ? persons[fam.husband_id] : null;
+                const w = fam.wife_id ? persons[fam.wife_id] : null;
+                const hLn = (h?.ln || '').trim();
+                const wLn = (w?.ln || '').trim();
+                if ((hLn && hLn.toLowerCase() === ln.toLowerCase()) || (wLn && wLn.toLowerCase() === ln.toLowerCase())) {
+                  const label = [h?.dn, w?.dn].filter(Boolean).join(' & ') || fid;
+                  const kidCount = (fam.children || []).length;
+                  const kidNames = (fam.children || []).slice(0, 4).map(cid => persons[cid]?.dn || '?');
+                  candidates.push({ fid, label, kidCount, kidNames });
+                }
+              }
+            }
+            orphans.push({
+              id: pid, dn: p.dn || p.fn || pid, gender: p.g,
+              dob: p.dob || '', ln,
+              candidates: candidates.slice(0, 3), // top 3 suggestions
+            });
           }
         }
 
-        // 1b. Partial orphans — spouse in some family but never a child in any family
+        // 1b. Married-in only — spouse in some family but never a child in any family
         // Flag only those with birth year > 1950 (suspicious for recent generations)
         const partialOrphans = [];
         for (const [pid, p] of Object.entries(persons)) {
@@ -3283,18 +3304,19 @@ function TreeHealthTab({ personMap, familyMap, flat, tree, user, onPlaceOrphan }
             const birthYear = dob.match(/(19[5-9]\d|20\d\d)/);
             if (birthYear) {
               const hName = p.dn || p.fn || pid;
-              // Find which family they're a spouse in
-              let spouseFamilyLabel = '';
+              // Find all families they're a spouse in, with children info
+              const spouseFamilies = [];
               for (const [fid, fam] of Object.entries(families)) {
                 if (fam.husband_id === pid || fam.wife_id === pid) {
                   const otherName = fam.husband_id === pid
                     ? (fam.wife_id && persons[fam.wife_id] ? (persons[fam.wife_id].dn || persons[fam.wife_id].fn || '?') : '')
                     : (fam.husband_id && persons[fam.husband_id] ? (persons[fam.husband_id].dn || persons[fam.husband_id].fn || '?') : '');
-                  spouseFamilyLabel = otherName ? `Married to ${otherName}` : fid;
-                  break;
+                  const kidCount = (fam.children || []).length;
+                  const kidNames = (fam.children || []).slice(0, 3).map(cid => persons[cid]?.dn || '?');
+                  spouseFamilies.push({ fid, otherName, kidCount, kidNames });
                 }
               }
-              partialOrphans.push({ id: pid, dn: hName, dob, spouseFamily: spouseFamilyLabel });
+              partialOrphans.push({ id: pid, dn: hName, dob, spouseFamilies });
             }
           }
         }
@@ -3306,7 +3328,11 @@ function TreeHealthTab({ personMap, familyMap, flat, tree, user, onPlaceOrphan }
           if (pfid && families[pfid]) {
             const kids = families[pfid].children || [];
             if (!kids.includes(pid)) {
-              misfits.push({ id: pid, dn: p.dn || p.fn || pid, familyId: pfid });
+              const fam = families[pfid];
+              const h = fam.husband_id ? persons[fam.husband_id] : null;
+              const w = fam.wife_id ? persons[fam.wife_id] : null;
+              const familyLabel = [h?.dn, w?.dn].filter(Boolean).join(' & ') || pfid;
+              misfits.push({ id: pid, dn: p.dn || p.fn || pid, familyId: pfid, familyLabel });
             }
           }
         }
@@ -3315,17 +3341,20 @@ function TreeHealthTab({ personMap, familyMap, flat, tree, user, onPlaceOrphan }
         const placeholders = [];
         for (const [fid, fam] of Object.entries(families)) {
           const kids = fam.children || [];
+          const h = fam.husband_id ? persons[fam.husband_id] : null;
+          const w = fam.wife_id ? persons[fam.wife_id] : null;
+          const familyLabel = [h?.dn, w?.dn].filter(Boolean).join(' & ') || fid;
           for (const cid of kids) {
             const p = persons[cid];
             if (!p) {
-              placeholders.push({ familyId: fid, childId: cid, issue: 'Missing — ID not found in persons table' });
+              placeholders.push({ familyId: fid, familyLabel, childId: cid, issue: 'Missing — ID not found in persons table' });
             } else {
               const fn = p.fn || '';
               const ln = p.ln || '';
               const dn = p.dn || '';
               const isBlank = !fn.trim() && !ln.trim() && (!dn.trim() || /^(unknown|mrs?\s*\/\/)/i.test(dn));
               if (isBlank) {
-                placeholders.push({ familyId: fid, childId: cid, issue: `Placeholder — name is "${dn || '(empty)'}"` });
+                placeholders.push({ familyId: fid, familyLabel, childId: cid, issue: `Placeholder — name is "${dn || '(empty)'}"` });
               }
             }
           }
@@ -3411,31 +3440,60 @@ function TreeHealthTab({ personMap, familyMap, flat, tree, user, onPlaceOrphan }
         <Section sectionKey="orphans" icon="👻" title="Orphans — completely disconnected" color="#c05050"
           items={results.orphans} emptyMsg="No orphans — everyone is connected to at least one family."
           renderItem={(item) => (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <span style={{ width: 8, height: 8, borderRadius: '50%', background: item.gender === 'M' ? MC : item.gender === 'F' ? FC : DM, flexShrink: 0 }} />
-              <div style={{ flex: 1 }}>
-                <span style={{ color: TX, fontWeight: 500 }}>{item.dn}</span>
-                {item.dob && <span style={{ color: DM, marginLeft: 8 }}>b. {item.dob}</span>}
-                <div style={{ fontSize: 10, color: DM, marginTop: 1 }}>{item.id}</div>
+            <div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span style={{ width: 8, height: 8, borderRadius: '50%', background: item.gender === 'M' ? MC : item.gender === 'F' ? FC : DM, flexShrink: 0 }} />
+                <div style={{ flex: 1 }}>
+                  <span style={{ color: TX, fontWeight: 500 }}>{item.dn}</span>
+                  {item.dob && <span style={{ color: DM, marginLeft: 8 }}>b. {item.dob}</span>}
+                  {item.ln && <span style={{ color: DM, marginLeft: 8, fontSize: 11 }}>({item.ln})</span>}
+                </div>
+                <button onClick={(e) => { e.stopPropagation(); onPlaceOrphan(item); }}
+                  style={{ background: 'rgba(107,158,114,0.1)', border: '1px solid rgba(107,158,114,0.3)', color: MC,
+                    padding: '4px 12px', borderRadius: 5, cursor: 'pointer', fontSize: 11, whiteSpace: 'nowrap' }}>
+                  📌 Place in family…
+                </button>
               </div>
-              <button onClick={(e) => { e.stopPropagation(); onPlaceOrphan(item); }}
-                style={{ background: 'rgba(107,158,114,0.1)', border: '1px solid rgba(107,158,114,0.3)', color: MC,
-                  padding: '4px 12px', borderRadius: 5, cursor: 'pointer', fontSize: 11, whiteSpace: 'nowrap' }}>
-                📌 Place in family…
-              </button>
+              <div style={{ fontSize: 10, color: DM, marginTop: 2, marginLeft: 16 }}>{item.id}</div>
+              {item.candidates.length > 0 && (
+                <div style={{ marginTop: 6, marginLeft: 16, padding: '6px 10px', background: 'rgba(107,158,114,0.04)', border: '1px solid rgba(107,158,114,0.1)', borderRadius: 6 }}>
+                  <div style={{ fontSize: 10, color: MC, fontWeight: 500, marginBottom: 4 }}>Likely families (last name "{item.ln}" match):</div>
+                  {item.candidates.map((c, ci) => (
+                    <div key={ci} style={{ fontSize: 11, color: DM, marginTop: 2, lineHeight: 1.5 }}>
+                      <span style={{ color: TX }}>{c.label}</span>
+                      <span style={{ marginLeft: 6 }}>· {c.kidCount} children</span>
+                      {c.kidNames.length > 0 && <span style={{ marginLeft: 4, color: '#7a7568' }}>({c.kidNames.join(', ')})</span>}
+                    </div>
+                  ))}
+                </div>
+              )}
+              {item.candidates.length === 0 && (
+                <div style={{ marginTop: 4, marginLeft: 16, fontSize: 10, color: '#8a6040', fontStyle: 'italic' }}>
+                  No family name match found — may need manual lookup
+                </div>
+              )}
             </div>
           )} />
 
-        <Section sectionKey="partial" icon="🔗" title="Partial orphans — spouse but no known parents" color="#c4a35a"
-          items={results.partialOrphans} emptyMsg="No partial orphans among post-1950 individuals."
+        <Section sectionKey="partial" icon="🔗" title="Married-in only — no birth family in tree (post-1950)" color="#c4a35a"
+          items={results.partialOrphans} emptyMsg="No married-in-only individuals found among post-1950 entries."
           renderItem={(item) => (
             <div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                 <span style={{ color: TX, fontWeight: 500 }}>{item.dn}</span>
                 {item.dob && <span style={{ color: DM }}>b. {item.dob}</span>}
               </div>
-              <div style={{ fontSize: 11, color: DM, marginTop: 2 }}>{item.spouseFamily} · {item.id}</div>
-              <div style={{ fontSize: 10, color: '#8a7a50', marginTop: 3, fontStyle: 'italic' }}>Normal for married-in spouses — only suspicious if they should have parents in the tree.</div>
+              {item.spouseFamilies.map((sf, si) => (
+                <div key={si} style={{ fontSize: 11, color: DM, marginTop: 3, marginLeft: 8, lineHeight: 1.5 }}>
+                  <span>⚭ Married to <span style={{ color: TX }}>{sf.otherName || '?'}</span></span>
+                  {sf.kidCount > 0 && <span style={{ marginLeft: 6 }}>· {sf.kidCount} children ({sf.kidNames.join(', ')})</span>}
+                  {sf.kidCount === 0 && <span style={{ marginLeft: 6 }}>· no children</span>}
+                </div>
+              ))}
+              <div style={{ fontSize: 10, color: DM, marginTop: 2, marginLeft: 8 }}>{item.id}</div>
+              <div style={{ fontSize: 10, color: '#8a7a50', marginTop: 3, marginLeft: 8, fontStyle: 'italic' }}>
+                Typical for spouses who married into the family — only a concern if their parents should be in this tree.
+              </div>
             </div>
           )} />
 
@@ -3444,7 +3502,9 @@ function TreeHealthTab({ personMap, familyMap, flat, tree, user, onPlaceOrphan }
           renderItem={(item) => (
             <div>
               <span style={{ color: TX, fontWeight: 500 }}>{item.dn}</span>
-              <span style={{ color: DM, marginLeft: 8 }}>claims primary family <code style={{ color: '#5aa3c4', fontSize: 11 }}>{item.familyId}</code> but isn't in its children array</span>
+              <div style={{ fontSize: 11, color: DM, marginTop: 3, lineHeight: 1.5 }}>
+                Claims primary family <span style={{ color: '#5aa3c4' }}>{item.familyLabel}</span> <span style={{ fontSize: 10, color: '#666' }}>({item.familyId})</span> but isn't in that family's children array.
+              </div>
             </div>
           )} />
 
@@ -3452,9 +3512,15 @@ function TreeHealthTab({ personMap, familyMap, flat, tree, user, onPlaceOrphan }
           items={results.placeholders} emptyMsg="No placeholder children — all family child references resolve to named people."
           renderItem={(item) => (
             <div>
-              <span style={{ color: TX }}>Family <code style={{ color: '#9b82c4', fontSize: 11 }}>{item.familyId}</code></span>
-              <span style={{ color: DM, marginLeft: 4 }}>→ child <code style={{ color: '#9b82c4', fontSize: 11 }}>{item.childId}</code></span>
-              <div style={{ fontSize: 11, color: DM, marginTop: 2 }}>{item.issue}</div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <span style={{ color: TX }}>Child of <span style={{ color: '#9b82c4', fontWeight: 500 }}>{item.familyLabel}</span></span>
+              </div>
+              <div style={{ fontSize: 11, color: DM, marginTop: 3, lineHeight: 1.5 }}>
+                {item.issue}
+              </div>
+              <div style={{ fontSize: 10, color: '#666', marginTop: 2 }}>
+                Family: {item.familyId} → child: {item.childId}
+              </div>
             </div>
           )} />
       </>)}
