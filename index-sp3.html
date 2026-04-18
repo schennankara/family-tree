@@ -185,16 +185,7 @@ function buildTreeFromDB(persons, families) {
   const pMap = {};
   persons.forEach(p => {
     pMap[p.id] = {
-      id:p.id, fn:p.first_name, mn:p.middle_name, ln:p.last_name,
-      dn:p.display_name, nk:p.nickname, md:p.maiden_name, g:p.gender,
-      dob:p.date_of_birth, dod:p.date_of_death, dec:p.is_deceased, bo:p.birth_order,
-      em:p.email, ph:p.phone, a1:p.address1, a2:p.address2,
-      ci:p.city, st:p.state, zp:p.zip, co:p.country,
-      fb:p.facebook, ig:p.instagram, li:p.linkedin, ws:p.website,
-      pp:p.profile_photo, bio:p.bio, loc:p.location, prof:p.profession, emp:p.employer,
-      stories:p.stories, notes:p.notes, pgl:p.photo_gallery_link, dl:p.documents_link,
-      tp:p.title_prefix, burd:p.burial_date, _xg:p._extra_gedcom,
-      primaryFamId:p.primary_family_id||null,
+      ...personRowToTreePerson(p),
       _fams: [], _famc: [],
     };
   });
@@ -283,6 +274,21 @@ function buildTreeFromDB(persons, families) {
   }
 
   return { tree: buildNode(bestRoot), personMap, familyMap: fMap };
+}
+
+function personRowToTreePerson(p) {
+  return {
+    id:p.id, fn:p.first_name, mn:p.middle_name, ln:p.last_name,
+    dn:p.display_name, nk:p.nickname, md:p.maiden_name, g:p.gender,
+    dob:p.date_of_birth, dod:p.date_of_death, dec:p.is_deceased, bo:p.birth_order,
+    em:p.email, ph:p.phone, a1:p.address1, a2:p.address2,
+    ci:p.city, st:p.state, zp:p.zip, co:p.country,
+    fb:p.facebook, ig:p.instagram, li:p.linkedin, ws:p.website,
+    pp:p.profile_photo, bio:p.bio, loc:p.location, prof:p.profession, emp:p.employer,
+    stories:p.stories, notes:p.notes, pgl:p.photo_gallery_link, dl:p.documents_link,
+    tp:p.title_prefix, burd:p.burial_date, _xg:p._extra_gedcom,
+    primaryFamId:p.primary_family_id||null,
+  };
 }
 
 /* ───── SAVE TO SUPABASE ───── */
@@ -1153,24 +1159,40 @@ async function downloadGedcom(tree, personMap, familyMap) {
 
 /* ───── GEDCOM DIFF & MERGE ENGINE ───── */
 
+const PERSON_DIFF_FIELDS = [
+  ['fn','First Name'],['mn','Middle Name'],['ln','Last Name'],['dn','Display Name'],
+  ['nk','Nickname'],['md','Maiden Name'],['tp','Title Prefix'],['g','Gender'],
+  ['dob','Birth Date'],['dod','Death Date'],['burd','Burial Date'],['loc','Birth Place'],
+  ['prof','Occupation'],['emp','Employer'],['ph','Phone'],['em','Email'],
+  ['a1','Address'],['a2','Address 2'],['ci','City'],['st','State'],['co','Country'],['zp','Zip'],
+  ['fb','Facebook'],['ig','Instagram'],['li','LinkedIn'],['ws','Website'],
+  ['pp','Profile Photo'],['notes','Notes'],['bio','Bio'],['stories','Stories'],
+  ['pgl','Photo Gallery'],['dl','Documents'],['_xg','Extra GEDCOM']
+];
+
+function diffPersonFields(left, right, fields=PERSON_DIFF_FIELDS) {
+  const diffs = [];
+  for (const [key, label] of fields) {
+    const leftVal = left?.[key];
+    const rightVal = right?.[key];
+    const leftNorm = typeof leftVal === 'boolean' ? String(leftVal) : (leftVal ?? '').toString().trim();
+    const rightNorm = typeof rightVal === 'boolean' ? String(rightVal) : (rightVal ?? '').toString().trim();
+    if (leftNorm !== rightNorm && (leftNorm || rightNorm)) {
+      diffs.push({ key, label, ftls: leftNorm, ext: rightNorm });
+    }
+  }
+  return diffs;
+}
+
 // Compare fields between two person objects, return changed fields
 function diffPerson(ftls, ext) {
-  const fields = [
+  return diffPersonFields(ftls, ext, [
     ['fn','First Name'],['mn','Middle Name'],['ln','Last Name'],['nk','Nickname'],
     ['md','Maiden Name'],['g','Gender'],['dob','Birth Date'],['dod','Death Date'],
     ['loc','Birth Place'],['ph','Phone'],['em','Email'],['prof','Occupation'],
     ['a1','Address'],['ci','City'],['st','State'],['co','Country'],['zp','Zip'],
     ['notes','Notes'],['bio','Bio']
-  ];
-  const diffs = [];
-  for (const [key, label] of fields) {
-    const fVal = (ftls[key]||'').toString().trim();
-    const eVal = (ext[key]||'').toString().trim();
-    if (fVal !== eVal && (fVal || eVal)) {
-      diffs.push({ key, label, ftls: fVal, ext: eVal });
-    }
-  }
-  return diffs;
+  ]);
 }
 
 function normalizeNameText(value) {
@@ -1936,9 +1958,13 @@ async function remapPersonId(oldId, newId, editUser) {
   } catch(e) { console.warn('Could not log remap:', e); }
 }
 
-async function mergeDuplicatePeople(keepId, removeId, editUser, preferSource='keep') {
+async function mergeDuplicatePeople(keepId, removeId, editUser, options={}) {
   if (!isAdmin()) throw new Error('Only admins can merge duplicate people');
   if (!keepId || !removeId || keepId === removeId) throw new Error('Pick two different person IDs to merge');
+
+  const opts = typeof options === 'string' ? { preferSource: options } : (options || {});
+  const preferSource = opts.preferSource || 'keep';
+  const fieldSelections = opts.fieldSelections || {};
 
   const keepRows = await sbFetch(`persons?id=eq.${keepId}&select=*`);
   const removeRows = await sbFetch(`persons?id=eq.${removeId}&select=*`);
@@ -1947,29 +1973,39 @@ async function mergeDuplicatePeople(keepId, removeId, editUser, preferSource='ke
   if (!keepRow) throw new Error('Keep record ' + keepId + ' not found');
   if (!removeRow) throw new Error('Duplicate record ' + removeId + ' not found');
 
-  const merged = { ...keepRow };
-  const skipMerge = new Set(['id', 'created_at', 'updated_at']);
-  for (const key of Object.keys(removeRow)) {
-    if (skipMerge.has(key)) continue;
-    const keepVal = keepRow[key];
-    const removeVal = removeRow[key];
-    if (Array.isArray(keepVal) || Array.isArray(removeVal)) continue;
-    const keepEmpty = keepVal === null || keepVal === undefined || String(keepVal).trim() === '';
-    const removeEmpty = removeVal === null || removeVal === undefined || String(removeVal).trim() === '';
+  const keepPerson = personRowToTreePerson(keepRow);
+  const removePerson = personRowToTreePerson(removeRow);
+  const merged = { ...keepPerson, id: keepId };
+  const allKeys = new Set(PERSON_DIFF_FIELDS.map(([key]) => key));
+
+  for (const key of allKeys) {
+    const selectedSource = fieldSelections[key];
+    if (selectedSource === 'keep') {
+      merged[key] = keepPerson[key];
+      continue;
+    }
+    if (selectedSource === 'remove') {
+      merged[key] = removePerson[key];
+      continue;
+    }
+    const keepVal = keepPerson[key];
+    const removeVal = removePerson[key];
+    const keepEmpty = keepVal === null || keepVal === undefined || keepVal === '';
+    const removeEmpty = removeVal === null || removeVal === undefined || removeVal === '';
     if (preferSource === 'remove') {
       merged[key] = !removeEmpty ? removeVal : keepVal;
     } else if (keepEmpty && !removeEmpty) {
       merged[key] = removeVal;
     }
   }
-  if (!merged.primary_family_id && removeRow.primary_family_id) merged.primary_family_id = removeRow.primary_family_id;
-  merged.updated_by = editUser || 'GEDCOM duplicate merge';
 
-  await sbFetch(`persons?id=eq.${keepId}`, {
-    method: 'PATCH',
-    body: JSON.stringify(merged),
-    headers: { 'Prefer': 'return=minimal' }
-  });
+  if (!merged.primaryFamId && removePerson.primaryFamId) merged.primaryFamId = removePerson.primaryFamId;
+  merged.dec = !!merged.dec;
+  if (!merged.dn || (!fieldSelections.dn && (fieldSelections.fn || fieldSelections.mn || fieldSelections.ln))) {
+    merged.dn = ((merged.fn||'') + (merged.mn ? ' ' + merged.mn : '') + (merged.ln ? ' ' + merged.ln : '')).trim() || merged.nk || '(Unknown)';
+  }
+
+  await savePerson(merged, editUser || 'GEDCOM duplicate merge');
 
   const famsH = await sbFetch(`families?husband_id=eq.${removeId}&select=id`);
   for (const f of famsH) {
@@ -2067,6 +2103,7 @@ async function mergeDuplicatePeople(keepId, removeId, editUser, preferSource='ke
           kept_id: keepId,
           removed_id: removeId,
           prefer_source: preferSource,
+          field_selections: fieldSelections,
           kept_name: keepRow.display_name || keepId,
           removed_name: removeRow.display_name || removeId
         }
@@ -6323,6 +6360,189 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
 }
 
 /* ───── MOVE BRANCH MODAL ───── */
+function DuplicateResolveModal({ orphanPerson, candidatePerson, candidateMeta, personMap, familyMap, initialKeepId, onConfirm, onBack, onClose, busy }) {
+  const [keepId, setKeepId] = useState(initialKeepId || candidatePerson.id);
+  const [defaultSource, setDefaultSource] = useState(initialKeepId === orphanPerson.id ? 'orphan' : 'existing');
+  const [fieldSource, setFieldSource] = useState({});
+
+  const duplicateDiffs = useMemo(() => diffPersonFields(candidatePerson, orphanPerson), [candidatePerson, orphanPerson]);
+  const relatedFamilies = useMemo(() => {
+    const items = [];
+    for (const [fid, fam] of Object.entries(familyMap)) {
+      const kids = fam.children || [];
+      const hid = fam.husband_id || '';
+      const wid = fam.wife_id || '';
+      if (!kids.includes(candidatePerson.id) && hid !== candidatePerson.id && wid !== candidatePerson.id) continue;
+      const hName = hid && personMap[hid] ? personMap[hid].dn : '';
+      const wName = wid && personMap[wid] ? personMap[wid].dn : '';
+      items.push({
+        id: fid,
+        label: [hName, wName].filter(Boolean).join(' & ') || fid,
+        role: kids.includes(candidatePerson.id) ? 'child in parent family' : 'spouse in family',
+        kidCount: kids.length
+      });
+    }
+    return items;
+  }, [candidatePerson.id, familyMap, personMap]);
+
+  const getUiSource = (key) => fieldSource[key] || defaultSource;
+  const mapUiSourceToMergeSource = (source) => {
+    if (source === 'existing') return keepId === candidatePerson.id ? 'keep' : 'remove';
+    return keepId === orphanPerson.id ? 'keep' : 'remove';
+  };
+
+  const handleConfirm = () => {
+    const removeId = keepId === candidatePerson.id ? orphanPerson.id : candidatePerson.id;
+    const selections = {};
+    duplicateDiffs.forEach(d => {
+      selections[d.key] = mapUiSourceToMergeSource(getUiSource(d.key));
+    });
+    onConfirm({
+      keepId,
+      removeId,
+      preferSource: mapUiSourceToMergeSource(defaultSource),
+      fieldSelections: selections
+    });
+  };
+
+  const pickerBtn = (active, accent=MC) => ({
+    padding:'6px 10px',
+    borderRadius:6,
+    cursor:'pointer',
+    fontSize:11,
+    border:'1px solid ' + (active ? accent : BR),
+    background: active ? 'rgba(107,158,114,0.14)' : 'rgba(255,255,255,0.03)',
+    color: active ? accent : DM
+  });
+
+  return (
+    <div style={{ position:'fixed', inset:0, zIndex:210, display:'flex', alignItems:'center', justifyContent:'center' }}>
+      <div style={{ position:'absolute', inset:0, background:'rgba(0,0,0,0.88)' }} onClick={onClose} />
+      <div style={{ position:'relative', background:'#141410', border:'1px solid '+GD, borderRadius:12, width:Math.min(920, window.innerWidth-32), maxHeight:'90vh', overflow:'hidden', display:'flex', flexDirection:'column', zIndex:211 }}>
+        <div style={{ padding:'16px 20px', borderBottom:'1px solid '+BR, display:'flex', alignItems:'center', justifyContent:'space-between' }}>
+          <div>
+            <div style={{ fontSize:18, color:GC, fontWeight:500 }}>🧬 Review Duplicate Before Merge</div>
+            <div style={{ fontSize:12, color:DM, marginTop:4 }}>
+              {candidateMeta?.score ? `Match score ${candidateMeta.score} · ` : ''}Choose the final ID and which values to keep for each field.
+            </div>
+          </div>
+          <span onClick={onClose} style={{ fontSize:20, color:DM, cursor:'pointer' }}>✕</span>
+        </div>
+
+        <div style={{ flex:1, overflowY:'auto', padding:20 }}>
+          <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12, marginBottom:16 }}>
+            <div style={{ padding:12, border:'1px solid '+BR, borderRadius:8, background:'rgba(255,255,255,0.02)' }}>
+              <div style={{ fontSize:11, color:DM, textTransform:'uppercase', letterSpacing:1.4, marginBottom:6 }}>Existing FTLS / Tree Record</div>
+              <div style={{ fontSize:15, color:TX }}>{candidatePerson.dn || candidatePerson.fn || candidatePerson.id}</div>
+              <div style={{ fontSize:11, color:DM, marginTop:4 }}>{candidatePerson.id}</div>
+              {relatedFamilies.length > 0 && <div style={{ fontSize:11, color:DM, marginTop:8 }}>{relatedFamilies.length} linked family record{relatedFamilies.length===1?'':'s'}</div>}
+            </div>
+            <div style={{ padding:12, border:'1px solid '+BR, borderRadius:8, background:'rgba(126,184,208,0.05)' }}>
+              <div style={{ fontSize:11, color:DM, textTransform:'uppercase', letterSpacing:1.4, marginBottom:6 }}>Current Orphan / Imported Record</div>
+              <div style={{ fontSize:15, color:TX }}>{orphanPerson.dn || orphanPerson.fn || orphanPerson.id}</div>
+              <div style={{ fontSize:11, color:DM, marginTop:4 }}>{orphanPerson.id}</div>
+              <div style={{ fontSize:11, color:DM, marginTop:8 }}>This is the record currently showing in Tree Health as the orphan.</div>
+            </div>
+          </div>
+
+          <div style={{ marginBottom:16, padding:12, border:'1px solid '+BR, borderRadius:8, background:'rgba(196,163,90,0.05)' }}>
+            <div style={{ fontSize:11, color:DM, textTransform:'uppercase', letterSpacing:1.4, marginBottom:8 }}>Final ID After Merge</div>
+            <div style={{ display:'flex', gap:8, flexWrap:'wrap' }}>
+              <button type="button" onClick={() => setKeepId(candidatePerson.id)} style={pickerBtn(keepId === candidatePerson.id)}>
+                Keep FTLS/tree ID: {candidatePerson.id}
+              </button>
+              <button type="button" onClick={() => setKeepId(orphanPerson.id)} style={pickerBtn(keepId === orphanPerson.id, '#7eb8d0')}>
+                Keep orphan/import ID: {orphanPerson.id}
+              </button>
+            </div>
+            <div style={{ fontSize:11, color:DM, marginTop:8 }}>
+              Family links, media tags, requests, and other references will be repointed to the kept ID automatically.
+            </div>
+          </div>
+
+          <div style={{ marginBottom:16, padding:12, border:'1px solid '+BR, borderRadius:8, background:'rgba(255,255,255,0.02)' }}>
+            <div style={{ fontSize:11, color:DM, textTransform:'uppercase', letterSpacing:1.4, marginBottom:8 }}>Default Field Preference</div>
+            <div style={{ display:'flex', gap:8, flexWrap:'wrap' }}>
+              <button type="button" onClick={() => { setDefaultSource('existing'); setFieldSource({}); }} style={pickerBtn(defaultSource === 'existing')}>
+                Prefer existing FTLS values
+              </button>
+              <button type="button" onClick={() => { setDefaultSource('orphan'); setFieldSource({}); }} style={pickerBtn(defaultSource === 'orphan', '#7eb8d0')}>
+                Prefer orphan / import values
+              </button>
+            </div>
+          </div>
+
+          {relatedFamilies.length > 0 && (
+            <div style={{ marginBottom:16, padding:12, border:'1px solid '+BR, borderRadius:8, background:'rgba(255,255,255,0.02)' }}>
+              <div style={{ fontSize:11, color:DM, textTransform:'uppercase', letterSpacing:1.4, marginBottom:8 }}>Existing Family Context</div>
+              {relatedFamilies.map(f => (
+                <div key={f.id} style={{ fontSize:12, color:TX, marginTop:6 }}>
+                  {f.label} <span style={{ color:DM }}>· {f.role} · {f.kidCount} children · {f.id}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {duplicateDiffs.length > 0 ? (
+            <table style={{ width:'100%', borderCollapse:'collapse', fontSize:12 }}>
+              <thead>
+                <tr>
+                  <th style={{ textAlign:'left', color:DM, padding:'6px 8px', width:150 }}>Choose</th>
+                  <th style={{ textAlign:'left', color:DM, padding:'6px 8px', width:140 }}>Field</th>
+                  <th style={{ textAlign:'left', color:GC, padding:'6px 8px' }}>Existing FTLS</th>
+                  <th style={{ textAlign:'left', color:'#7eb8d0', padding:'6px 8px' }}>Orphan / Import</th>
+                </tr>
+              </thead>
+              <tbody>
+                {duplicateDiffs.map(d => {
+                  const source = getUiSource(d.key);
+                  return (
+                    <tr key={d.key} style={{ borderTop:'1px solid rgba(196,163,90,0.06)' }}>
+                      <td style={{ padding:'6px 8px' }}>
+                        <div style={{ display:'inline-flex', gap:1, fontSize:11 }}>
+                          <span onClick={() => setFieldSource(prev => ({ ...prev, [d.key]: 'existing' }))}
+                            style={{ padding:'2px 8px', borderRadius:'4px 0 0 4px', cursor:'pointer', background: source === 'existing' ? 'rgba(107,158,114,0.25)' : 'rgba(255,255,255,0.04)', border:'1px solid '+(source === 'existing' ? MC : 'rgba(255,255,255,0.1)'), color: source === 'existing' ? MC : DM }}>
+                            Use FTLS
+                          </span>
+                          <span onClick={() => setFieldSource(prev => ({ ...prev, [d.key]: 'orphan' }))}
+                            style={{ padding:'2px 8px', borderRadius:'0 4px 4px 0', cursor:'pointer', background: source === 'orphan' ? 'rgba(126,184,208,0.18)' : 'rgba(255,255,255,0.04)', border:'1px solid '+(source === 'orphan' ? '#7eb8d0' : 'rgba(255,255,255,0.1)'), color: source === 'orphan' ? '#7eb8d0' : DM }}>
+                            Use Orphan
+                          </span>
+                        </div>
+                      </td>
+                      <td style={{ padding:'6px 8px', color:DM }}>{d.label}</td>
+                      <td style={{ padding:'6px 8px', color:TX, background: source === 'existing' ? 'rgba(107,158,114,0.06)' : 'transparent', whiteSpace:'pre-wrap', wordBreak:'break-word' }}>{d.ftls || '(empty)'}</td>
+                      <td style={{ padding:'6px 8px', color:'#8ec496', background: source === 'orphan' ? 'rgba(126,184,208,0.08)' : 'transparent', whiteSpace:'pre-wrap', wordBreak:'break-word' }}>{d.ext || '(empty)'}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          ) : (
+            <div style={{ padding:12, border:'1px solid '+BR, borderRadius:8, background:'rgba(255,255,255,0.02)', color:DM, fontSize:12 }}>
+              No field differences were found. You can still pick which ID to keep and merge the duplicate references.
+            </div>
+          )}
+        </div>
+
+        <div style={{ padding:'14px 20px', borderTop:'1px solid '+BR, display:'flex', justifyContent:'space-between', gap:10 }}>
+          <div style={{ fontSize:11, color:DM, lineHeight:1.6 }}>
+            Final kept ID: <span style={{ color:TX }}>{keepId}</span>
+          </div>
+          <div style={{ display:'flex', gap:10 }}>
+            <button onClick={onBack} style={{ background:'transparent', border:'1px solid '+BR, color:DM, padding:'8px 14px', borderRadius:6, cursor:'pointer', fontSize:13 }}>Back</button>
+            <button onClick={onClose} style={{ background:'transparent', border:'1px solid '+BR, color:DM, padding:'8px 14px', borderRadius:6, cursor:'pointer', fontSize:13 }}>Cancel</button>
+            <button disabled={busy} onClick={handleConfirm}
+              style={{ background:'rgba(107,158,114,0.15)', border:'1px solid '+MC, color:MC, padding:'8px 18px', borderRadius:6, cursor:'pointer', fontSize:13 }}>
+              {busy ? 'Reconciling...' : 'Merge Duplicate'}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function MoveBranchModal({ node, personMap, familyMap, flat, tree, user, onMove, onRequestMove, onResolveDuplicate, onClose }) {
   const [targetSearch, setTargetSearch] = useState('');
   const [selectedTarget, setSelectedTarget] = useState(null);
@@ -6332,29 +6552,31 @@ function MoveBranchModal({ node, personMap, familyMap, flat, tree, user, onMove,
   const [error, setError] = useState('');
   const [ignoredDuplicateIds, setIgnoredDuplicateIds] = useState([]);
   const [showManualPlacement, setShowManualPlacement] = useState(false);
+  const [duplicateReview, setDuplicateReview] = useState(null);
+  const nodePerson = personMap[node.id] || node;
 
   // Find current parent family (the family this person is a child of)
   const currentFamily = useMemo(() => {
     for (const [fid, fam] of Object.entries(familyMap)) {
       const kids = fam.children || [];
-      if (kids.includes(node.id)) {
+      if (kids.includes(nodePerson.id)) {
         const hName = fam.husband_id && personMap[fam.husband_id] ? personMap[fam.husband_id].dn : '';
         const wName = fam.wife_id && personMap[fam.wife_id] ? personMap[fam.wife_id].dn : '';
         return { id: fid, husband: hName, wife: wName, label: [hName, wName].filter(Boolean).join(' & ') || fid };
       }
     }
     return null;
-  }, [node.id, familyMap, personMap]);
+  }, [nodePerson.id, familyMap, personMap]);
 
   // Search for target parent
   const searchResults = useMemo(() => {
     if (!targetSearch || targetSearch.length < 2) return [];
     const q = targetSearch.toLowerCase();
-    return flat.filter(p => 
-      p.id !== node.id && 
+    return flat.filter(p =>
+      p.id !== nodePerson.id &&
       (p.dn||'').toLowerCase().includes(q)
     ).slice(0, 8);
-  }, [targetSearch, flat, node.id]);
+  }, [targetSearch, flat, nodePerson.id]);
 
   // When a target person is selected, find their families (where they are husband or wife)
   const targetFamilies = useMemo(() => {
@@ -6419,9 +6641,9 @@ function MoveBranchModal({ node, personMap, familyMap, flat, tree, user, onMove,
     setBusy(true); setError('');
     try {
       if (isAdmin) {
-        await onMove(node.id, currentFamily?.id || null, selectedFamily.id);
+        await onMove(nodePerson.id, currentFamily?.id || null, selectedFamily.id);
       } else {
-        await onRequestMove(node.id, node.dn, currentFamily || { id: null, label: '(orphan — no family)' }, selectedFamily, reason);
+        await onRequestMove(nodePerson.id, nodePerson.dn, currentFamily || { id: null, label: '(orphan — no family)' }, selectedFamily, reason);
       }
       onClose();
     } catch (e) {
@@ -6430,12 +6652,12 @@ function MoveBranchModal({ node, personMap, familyMap, flat, tree, user, onMove,
     }
   };
 
-  const resolveDuplicate = async (keepId, removeId, preferSource) => {
+  const resolveDuplicate = async ({ keepId, removeId, preferSource, fieldSelections }) => {
     if (!onResolveDuplicate) return;
     setBusy(true);
     setError('');
     try {
-      await onResolveDuplicate(keepId, removeId, preferSource);
+      await onResolveDuplicate(keepId, removeId, { preferSource, fieldSelections });
       onClose();
     } catch (e) {
       setError(e.message || 'Duplicate resolution failed');
@@ -6445,21 +6667,42 @@ function MoveBranchModal({ node, personMap, familyMap, flat, tree, user, onMove,
 
   const duplicateKeepId = (candidateId, mode) => {
     if (mode === 'gedcom') {
-      if (isLikelyGedcomPersonId(node.id) && !isLikelyGedcomPersonId(candidateId)) return node.id;
-      if (isLikelyGedcomPersonId(candidateId) && !isLikelyGedcomPersonId(node.id)) return candidateId;
-      return node.id;
+      if (isLikelyGedcomPersonId(nodePerson.id) && !isLikelyGedcomPersonId(candidateId)) return nodePerson.id;
+      if (isLikelyGedcomPersonId(candidateId) && !isLikelyGedcomPersonId(nodePerson.id)) return candidateId;
+      return nodePerson.id;
     }
     if (mode === 'merge') {
       const candidate = duplicateCandidates.find(c => c.id === candidateId);
       if (candidate && candidate.status !== 'orphan') return candidateId;
-      if (isLikelyGedcomPersonId(node.id) && !isLikelyGedcomPersonId(candidateId)) return node.id;
-      if (isLikelyGedcomPersonId(candidateId) && !isLikelyGedcomPersonId(node.id)) return candidateId;
-      return node.id;
+      if (isLikelyGedcomPersonId(nodePerson.id) && !isLikelyGedcomPersonId(candidateId)) return nodePerson.id;
+      if (isLikelyGedcomPersonId(candidateId) && !isLikelyGedcomPersonId(nodePerson.id)) return candidateId;
+      return nodePerson.id;
     }
-    return node.id;
+    return nodePerson.id;
   };
 
   const showDuplicateWorkflow = isOrphan && duplicateCandidates.length > 0 && !showManualPlacement;
+
+  if (duplicateReview) {
+    const candidateMeta = duplicateCandidates.find(c => c.id === duplicateReview.candidateId);
+    const candidatePerson = personMap[duplicateReview.candidateId];
+    if (candidateMeta && candidatePerson) {
+      return (
+        <DuplicateResolveModal
+          orphanPerson={nodePerson}
+          candidatePerson={candidatePerson}
+          candidateMeta={candidateMeta}
+          personMap={personMap}
+          familyMap={familyMap}
+          initialKeepId={duplicateReview.initialKeepId}
+          busy={busy}
+          onBack={() => setDuplicateReview(null)}
+          onClose={onClose}
+          onConfirm={resolveDuplicate}
+        />
+      );
+    }
+  }
 
   return (
     <div style={{ position:'fixed', inset:0, zIndex:200, display:'flex', alignItems:'center', justifyContent:'center' }}>
@@ -6472,8 +6715,8 @@ function MoveBranchModal({ node, personMap, familyMap, flat, tree, user, onMove,
 
         {/* Person being moved */}
         <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:20, padding:10, background:'rgba(196,163,90,0.06)', borderRadius:8, border:'1px solid '+BR }}>
-          <span style={{ width:10, height:10, borderRadius:'50%', background: node.g==='M'?MC:FC }} />
-          <span style={{ color:TX, fontSize:15, fontWeight:500 }}>{node.dn}</span>
+          <span style={{ width:10, height:10, borderRadius:'50%', background: nodePerson.g==='M'?MC:FC }} />
+          <span style={{ color:TX, fontSize:15, fontWeight:500 }}>{nodePerson.dn}</span>
         </div>
 
         {/* FROM */}
@@ -6503,9 +6746,7 @@ function MoveBranchModal({ node, personMap, familyMap, flat, tree, user, onMove,
               </div>
               {duplicateCandidates.map(c => {
                 const keepGedcomId = duplicateKeepId(c.id, 'gedcom');
-                const removeForGedcom = keepGedcomId === node.id ? c.id : node.id;
                 const keepMergeId = duplicateKeepId(c.id, 'merge');
-                const removeForMerge = keepMergeId === node.id ? c.id : node.id;
                 return (
                   <div key={c.id} style={{ marginTop:8, padding:10, background:'rgba(255,255,255,0.02)', border:'1px solid '+BR, borderRadius:8 }}>
                     <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', gap:10 }}>
@@ -6514,11 +6755,11 @@ function MoveBranchModal({ node, personMap, familyMap, flat, tree, user, onMove,
                         <div style={{ color:DM, fontSize:10, marginTop:2 }}>{c.id} · score {c.score} · {c.status}</div>
                       </div>
                       <div style={{ display:'flex', gap:6, flexWrap:'wrap', justifyContent:'flex-end' }}>
-                        <button disabled={busy} onClick={() => resolveDuplicate(keepMergeId, removeForMerge, keepMergeId === node.id ? 'keep' : 'remove')}
+                        <button disabled={busy} onClick={() => setDuplicateReview({ candidateId: c.id, initialKeepId: keepMergeId })}
                           style={{ background:'rgba(107,158,114,0.12)', border:'1px solid rgba(107,158,114,0.3)', color:MC, padding:'4px 10px', borderRadius:5, cursor:'pointer', fontSize:11 }}>
                           Merge
                         </button>
-                        <button disabled={busy} onClick={() => resolveDuplicate(keepGedcomId, removeForGedcom, keepGedcomId === node.id ? 'keep' : 'remove')}
+                        <button disabled={busy} onClick={() => setDuplicateReview({ candidateId: c.id, initialKeepId: keepGedcomId })}
                           style={{ background:'rgba(126,184,208,0.12)', border:'1px solid rgba(126,184,208,0.3)', color:'#7eb8d0', padding:'4px 10px', borderRadius:5, cursor:'pointer', fontSize:11 }}>
                           Replace with GEDCOM
                         </button>
@@ -6612,9 +6853,9 @@ function MoveBranchModal({ node, personMap, familyMap, flat, tree, user, onMove,
         {canSubmit && (
           <div style={{ padding:10, background:'rgba(196,163,90,0.06)', borderRadius:8, border:'1px solid '+BR, marginBottom:16, fontSize:12, color:DM, lineHeight:1.6 }}>
             {isOrphan ? (<>
-              <strong style={{ color:TX }}>{node.dn}</strong> will be placed as a child of <strong style={{ color:MC }}>{selectedFamily.label}</strong>. They will appear in the tree under that family.
+              <strong style={{ color:TX }}>{nodePerson.dn}</strong> will be placed as a child of <strong style={{ color:MC }}>{selectedFamily.label}</strong>. They will appear in the tree under that family.
             </>) : (<>
-              <strong style={{ color:TX }}>{node.dn}</strong> will move from <strong style={{ color:'#c07a7a' }}>{currentFamily.label}</strong> to <strong style={{ color:MC }}>{selectedFamily.label}</strong>. All descendants will follow.
+              <strong style={{ color:TX }}>{nodePerson.dn}</strong> will move from <strong style={{ color:'#c07a7a' }}>{currentFamily.label}</strong> to <strong style={{ color:MC }}>{selectedFamily.label}</strong>. All descendants will follow.
             </>)}
           </div>
         )}
@@ -6636,8 +6877,8 @@ function MoveBranchModal({ node, personMap, familyMap, flat, tree, user, onMove,
           {isAdmin ? (
             <button onClick={()=>{
               const msg = isOrphan
-                ? `Place ${node.dn} as a child of "${selectedFamily?.label}"?\n\nThis modifies the database immediately.`
-                : `Move ${node.dn} from "${currentFamily?.label}" to "${selectedFamily?.label}"?\n\nThis modifies the database immediately.`;
+                ? `Place ${nodePerson.dn} as a child of "${selectedFamily?.label}"?\n\nThis modifies the database immediately.`
+                : `Move ${nodePerson.dn} from "${currentFamily?.label}" to "${selectedFamily?.label}"?\n\nThis modifies the database immediately.`;
               if(confirm(msg)){
                 handleSubmit();
               }
@@ -7466,8 +7707,8 @@ function App(){
     setTimeout(() => setMsg(''), 3000);
   };
 
-  const handleResolveDuplicate = async (keepId, removeId, preferSource) => {
-    await mergeDuplicatePeople(keepId, removeId, user?.name || user?.email || 'GEDCOM duplicate merge', preferSource || 'keep');
+  const handleResolveDuplicate = async (keepId, removeId, options) => {
+    await mergeDuplicatePeople(keepId, removeId, user?.name || user?.email || 'GEDCOM duplicate merge', options || { preferSource: 'keep' });
     setMovingBranch(null);
     setMsg('Duplicate reconciled — refreshing...');
     await reloadTree(false);
