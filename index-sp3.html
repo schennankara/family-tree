@@ -360,22 +360,33 @@ async function savePerson(person, editUser) {
   // Log edit — only log if something actually changed
   if (Object.keys(diff).length > 0) {
     try {
-      await sbFetch('edit_log', {
-        method: 'POST',
-        headers: { 'Prefer': 'return=minimal' },
-        body: JSON.stringify({ 
-          person_id: person.id, 
-          action: oldRow ? 'update' : 'create', 
-          edited_by: editUser||'', 
-          changes: { 
-            person_name: row.display_name || row.first_name + ' ' + row.last_name,
-            changed_fields: diff, 
-            previous_values: prev 
-          } 
-        })
+      await logEditAction({
+        personId: person.id,
+        action: oldRow ? 'update' : 'create',
+        editedBy: editUser || '',
+        changes: {
+          person_name: row.display_name || row.first_name + ' ' + row.last_name,
+          changed_fields: diff,
+          previous_values: prev
+        }
       });
     } catch(e) { console.warn('Edit log failed:', e); }
   }
+}
+
+async function logEditAction({ personId, familyId, action, editedBy, changes }) {
+  const payload = {
+    action,
+    edited_by: editedBy || '',
+  };
+  if (personId !== undefined) payload.person_id = personId;
+  if (familyId !== undefined) payload.family_id = familyId;
+  if (changes && Object.keys(changes).length > 0) payload.changes = changes;
+  return sbFetch('edit_log', {
+    method: 'POST',
+    headers: { 'Prefer': 'return=minimal' },
+    body: JSON.stringify(payload)
+  });
 }
 
 async function saveFamily(familyId, husbandId, wifeId, children, mdate, mplace) {
@@ -2007,6 +2018,44 @@ async function mergeDuplicatePeople(keepId, removeId, editUser, options={}) {
 
   await savePerson(merged, editUser || 'GEDCOM duplicate merge');
 
+  try {
+    await logEditAction({
+      personId: keepId,
+      action: 'merge_duplicate_person',
+      editedBy: editUser || '',
+      changes: {
+        person_name: merged.dn || keepRow.display_name || keepId,
+        kept_id: keepId,
+        removed_id: removeId,
+        prefer_source: preferSource,
+        field_selections: fieldSelections,
+        kept_name: keepRow.display_name || keepId,
+        removed_name: removeRow.display_name || removeId,
+        kept_before: {
+          display_name: keepRow.display_name || '',
+          first_name: keepRow.first_name || '',
+          last_name: keepRow.last_name || '',
+          gender: keepRow.gender || '',
+          city: keepRow.city || ''
+        },
+        removed_before: {
+          display_name: removeRow.display_name || '',
+          first_name: removeRow.first_name || '',
+          last_name: removeRow.last_name || '',
+          gender: removeRow.gender || '',
+          city: removeRow.city || ''
+        },
+        kept_after: {
+          display_name: merged.dn || '',
+          first_name: merged.fn || '',
+          last_name: merged.ln || '',
+          gender: merged.g || '',
+          city: merged.ci || ''
+        }
+      }
+    });
+  } catch(e) { console.warn('Duplicate merge log failed:', e); }
+
   const famsH = await sbFetch(`families?husband_id=eq.${removeId}&select=id`);
   for (const f of famsH) {
     await sbFetch(`families?id=eq.${f.id}`, {
@@ -2091,26 +2140,6 @@ async function mergeDuplicatePeople(keepId, removeId, editUser, options={}) {
     method: 'DELETE',
     headers: { 'Prefer': 'return=minimal' }
   });
-
-  try {
-    await sbFetch('edit_log', {
-      method: 'POST',
-      body: JSON.stringify({
-        person_id: keepId,
-        action: 'merge_duplicate_person',
-        edited_by: editUser || '',
-        changes: {
-          kept_id: keepId,
-          removed_id: removeId,
-          prefer_source: preferSource,
-          field_selections: fieldSelections,
-          kept_name: keepRow.display_name || keepId,
-          removed_name: removeRow.display_name || removeId
-        }
-      }),
-      headers: { 'Prefer': 'return=minimal' }
-    });
-  } catch(e) { console.warn('Edit log failed:', e); }
 }
 
 // Remap a family ID: change FTLS family ID to match external GEDCOM ID
@@ -5199,6 +5228,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
   const [fuzzyFamResolved, setFuzzyFamResolved] = useState({}); // { extFamId: 'remapped' | 'ignored' }
   const [showAddrOnly, setShowAddrOnly] = useState(false);
   const [showOthers, setShowOthers] = useState(false);
+  const [familyReview, setFamilyReview] = useState(null);
 
   const handleFile = () => {
     const input = document.createElement('input');
@@ -5257,6 +5287,102 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
     if (fo) return fo;
     return changedDir[personId] || null;
   };
+
+  const personResolutionMap = useMemo(() => {
+    const map = {};
+    Object.keys(personMap || {}).forEach(id => { map[id] = id; });
+    if (!diffResult) return map;
+    (diffResult.matched || []).forEach(m => { map[m.id] = m.id; });
+    (diffResult.fuzzyMatched || []).forEach(m => { map[m.extId] = m.ftlsId; });
+    return map;
+  }, [diffResult, personMap]);
+
+  const resolveDbPersonId = useCallback((id) => {
+    if (!id) return null;
+    if (personMap[id]) return id;
+    return personResolutionMap[id] || null;
+  }, [personMap, personResolutionMap]);
+
+  const normalizeExtFamilyForDb = useCallback((fam) => {
+    const resolvedKids = [...new Set((fam.children || []).map(cid => resolveDbPersonId(cid)).filter(Boolean))];
+    return {
+      ...fam,
+      husb: resolveDbPersonId(fam.husb),
+      wife: resolveDbPersonId(fam.wife),
+      children: resolvedKids,
+      mdate: fam.mdate || fam.marriage_date || '',
+      mplace: fam.mplace || fam.marriage_place || ''
+    };
+  }, [resolveDbPersonId]);
+
+  const findFtlsFamilyCandidate = useCallback((extFam) => {
+    if (!extFam || !diffResult) return null;
+    return fuzzyMatchFamily(extFam, familyMap, extPeopleMap, personMap, personResolutionMap);
+  }, [diffResult, familyMap, extPeopleMap, personMap, personResolutionMap]);
+
+  const reconcileExternalFamily = useCallback(async (extFam, ftlsFamId, options={}) => {
+    if (!extFam || !ftlsFamId) throw new Error('Family reconciliation needs both an external family and an FTLS family');
+    const keepMode = options.keepMode || 'ftls';
+    const fieldSelections = options.fieldSelections || {};
+    const editUser = user?.email || user?.name || 'GEDCOM family reconcile';
+    const normalizedFam = normalizeExtFamilyForDb(extFam);
+    let targetId = ftlsFamId;
+
+    if (keepMode === 'external' && ftlsFamId !== extFam.id) {
+      await remapFamilyId(ftlsFamId, extFam.id, editUser);
+      targetId = extFam.id;
+    }
+
+    const currentRows = await sbFetch(`families?id=eq.${targetId}&select=*`);
+    const current = currentRows[0];
+    if (!current) throw new Error('Family ' + targetId + ' not found after reconcile step');
+
+    const patch = {};
+    if (!current.husband_id && normalizedFam.husb) patch.husband_id = normalizedFam.husb;
+    if (!current.wife_id && normalizedFam.wife) patch.wife_id = normalizedFam.wife;
+
+    const currentKids = current.children || [];
+    const mergedKids = [...new Set([...currentKids, ...(normalizedFam.children || [])])];
+    if (mergedKids.length !== currentKids.length) patch.children = mergedKids;
+
+    const pickFamilyFact = (key, currentVal, extVal) => {
+      const source = fieldSelections[key];
+      if (source === 'external') return extVal || currentVal || '';
+      if (source === 'ftls') return currentVal || '';
+      return currentVal || extVal || '';
+    };
+
+    const nextMdate = pickFamilyFact('mdate', current.marriage_date || '', normalizedFam.mdate || '');
+    const nextMplace = pickFamilyFact('mplace', current.marriage_place || '', normalizedFam.mplace || '');
+    if (nextMdate !== (current.marriage_date || '')) patch.marriage_date = nextMdate;
+    if (nextMplace !== (current.marriage_place || '')) patch.marriage_place = nextMplace;
+
+    if (Object.keys(patch).length > 0) {
+      await sbFetch(`families?id=eq.${targetId}`, {
+        method: 'PATCH',
+        body: JSON.stringify(patch),
+        headers: { 'Prefer': 'return=minimal' }
+      });
+    }
+
+    await logEditAction({
+      personId: current.husband_id || current.wife_id || normalizedFam.husb || normalizedFam.wife || null,
+      familyId: targetId,
+      action: 'reconcile_family_duplicate',
+      editedBy: editUser,
+      changes: {
+        family_name: ((personMap[patch.husband_id || current.husband_id]?.dn || extPeopleMap[extFam.husb]?.dn || '—') + ' ⚭ ' + (personMap[patch.wife_id || current.wife_id]?.dn || extPeopleMap[extFam.wife]?.dn || '—')).trim(),
+        kept_family_id: targetId,
+        original_ftls_id: ftlsFamId,
+        external_family_id: extFam.id,
+        keep_mode: keepMode,
+        field_selections: fieldSelections,
+        patch
+      }
+    });
+
+    return { targetId, patch };
+  }, [user, normalizeExtFamilyForDb, personMap, extPeopleMap]);
 
   // Set person-level direction (cascades to all fields that don't have overrides)
   const setPersonDirection = (personId, dir) => {
@@ -5448,13 +5574,31 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
     return { imports, exports, importFams, orphanFams };
   }, [diffResult, extDir, ftlsDir, changedDir, fieldDir, extFamDir, personMap]);
 
+  const orphanFamilyCandidates = useMemo(() => {
+    return basket.orphanFams.map(fam => {
+      if (fuzzyFamResolved[fam.id]) return null;
+      const match = findFtlsFamilyCandidate(fam);
+      return match ? { ext: fam, match } : null;
+    }).filter(Boolean);
+  }, [basket.orphanFams, findFtlsFamilyCandidate, fuzzyFamResolved]);
+
+  const orphanFamilyCandidateMap = useMemo(() => {
+    const map = {};
+    orphanFamilyCandidates.forEach(item => { map[item.ext.id] = item.match; });
+    return map;
+  }, [orphanFamilyCandidates]);
+
+  const repairableOrphanFams = useMemo(() => {
+    return basket.orphanFams.filter(fam => !orphanFamilyCandidateMap[fam.id]);
+  }, [basket.orphanFams, orphanFamilyCandidateMap]);
+
   // ── REPAIR ORPHAN FAMILIES (standalone — no basket selection needed) ──
-  const repairOrphanFamilies = async () => {
-    if (basket.orphanFams.length === 0) return;
+  const repairOrphanFamilies = async (familiesToRepair=repairableOrphanFams) => {
+    if (familiesToRepair.length === 0) return;
     setMerging(true);
     const log = [];
     let fixed = 0;
-    for (const fam of basket.orphanFams) {
+    for (const fam of familiesToRepair) {
       try {
         const result = await mergeFamilyToDb(fam);
         if (result && !result.skipped) {
@@ -5589,7 +5733,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
     </span>);
   };
 
-  const basketCount = basket.imports.length + basket.importFams.length + basket.exports.length + basket.orphanFams.length;
+  const basketCount = basket.imports.length + basket.importFams.length + basket.exports.length + repairableOrphanFams.length + orphanFamilyCandidates.length;
 
   return (
     <div style={{ position:'fixed', inset:0, zIndex:200, display:'flex', alignItems:'center', justifyContent:'center' }}>
@@ -6103,7 +6247,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
                 {/* Action buttons */}
                 <div style={{ padding:'6px 14px 10px', display:'flex', gap:8, alignItems:'center' }}>
                   {fuzzyResolved[m.extId] === 'remapped' ? (
-                    <span style={{ fontSize:12, color:'#6b9e72' }}>✓ Remapped to {m.extId}</span>
+                    <span style={{ fontSize:12, color:'#6b9e72' }}>✓ ID aligned to {m.extId}</span>
                   ) : fuzzyResolved[m.extId] === 'ignored' ? (
                     <span style={{ fontSize:12, color:DM }}>— Ignored</span>
                   ) : (<>
@@ -6118,13 +6262,13 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
                         setMergeLog(prev => [...prev, '✗ Remap failed for ' + (m.ext.dn||'?') + ': ' + e.message]);
                       }
                     }} style={{ background:'rgba(126,184,208,0.12)', border:'1px solid rgba(126,184,208,0.3)', color:'#7eb8d0', padding:'4px 12px', borderRadius:5, cursor:'pointer', fontSize:11 }}>
-                      🔄 Use External ID
+                      🔄 Keep GEDCOM ID
                     </button>
                     <button onClick={() => setFuzzyResolved(prev => ({...prev, [m.extId]: 'ignored'}))} 
                       style={{ background:'transparent', border:'1px solid '+BR, color:DM, padding:'4px 12px', borderRadius:5, cursor:'pointer', fontSize:11 }}>
                       Ignore
                     </button>
-                    <span style={{ fontSize:10, color:DM }}>Use External ID aligns IDs for future syncs</span>
+                    <span style={{ fontSize:10, color:DM }}>Keeps the GEDCOM/import ID so future syncs match this person</span>
                   </>)}
                 </div>
               </div>))}
@@ -6165,7 +6309,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
                   </div>
                   <div style={{ padding:'0 14px 10px', display:'flex', gap:8, alignItems:'center' }}>
                     <span style={{ fontSize:10, color:DM }}>
-                      Review-only for now: the external GEDCOM ID already exists in FTLS, so automatic "Use External ID" remap is not offered here.
+                      Review-only for now: the GEDCOM/import ID already exists in FTLS, so an automatic ID-alignment action is not offered here.
                     </span>
                   </div>
                 </div>))}
@@ -6177,7 +6321,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
                   <div style={{ fontSize:13, color:'#7eb8d0', fontWeight:500, marginBottom:4 }}>📎 Family ID Mismatches ({diffResult.fuzzyMatchedFamilies.length})</div>
                   <div style={{ fontSize:12, color:DM, lineHeight:1.5 }}>
                     These families have different IDs but the same husband/wife. They represent the same family unit in both systems.
-                    Use "Use External ID" to align the FTLS family ID with the GEDCOM, so future imports won't create duplicates.
+                    Review them here, then choose whether to keep the FTLS family ID or the GEDCOM family ID so future imports stay aligned.
                   </div>
                 </div>
                 {diffResult.fuzzyMatchedFamilies.map(m => {
@@ -6225,28 +6369,19 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
                     </div>
                     <div style={{ padding:'6px 14px 10px', display:'flex', gap:8, alignItems:'center' }}>
                       {fuzzyFamResolved[m.extId] === 'remapped' ? (
-                        <span style={{ fontSize:12, color:'#6b9e72' }}>✓ Remapped to {m.extId}</span>
+                        <span style={{ fontSize:12, color:'#6b9e72' }}>✓ Reconciled to {m.extId}</span>
                       ) : fuzzyFamResolved[m.extId] === 'ignored' ? (
                         <span style={{ fontSize:12, color:DM }}>— Ignored</span>
                       ) : (<>
-                        <button onClick={async () => {
-                          if (!confirm(`This will change the FTLS family ID from ${m.ftlsId} to ${m.extId}.\n\nThis ensures future GEDCOM imports from Rolson match this family correctly.\n\nContinue?`)) return;
-                          try {
-                            await remapFamilyId(m.ftlsId, m.extId, user?.email || 'GEDCOM merge');
-                            setFuzzyFamResolved(prev => ({...prev, [m.extId]: 'remapped'}));
-                            setMergeLog(prev => [...prev, '✓ Family remapped: ' + m.ftlsId + ' → ' + m.extId + ' (' + extH + ' ⚭ ' + extW + ')']);
-                          } catch(e) {
-                            alert('Family remap failed: ' + e.message);
-                            setMergeLog(prev => [...prev, '✗ Family remap failed: ' + e.message]);
-                          }
-                        }} style={{ background:'rgba(126,184,208,0.12)', border:'1px solid rgba(126,184,208,0.3)', color:'#7eb8d0', padding:'4px 12px', borderRadius:5, cursor:'pointer', fontSize:11 }}>
-                          🔄 Use External ID
+                        <button onClick={() => setFamilyReview({ extFam: m.ext, ftlsFamId: m.ftlsId, source: 'fuzzy' })}
+                          style={{ background:'rgba(126,184,208,0.12)', border:'1px solid rgba(126,184,208,0.3)', color:'#7eb8d0', padding:'4px 12px', borderRadius:5, cursor:'pointer', fontSize:11 }}>
+                          Review Duplicate
                         </button>
                         <button onClick={() => setFuzzyFamResolved(prev => ({...prev, [m.extId]: 'ignored'}))}
                           style={{ background:'transparent', border:'1px solid '+BR, color:DM, padding:'4px 12px', borderRadius:5, cursor:'pointer', fontSize:11 }}>
                           Ignore
                         </button>
-                        <span style={{ fontSize:10, color:DM }}>Aligns family IDs for future syncs</span>
+                        <span style={{ fontSize:10, color:DM }}>Choose merge, keep FTLS ID, keep GEDCOM ID, or ignore</span>
                       </>)}
                     </div>
                   </div>);
@@ -6256,7 +6391,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
 
             {/* ──── BASKET ──── */}
             {tab==='basket' && (<div style={{ padding:'12px 0' }}>
-              {basket.imports.length===0 && basket.exports.length===0 && basket.importFams.length===0 && basket.orphanFams.length===0 ? (
+              {basket.imports.length===0 && basket.exports.length===0 && basket.importFams.length===0 && repairableOrphanFams.length===0 && orphanFamilyCandidates.length===0 ? (
                 <div style={{ textAlign:'center', padding:'40px 20px', color:DM }}>
                   <div style={{ fontSize:36, marginBottom:12 }}>🧺</div>
                   <div style={{ fontSize:14 }}>Basket is empty</div>
@@ -6264,15 +6399,15 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
                 </div>
               ) : (<>
                 {/* ORPHAN FAMILY REPAIR — shown automatically, no selection needed */}
-                {basket.orphanFams.length > 0 && (<>
+                {repairableOrphanFams.length > 0 && (<>
                   <div style={{ fontSize:13, fontWeight:600, color:'#c49a6c', marginBottom:8, marginTop:8, display:'flex', alignItems:'center', gap:8 }}>
                     🔧 Orphan Family Repair
-                    <span style={{ fontSize:10, fontWeight:400, color:DM }}>({basket.orphanFams.length} families missing from DB)</span>
+                    <span style={{ fontSize:10, fontWeight:400, color:DM }}>({repairableOrphanFams.length} families missing from DB)</span>
                   </div>
                   <div style={{ fontSize:12, color:DM, marginBottom:12, lineHeight:1.6, background:'rgba(196,154,108,0.06)', border:'1px solid rgba(196,154,108,0.15)', borderRadius:6, padding:12 }}>
                     These families exist in the GEDCOM and their members are already in the database, but the family records were never created (likely from a previous import that failed with FK constraint errors). This will create the missing family links.
                   </div>
-                  {basket.orphanFams.map((fam, i) => {
+                  {repairableOrphanFams.map((fam, i) => {
                     const hName = fam.husb ? (extPeopleMap[fam.husb]?.dn || personMap[fam.husb]?.dn || fam.husb) : '—';
                     const wName = fam.wife ? (extPeopleMap[fam.wife]?.dn || personMap[fam.wife]?.dn || fam.wife) : '—';
                     return (<div key={'orf'+i} style={{ ...rowSt, fontSize:12, color:TX, display:'flex', alignItems:'center', gap:8 }}>
@@ -6281,14 +6416,50 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
                   })}
                   <div style={{ marginTop:12, display:'flex', gap:10, alignItems:'center' }}>
                     <button onClick={()=>{
-                      if (confirm(`This will create ${basket.orphanFams.length} missing family records in the database.\n\nThe persons already exist — this just creates the family links (husband/wife/children) that failed to import previously.\n\nContinue?`)) {
-                        repairOrphanFamilies();
+                      if (confirm(`This will create ${repairableOrphanFams.length} missing family records in the database.\n\nThe persons already exist — this just creates the family links (husband/wife/children) that failed to import previously.\n\nContinue?`)) {
+                        repairOrphanFamilies(repairableOrphanFams);
                       }
                     }} disabled={merging} style={{ background:'rgba(196,154,108,0.15)', border:'1px solid rgba(196,154,108,0.5)', color:'#c49a6c', padding:'8px 20px', borderRadius:6, cursor:'pointer', fontSize:13 }}>
-                      {merging ? 'Repairing...' : '🔧 Repair ' + basket.orphanFams.length + ' Orphan Families'}
+                      {merging ? 'Repairing...' : '🔧 Repair ' + repairableOrphanFams.length + ' Orphan Families'}
                     </button>
                     <span style={{ fontSize:10, color:DM }}>⚠ Creates family records in database</span>
                   </div>
+                </>)}
+
+                {orphanFamilyCandidates.length > 0 && (<>
+                  <div style={{ fontSize:13, fontWeight:600, color:'#7eb8d0', marginBottom:8, marginTop:20, display:'flex', alignItems:'center', gap:8 }}>
+                    📎 Duplicate / Out-of-Sync Families Already In FTLS
+                    <span style={{ fontSize:10, fontWeight:400, color:DM }}>({orphanFamilyCandidates.length} likely duplicates)</span>
+                  </div>
+                  <div style={{ fontSize:12, color:DM, marginBottom:12, lineHeight:1.6, background:'rgba(126,184,208,0.06)', border:'1px solid rgba(126,184,208,0.18)', borderRadius:6, padding:12 }}>
+                    These GEDCOM families are missing as family rows under their external IDs, but they already look like an existing FTLS family. Review them here instead of blindly creating another family record.
+                  </div>
+                  {orphanFamilyCandidates.map((item, i) => {
+                    const fam = item.ext;
+                    const match = item.match;
+                    const hName = fam.husb ? (extPeopleMap[fam.husb]?.dn || personMap[fam.husb]?.dn || fam.husb) : '—';
+                    const wName = fam.wife ? (extPeopleMap[fam.wife]?.dn || personMap[fam.wife]?.dn || fam.wife) : '—';
+                    const ftlsFam = familyMap[match.id] || match.family;
+                    const ftlsH = ftlsFam?.husband_id ? (personMap[ftlsFam.husband_id]?.dn || ftlsFam.husband_id) : '—';
+                    const ftlsW = ftlsFam?.wife_id ? (personMap[ftlsFam.wife_id]?.dn || ftlsFam.wife_id) : '—';
+                    return (
+                      <div key={'orfdup'+i} style={{ marginBottom:10, border:'1px solid rgba(126,184,208,0.25)', borderRadius:8, overflow:'hidden' }}>
+                        <div style={{ padding:'10px 14px', background:'rgba(126,184,208,0.04)', display:'flex', alignItems:'center', justifyContent:'space-between', gap:10 }}>
+                          <div>
+                            <div style={{ fontSize:13, color:TX, fontWeight:500 }}>{hName} ⚭ {wName} <span style={{ fontSize:10, color:DM, fontWeight:400 }}>score: {match.score}</span></div>
+                            <div style={{ fontSize:11, color:DM, marginTop:2 }}>FTLS likely match: <span style={{ color:GC }}>{match.id}</span> · GEDCOM/orphan family: <span style={{ color:'#7eb8d0' }}>{fam.id}</span></div>
+                          </div>
+                          <button onClick={() => setFamilyReview({ extFam: fam, ftlsFamId: match.id, source: 'basket' })}
+                            style={{ background:'rgba(126,184,208,0.12)', border:'1px solid rgba(126,184,208,0.3)', color:'#7eb8d0', padding:'4px 12px', borderRadius:5, cursor:'pointer', fontSize:11 }}>
+                            Review Duplicate
+                          </button>
+                        </div>
+                        <div style={{ padding:'8px 14px', fontSize:12, color:DM }}>
+                          FTLS family: {ftlsH} ⚭ {ftlsW} · {(ftlsFam?.children||[]).length} children
+                        </div>
+                      </div>
+                    );
+                  })}
                 </>)}
 
                 {/* IMPORT SECTION */}
@@ -6355,6 +6526,36 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
           </>)}
         </div>
       </div>
+      {familyReview && (() => {
+        const ftlsFam = familyMap[familyReview.ftlsFamId];
+        if (!ftlsFam) return null;
+        return (
+          <FamilyDuplicateReviewModal
+            extFam={familyReview.extFam}
+            ftlsFam={ftlsFam}
+            extPeopleMap={extPeopleMap}
+            personMap={personMap}
+            busy={merging}
+            onClose={() => setFamilyReview(null)}
+            onConfirm={async ({ keepMode, fieldSelections }) => {
+              try {
+                setMerging(true);
+                const result = await reconcileExternalFamily(familyReview.extFam, familyReview.ftlsFamId, { keepMode, fieldSelections });
+                setFuzzyFamResolved(prev => ({ ...prev, [familyReview.extFam.id]: 'remapped' }));
+                const hName = familyReview.extFam.husb ? (extPeopleMap[familyReview.extFam.husb]?.dn || personMap[familyReview.extFam.husb]?.dn || familyReview.extFam.husb) : '—';
+                const wName = familyReview.extFam.wife ? (extPeopleMap[familyReview.extFam.wife]?.dn || personMap[familyReview.extFam.wife]?.dn || familyReview.extFam.wife) : '—';
+                setMergeLog(prev => [...prev, '✓ Family duplicate merged: ' + familyReview.ftlsFamId + ' → ' + result.targetId + ' (' + hName + ' ⚭ ' + wName + ')']);
+                setFamilyReview(null);
+              } catch (e) {
+                alert('Family reconcile failed: ' + e.message);
+                setMergeLog(prev => [...prev, '✗ Family reconcile failed: ' + e.message]);
+              } finally {
+                setMerging(false);
+              }
+            }}
+          />
+        );
+      })()}
     </div>
   );
 }
@@ -6534,9 +6735,166 @@ function DuplicateResolveModal({ orphanPerson, candidatePerson, candidateMeta, p
             <button onClick={onClose} style={{ background:'transparent', border:'1px solid '+BR, color:DM, padding:'8px 14px', borderRadius:6, cursor:'pointer', fontSize:13 }}>Cancel</button>
             <button disabled={busy} onClick={handleConfirm}
               style={{ background:'rgba(107,158,114,0.15)', border:'1px solid '+MC, color:MC, padding:'8px 18px', borderRadius:6, cursor:'pointer', fontSize:13 }}>
-              {busy ? 'Reconciling...' : 'Merge Duplicate'}
+              {busy ? 'Merging...' : 'Merge Duplicate'}
             </button>
           </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function FamilyDuplicateReviewModal({ extFam, ftlsFam, extPeopleMap, personMap, initialKeepMode='ftls', onConfirm, onClose, busy }) {
+  const [keepMode, setKeepMode] = useState(initialKeepMode);
+  const [defaultSource, setDefaultSource] = useState('ftls');
+  const [fieldSource, setFieldSource] = useState({});
+
+  const getFamilyName = (id, isExt=false) => {
+    if (!id) return '—';
+    const p = isExt ? (extPeopleMap[id] || personMap[id]) : personMap[id];
+    return p ? (p.dn || p.fn || id) : id;
+  };
+
+  const extKids = extFam.children || [];
+  const ftlsKids = ftlsFam.children || [];
+  const familyDiffs = [
+    { key: 'mdate', label: 'Marriage Date', ftls: ftlsFam.marriage_date || ftlsFam.mdate || '', ext: extFam.mdate || extFam.marriage_date || '' },
+    { key: 'mplace', label: 'Marriage Place', ftls: ftlsFam.marriage_place || ftlsFam.mplace || '', ext: extFam.mplace || extFam.marriage_place || '' },
+  ].filter(d => (d.ftls || '') !== (d.ext || '') || (d.ftls || d.ext));
+
+  const getUiSource = (key) => fieldSource[key] || defaultSource;
+
+  const handleConfirm = () => {
+    const selections = {};
+    familyDiffs.forEach(d => {
+      selections[d.key] = getUiSource(d.key);
+    });
+    onConfirm({ keepMode, fieldSelections: selections });
+  };
+
+  const pickerBtn = (active, accent=MC) => ({
+    padding:'6px 10px',
+    borderRadius:6,
+    cursor:'pointer',
+    fontSize:11,
+    border:'1px solid ' + (active ? accent : BR),
+    background: active ? 'rgba(107,158,114,0.14)' : 'rgba(255,255,255,0.03)',
+    color: active ? accent : DM
+  });
+
+  return (
+    <div style={{ position:'fixed', inset:0, zIndex:220, display:'flex', alignItems:'center', justifyContent:'center' }}>
+      <div style={{ position:'absolute', inset:0, background:'rgba(0,0,0,0.88)' }} onClick={onClose} />
+      <div style={{ position:'relative', background:'#141410', border:'1px solid '+GD, borderRadius:12, width:Math.min(920, window.innerWidth-32), maxHeight:'90vh', overflow:'hidden', display:'flex', flexDirection:'column', zIndex:221 }}>
+        <div style={{ padding:'16px 20px', borderBottom:'1px solid '+BR, display:'flex', alignItems:'center', justifyContent:'space-between' }}>
+          <div>
+            <div style={{ fontSize:18, color:GC, fontWeight:500 }}>📎 Review Duplicate Before Merge</div>
+            <div style={{ fontSize:12, color:DM, marginTop:4 }}>Choose the final family ID and which family facts to keep, just like the person duplicate review.</div>
+          </div>
+          <span onClick={onClose} style={{ fontSize:20, color:DM, cursor:'pointer' }}>✕</span>
+        </div>
+
+        <div style={{ flex:1, overflowY:'auto', padding:20 }}>
+          <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12, marginBottom:16 }}>
+            <div style={{ padding:12, border:'1px solid '+BR, borderRadius:8, background:'rgba(255,255,255,0.02)' }}>
+              <div style={{ fontSize:11, color:DM, textTransform:'uppercase', letterSpacing:1.4, marginBottom:6 }}>Existing FTLS / Tree Family</div>
+              <div style={{ fontSize:15, color:TX }}>{getFamilyName(ftlsFam.husband_id)} ⚭ {getFamilyName(ftlsFam.wife_id)}</div>
+              <div style={{ fontSize:11, color:DM, marginTop:4 }}>{ftlsFam.id}</div>
+              <div style={{ fontSize:11, color:DM, marginTop:8 }}>{ftlsKids.length} children</div>
+            </div>
+            <div style={{ padding:12, border:'1px solid '+BR, borderRadius:8, background:'rgba(126,184,208,0.05)' }}>
+              <div style={{ fontSize:11, color:DM, textTransform:'uppercase', letterSpacing:1.4, marginBottom:6 }}>Current GEDCOM / Orphan Family</div>
+              <div style={{ fontSize:15, color:TX }}>{getFamilyName(extFam.husb, true)} ⚭ {getFamilyName(extFam.wife, true)}</div>
+              <div style={{ fontSize:11, color:DM, marginTop:4 }}>{extFam.id}</div>
+              <div style={{ fontSize:11, color:DM, marginTop:8 }}>{extKids.length} children</div>
+            </div>
+          </div>
+
+          <div style={{ marginBottom:16, padding:12, border:'1px solid '+BR, borderRadius:8, background:'rgba(196,163,90,0.05)' }}>
+            <div style={{ fontSize:11, color:DM, textTransform:'uppercase', letterSpacing:1.4, marginBottom:8 }}>Final Family ID After Merge</div>
+            <div style={{ display:'flex', gap:8, flexWrap:'wrap' }}>
+              <button type="button" onClick={() => setKeepMode('ftls')} style={pickerBtn(keepMode === 'ftls')}>
+                Keep FTLS/tree ID: {ftlsFam.id}
+              </button>
+              <button type="button" onClick={() => setKeepMode('external')} style={pickerBtn(keepMode === 'external', '#7eb8d0')}>
+                Keep GEDCOM/import ID: {extFam.id}
+              </button>
+            </div>
+          </div>
+
+          <div style={{ marginBottom:16, padding:12, border:'1px solid '+BR, borderRadius:8, background:'rgba(255,255,255,0.02)' }}>
+            <div style={{ fontSize:11, color:DM, textTransform:'uppercase', letterSpacing:1.4, marginBottom:8 }}>Default Field Preference</div>
+            <div style={{ display:'flex', gap:8, flexWrap:'wrap' }}>
+              <button type="button" onClick={() => { setDefaultSource('ftls'); setFieldSource({}); }} style={pickerBtn(defaultSource === 'ftls')}>
+                Prefer existing FTLS values
+              </button>
+              <button type="button" onClick={() => { setDefaultSource('external'); setFieldSource({}); }} style={pickerBtn(defaultSource === 'external', '#7eb8d0')}>
+                Prefer GEDCOM / orphan values
+              </button>
+            </div>
+            <div style={{ fontSize:11, color:DM, marginTop:8 }}>
+              Missing spouse slots and missing children will be filled automatically from the GEDCOM family when possible.
+            </div>
+          </div>
+
+          <div style={{ marginBottom:16, padding:12, border:'1px solid '+BR, borderRadius:8, background:'rgba(255,255,255,0.02)' }}>
+            <div style={{ fontSize:11, color:DM, textTransform:'uppercase', letterSpacing:1.4, marginBottom:8 }}>Children</div>
+            <div style={{ fontSize:12, color:TX, marginBottom:6 }}>
+              FTLS: {ftlsKids.length > 0 ? ftlsKids.map(id => getFamilyName(id)).join(', ') : '(none)'}
+            </div>
+            <div style={{ fontSize:12, color:'#8ec496' }}>
+              External: {extKids.length > 0 ? extKids.map(id => getFamilyName(id, true)).join(', ') : '(none)'}
+            </div>
+          </div>
+
+          {familyDiffs.length > 0 ? (
+            <table style={{ width:'100%', borderCollapse:'collapse', fontSize:12 }}>
+              <thead>
+                <tr>
+                  <th style={{ textAlign:'left', color:DM, padding:'6px 8px', width:150 }}>Choose</th>
+                  <th style={{ textAlign:'left', color:DM, padding:'6px 8px', width:160 }}>Field</th>
+                  <th style={{ textAlign:'left', color:GC, padding:'6px 8px' }}>FTLS</th>
+                  <th style={{ textAlign:'left', color:'#7eb8d0', padding:'6px 8px' }}>External</th>
+                </tr>
+              </thead>
+              <tbody>
+                {familyDiffs.map(d => {
+                  const source = getUiSource(d.key);
+                  return (
+                    <tr key={d.key} style={{ borderTop:'1px solid rgba(196,163,90,0.06)' }}>
+                      <td style={{ padding:'6px 8px' }}>
+                        <div style={{ display:'inline-flex', gap:1, fontSize:11 }}>
+                          <span onClick={() => setFieldSource(prev => ({ ...prev, [d.key]: 'ftls' }))}
+                            style={{ padding:'2px 8px', borderRadius:'4px 0 0 4px', cursor:'pointer', background: source === 'ftls' ? 'rgba(107,158,114,0.25)' : 'rgba(255,255,255,0.04)', border:'1px solid '+(source === 'ftls' ? MC : 'rgba(255,255,255,0.1)'), color: source === 'ftls' ? MC : DM }}>
+                            Use FTLS
+                          </span>
+                          <span onClick={() => setFieldSource(prev => ({ ...prev, [d.key]: 'external' }))}
+                            style={{ padding:'2px 8px', borderRadius:'0 4px 4px 0', cursor:'pointer', background: source === 'external' ? 'rgba(126,184,208,0.18)' : 'rgba(255,255,255,0.04)', border:'1px solid '+(source === 'external' ? '#7eb8d0' : 'rgba(255,255,255,0.1)'), color: source === 'external' ? '#7eb8d0' : DM }}>
+                            Use External
+                          </span>
+                        </div>
+                      </td>
+                      <td style={{ padding:'6px 8px', color:DM }}>{d.label}</td>
+                      <td style={{ padding:'6px 8px', color:TX, background: source === 'ftls' ? 'rgba(107,158,114,0.06)' : 'transparent' }}>{d.ftls || '(empty)'}</td>
+                      <td style={{ padding:'6px 8px', color:'#8ec496', background: source === 'external' ? 'rgba(126,184,208,0.08)' : 'transparent' }}>{d.ext || '(empty)'}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          ) : (
+            <div style={{ padding:12, border:'1px solid '+BR, borderRadius:8, background:'rgba(255,255,255,0.02)', color:DM, fontSize:12 }}>
+              No marriage fact differences were found. This merge will mainly align the family ID and fill any missing children/spouse links.
+            </div>
+          )}
+        </div>
+
+        <div style={{ padding:'14px 20px', borderTop:'1px solid '+BR, display:'flex', justifyContent:'flex-end', gap:10 }}>
+          <button onClick={onClose} style={{ background:'transparent', border:'1px solid '+BR, color:DM, padding:'8px 14px', borderRadius:6, cursor:'pointer', fontSize:13 }}>Cancel</button>
+          <button disabled={busy} onClick={handleConfirm}
+            style={{ background:'rgba(107,158,114,0.15)', border:'1px solid '+MC, color:MC, padding:'8px 18px', borderRadius:6, cursor:'pointer', fontSize:13 }}>
+              {busy ? 'Merging...' : 'Merge Duplicate'}
+          </button>
         </div>
       </div>
     </div>
