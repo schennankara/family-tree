@@ -1308,6 +1308,13 @@ function hasStrongDuplicateNameEvidence(aPerson, bPerson) {
   const a = getNameSignals(aPerson);
   const b = getNameSignals(bPerson);
   const sharedCore = countEquivalentTokens(a.coreTokens, b.coreTokens);
+  const duplicateTokenEquivalent = (left, right) => {
+    if (!left || !right) return false;
+    if (left === right) return true;
+    // For duplicate buckets, only allow near-matches on longer names.
+    if (Math.min(left.length, right.length) < 5) return false;
+    return isOneEditAway(left, right);
+  };
 
   if (a.allKey && b.allKey && a.allKey === b.allKey) return true;
   if (a.coreKey && b.coreKey && a.coreKey === b.coreKey) return true;
@@ -1318,12 +1325,12 @@ function hasStrongDuplicateNameEvidence(aPerson, bPerson) {
     const aTok = a.coreTokens[0] || '';
     const bTok = b.coreTokens[0] || '';
     if (aTok === bTok) return true;
-    if (Math.min(aTok.length, bTok.length) >= 5 && nameTokensEquivalent(aTok, bTok)) return true;
+    if (duplicateTokenEquivalent(aTok, bTok)) return true;
     return false;
   }
 
-  const fnMatch = a.fn && b.fn && nameTokensEquivalent(a.fn, b.fn);
-  const lnMatch = a.ln && b.ln && nameTokensEquivalent(a.ln, b.ln);
+  const fnMatch = a.fn && b.fn && duplicateTokenEquivalent(a.fn, b.fn);
+  const lnMatch = a.ln && b.ln && duplicateTokenEquivalent(a.ln, b.ln);
   if (fnMatch && lnMatch) return true;
 
   return false;
@@ -1338,8 +1345,14 @@ function isStrongDuplicatePersonMatch(aPerson, bPerson, score=0) {
   const a = getNameSignals(aPerson);
   const b = getNameSignals(bPerson);
   const sharedCore = countEquivalentTokens(a.coreTokens, b.coreTokens);
-  const fnMatch = a.fn && b.fn && nameTokensEquivalent(a.fn, b.fn);
-  const lnMatch = a.ln && b.ln && nameTokensEquivalent(a.ln, b.ln);
+  const duplicateTokenEquivalent = (left, right) => {
+    if (!left || !right) return false;
+    if (left === right) return true;
+    if (Math.min(left.length, right.length) < 5) return false;
+    return isOneEditAway(left, right);
+  };
+  const fnMatch = a.fn && b.fn && duplicateTokenEquivalent(a.fn, b.fn);
+  const lnMatch = a.ln && b.ln && duplicateTokenEquivalent(a.ln, b.ln);
   const dobMatch = !!(aPerson.dob && bPerson.dob && aPerson.dob === bPerson.dob);
 
   if (dobMatch) return true;
