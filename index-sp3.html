@@ -34,7 +34,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.7.12';
+    const APP_VERSION = 'v4.7.13';
     const BUILD_DATE = '2026-04-18';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
@@ -1662,22 +1662,33 @@ function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap)
   // This catches cases where an external GEDCOM ID is already in FTLS, but an older
   // FTLS row still exists under a different ID for what is likely the same person.
   //
-  // TIGHTENED RULES (v4.7.12):
-  //   1. Score threshold raised from 42 → 65 (reduces initial-overlap noise in Kerala names)
+  // TIGHTENED RULES (v4.7.13):
+  //   1. Score threshold 65 (reduces initial-overlap noise in Kerala names)
   //   2. Parent-child exclusion: if A is in B's family (or vice versa) they can't be duplicates
   //   3. Gender gate checks FTLS current vs FTLS duplicate (not ext vs dup)
-  //   4. Anchor requirement: for scores < 100, need DOB match, same parent family, or same spouse family
-  //   5. Match reasoning captured for admin context panel
+  //   4. Spouse/children contradiction: if both have spouse families and NONE overlap
+  //      (different spouses, different kids) → different people, skip.
+  //      Siblings with no spouses/kids (placeholder names like Brother 1/2) are allowed through.
+  //   5. Different-parent exclusion: if both have parent families and they differ, skip
+  //      (same name + different parents = cousins/namesakes, not duplicates)
+  //      Exception: one has no parent (orphan/spouse-only) — that's exactly the duplicate pattern
+  //   6. Match reasoning captured for admin context panel
 
   function isParentChildRelation(idA, idB) {
     for (const fam of Object.values(ftlsFamilyMap)) {
       const kids = fam.children || [];
       const hid = fam.husband_id || fam.husb || '';
       const wid = fam.wife_id || fam.wife || '';
-      // A is parent, B is child
       if ((hid === idA || wid === idA) && kids.includes(idB)) return true;
-      // B is parent, A is child
       if ((hid === idB || wid === idB) && kids.includes(idA)) return true;
+    }
+    return false;
+  }
+
+  function areSiblings(idA, idB) {
+    for (const fam of Object.values(ftlsFamilyMap)) {
+      const kids = fam.children || [];
+      if (kids.includes(idA) && kids.includes(idB)) return true;
     }
     return false;
   }
@@ -1690,6 +1701,53 @@ function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap)
       if (hid === personId || wid === personId) fams.push(fid);
     }
     return fams;
+  }
+
+  // Get the spouse ID(s) for a person from their spouse families
+  function getSpouseIds(personId) {
+    const spouses = new Set();
+    for (const fam of Object.values(ftlsFamilyMap)) {
+      const hid = fam.husband_id || fam.husb || '';
+      const wid = fam.wife_id || fam.wife || '';
+      if (hid === personId && wid) spouses.add(wid);
+      if (wid === personId && hid) spouses.add(hid);
+    }
+    return spouses;
+  }
+
+  // Get children across all spouse families
+  function getChildIds(personId) {
+    const children = new Set();
+    for (const fam of Object.values(ftlsFamilyMap)) {
+      const hid = fam.husband_id || fam.husb || '';
+      const wid = fam.wife_id || fam.wife || '';
+      if (hid === personId || wid === personId) {
+        for (const cid of (fam.children || [])) children.add(cid);
+      }
+    }
+    return children;
+  }
+
+  // Check if two people have contradicting family evidence:
+  // both have spouses/children but none overlap → different people
+  function hasContradictingFamilyEvidence(idA, idB) {
+    const spousesA = getSpouseIds(idA);
+    const spousesB = getSpouseIds(idB);
+    const childrenA = getChildIds(idA);
+    const childrenB = getChildIds(idB);
+
+    // If both have spouse families...
+    const bothHaveSpouses = spousesA.size > 0 && spousesB.size > 0;
+    const bothHaveChildren = childrenA.size > 0 && childrenB.size > 0;
+
+    if (bothHaveSpouses || bothHaveChildren) {
+      // Check for ANY overlap in spouses or children
+      const sharedSpouse = [...spousesA].some(s => spousesB.has(s));
+      const sharedChild = [...childrenA].some(c => childrenB.has(c));
+      // If they share nothing — contradicting evidence
+      if (!sharedSpouse && !sharedChild) return true;
+    }
+    return false;
   }
 
   function buildMatchReasons(personA, personB, score) {
@@ -1707,6 +1765,16 @@ function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap)
     if (personA.g && personB.g && personA.g === personB.g) reasons.push('Same gender (' + personA.g + ')');
     if (personA.dob && personB.dob && personA.dob === personB.dob) reasons.push('Same DOB: ' + personA.dob);
     if (personA.nk && personB.nk && normalizeNameToken(personA.nk) === normalizeNameToken(personB.nk)) reasons.push('Nickname match: ' + personA.nk + ' ≈ ' + personB.nk);
+    // Note structural evidence
+    const parentA = findParentFamily(personA.id, ftlsFamilyMap);
+    const parentB = findParentFamily(personB.id, ftlsFamilyMap);
+    if (!parentA && !parentB) reasons.push('Neither has a parent family (both orphan/spouse-only)');
+    else if (!parentA || !parentB) reasons.push('One has no parent family — classic duplicate pattern');
+    else if (sameParentFamily(parentA, parentB)) reasons.push('Same parent family');
+    const spousesA = getSpouseIds(personA.id);
+    const spousesB = getSpouseIds(personB.id);
+    if (spousesA.size === 0 && spousesB.size === 0) reasons.push('Neither has a spouse family');
+    else if (spousesA.size === 0 || spousesB.size === 0) reasons.push('One has no spouse family');
     reasons.push('Fuzzy score: ' + score);
     return reasons;
   }
@@ -1720,36 +1788,36 @@ function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap)
     // Gender gate: check the two FTLS records against each other (not ext vs dup)
     if (match.ftls.g && dup.person.g && match.ftls.g !== dup.person.g) continue;
 
-    // Parent-child exclusion: they cannot be duplicates of each other
+    // Parent-child exclusion
     if (isParentChildRelation(match.id, dup.person.id)) continue;
 
-    // Anchor requirement for moderate scores: need DOB, same parent, or same spouse family
-    if (dup.score < 100) {
-      const dobMatch = !!(match.ftls.dob && dup.person.dob && match.ftls.dob === dup.person.dob);
-      const currentParentFam = findParentFamily(match.id, ftlsFamilyMap);
-      const dupParentFam = findParentFamily(dup.person.id, ftlsFamilyMap);
-      const sameParent = sameParentFamily(currentParentFam, dupParentFam);
-      const currentSpouseFams = findSpouseFamilies(match.id);
-      const dupSpouseFams = findSpouseFamilies(dup.person.id);
-      const sharedSpouseFam = currentSpouseFams.some(f => dupSpouseFams.includes(f));
-      if (!dobMatch && !sameParent && !sharedSpouseFam) continue;
-    }
+    // Spouse/children contradiction: if both have family connections and NONE overlap,
+    // they are almost certainly different people (cousins, namesakes, or distinct siblings)
+    // Ron George (⚭ Neema, kids: Gabby/Ethan) vs Mon George (⚭ Ammini, kids: Robin) → skip
+    // But: Brother 1 vs Brother 2 with no spouses/kids → allowed through (placeholder names)
+    if (hasContradictingFamilyEvidence(match.id, dup.person.id)) continue;
+
+    // Different-parent exclusion: if BOTH have parent families and they differ,
+    // these are cousins/namesakes, not duplicates.
+    // Exception: if one has NO parent (orphan/spouse-only) — that's the classic duplicate pattern
+    // where someone was imported as a spouse stub and also exists as a child elsewhere.
+    const currentParentFam = findParentFamily(match.id, ftlsFamilyMap);
+    const dupParentFam = findParentFamily(dup.person.id, ftlsFamilyMap);
+    if (currentParentFam && dupParentFam && !sameParentFamily(currentParentFam, dupParentFam)) continue;
 
     const pairKey = [match.id, dup.person.id].sort().join('|');
     if (seenDuplicatePairs.has(pairKey)) continue;
     seenDuplicatePairs.add(pairKey);
 
     const diffs = diffPerson(match.ftls, dup.person);
-    const currentParent = findParentFamily(match.id, ftlsFamilyMap);
-    const duplicateParent = findParentFamily(dup.person.id, ftlsFamilyMap);
-    if (!sameParentFamily(currentParent, duplicateParent)) {
-      const currentFamId = currentParent?.familyId || '';
-      const duplicateFamId = duplicateParent?.familyId || '';
+    if (currentParentFam && dupParentFam && !sameParentFamily(currentParentFam, dupParentFam)) {
+      const currentFamId = currentParentFam?.familyId || '';
+      const duplicateFamId = dupParentFam?.familyId || '';
       diffs.push({
         key: '_famc',
         label: 'Parent Family',
-        ftls: currentParent ? parentLabel(currentParent, ftlsPersonMap) + ' (' + currentFamId + ')' : '(none)',
-        ext: duplicateParent ? parentLabel(duplicateParent, ftlsPersonMap) + ' (' + duplicateFamId + ')' : '(none)'
+        ftls: currentParentFam ? parentLabel(currentParentFam, ftlsPersonMap) + ' (' + currentFamId + ')' : '(none)',
+        ext: dupParentFam ? parentLabel(dupParentFam, ftlsPersonMap) + ' (' + duplicateFamId + ')' : '(none)'
       });
     }
 
