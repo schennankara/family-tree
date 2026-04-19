@@ -34,8 +34,8 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.7.11';
-    const BUILD_DATE = '2026-04-16';
+    const APP_VERSION = 'v4.7.12';
+    const BUILD_DATE = '2026-04-18';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
 
@@ -1661,11 +1661,80 @@ function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap)
   // Pass 3b: Duplicate search for exact-ID matches.
   // This catches cases where an external GEDCOM ID is already in FTLS, but an older
   // FTLS row still exists under a different ID for what is likely the same person.
+  //
+  // TIGHTENED RULES (v4.7.12):
+  //   1. Score threshold raised from 42 → 65 (reduces initial-overlap noise in Kerala names)
+  //   2. Parent-child exclusion: if A is in B's family (or vice versa) they can't be duplicates
+  //   3. Gender gate checks FTLS current vs FTLS duplicate (not ext vs dup)
+  //   4. Anchor requirement: for scores < 100, need DOB match, same parent family, or same spouse family
+  //   5. Match reasoning captured for admin context panel
+
+  function isParentChildRelation(idA, idB) {
+    for (const fam of Object.values(ftlsFamilyMap)) {
+      const kids = fam.children || [];
+      const hid = fam.husband_id || fam.husb || '';
+      const wid = fam.wife_id || fam.wife || '';
+      // A is parent, B is child
+      if ((hid === idA || wid === idA) && kids.includes(idB)) return true;
+      // B is parent, A is child
+      if ((hid === idB || wid === idB) && kids.includes(idA)) return true;
+    }
+    return false;
+  }
+
+  function findSpouseFamilies(personId) {
+    const fams = [];
+    for (const [fid, fam] of Object.entries(ftlsFamilyMap)) {
+      const hid = fam.husband_id || fam.husb || '';
+      const wid = fam.wife_id || fam.wife || '';
+      if (hid === personId || wid === personId) fams.push(fid);
+    }
+    return fams;
+  }
+
+  function buildMatchReasons(personA, personB, score) {
+    const reasons = [];
+    const sigA = getNameSignals(personA);
+    const sigB = getNameSignals(personB);
+    if (sigA.allKey && sigB.allKey && sigA.allKey === sigB.allKey) reasons.push('Exact full name match');
+    else if (sigA.coreKey && sigB.coreKey && sigA.coreKey === sigB.coreKey) reasons.push('Core name tokens identical');
+    else {
+      const shared = countEquivalentTokens(sigA.coreTokens, sigB.coreTokens);
+      if (shared >= 2) reasons.push(shared + ' shared core name tokens: ' + sigA.coreTokens.filter(t => sigB.coreTokens.some(bt => nameTokensEquivalent(t, bt))).join(', '));
+      if (sigA.fn && sigB.fn && nameTokensEquivalent(sigA.fn, sigB.fn)) reasons.push('First name match: ' + (personA.fn||'') + ' ≈ ' + (personB.fn||''));
+      if (sigA.ln && sigB.ln && nameTokensEquivalent(sigA.ln, sigB.ln)) reasons.push('Last name match: ' + (personA.ln||'') + ' ≈ ' + (personB.ln||''));
+    }
+    if (personA.g && personB.g && personA.g === personB.g) reasons.push('Same gender (' + personA.g + ')');
+    if (personA.dob && personB.dob && personA.dob === personB.dob) reasons.push('Same DOB: ' + personA.dob);
+    if (personA.nk && personB.nk && normalizeNameToken(personA.nk) === normalizeNameToken(personB.nk)) reasons.push('Nickname match: ' + personA.nk + ' ≈ ' + personB.nk);
+    reasons.push('Fuzzy score: ' + score);
+    return reasons;
+  }
+
   const seenDuplicatePairs = new Set();
   for (const match of results.matched) {
     const duplicateCandidates = Object.values(ftlsPersonMap).filter(p => p.id !== match.id);
     const dup = fuzzyMatchPerson(match.ext, duplicateCandidates);
-    if (!dup || dup.score < 42 || !isStrongDuplicatePersonMatch(match.ext, dup.person, dup.score)) continue;
+    if (!dup || dup.score < 65 || !isStrongDuplicatePersonMatch(match.ext, dup.person, dup.score)) continue;
+
+    // Gender gate: check the two FTLS records against each other (not ext vs dup)
+    if (match.ftls.g && dup.person.g && match.ftls.g !== dup.person.g) continue;
+
+    // Parent-child exclusion: they cannot be duplicates of each other
+    if (isParentChildRelation(match.id, dup.person.id)) continue;
+
+    // Anchor requirement for moderate scores: need DOB, same parent, or same spouse family
+    if (dup.score < 100) {
+      const dobMatch = !!(match.ftls.dob && dup.person.dob && match.ftls.dob === dup.person.dob);
+      const currentParentFam = findParentFamily(match.id, ftlsFamilyMap);
+      const dupParentFam = findParentFamily(dup.person.id, ftlsFamilyMap);
+      const sameParent = sameParentFamily(currentParentFam, dupParentFam);
+      const currentSpouseFams = findSpouseFamilies(match.id);
+      const dupSpouseFams = findSpouseFamilies(dup.person.id);
+      const sharedSpouseFam = currentSpouseFams.some(f => dupSpouseFams.includes(f));
+      if (!dobMatch && !sameParent && !sharedSpouseFam) continue;
+    }
+
     const pairKey = [match.id, dup.person.id].sort().join('|');
     if (seenDuplicatePairs.has(pairKey)) continue;
     seenDuplicatePairs.add(pairKey);
@@ -1684,6 +1753,9 @@ function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap)
       });
     }
 
+    // Build match reasoning for admin context
+    const matchReasons = buildMatchReasons(match.ftls, dup.person, dup.score);
+
     results.duplicateExactMatches.push({
       extId: match.id,
       currentId: match.id,
@@ -1693,6 +1765,7 @@ function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap)
       duplicate: dup.person,
       score: dup.score,
       diffs,
+      matchReasons,
       currentStatus: personRelationStatus(match.id),
       duplicateStatus: personRelationStatus(dup.person.id)
     });
@@ -5290,6 +5363,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
   const [showAddrOnly, setShowAddrOnly] = useState(false);
   const [showOthers, setShowOthers] = useState(false);
   const [familyReview, setFamilyReview] = useState(null);
+  const [ftlsDupReview, setFtlsDupReview] = useState(null); // { currentId, duplicateId, current, duplicate, matchReasons, score }
 
   const handleFile = () => {
     const input = document.createElement('input');
@@ -5380,6 +5454,75 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
     if (!extFam || !diffResult) return null;
     return fuzzyMatchFamily(extFam, familyMap, extPeopleMap, personMap, personResolutionMap);
   }, [diffResult, familyMap, extPeopleMap, personMap, personResolutionMap]);
+
+  // Build rich context for a person: parents, siblings, spouse families, children, lineage path
+  const buildPersonContext = useCallback((personId) => {
+    const p = personMap[personId];
+    if (!p) return null;
+    const ctx = { person: p, parentFamily: null, siblings: [], spouseFamilies: [], lineagePath: [] };
+
+    // Parent family
+    for (const [fid, fam] of Object.entries(familyMap)) {
+      if ((fam.children || []).includes(personId)) {
+        const hid = fam.husband_id || '';
+        const wid = fam.wife_id || '';
+        ctx.parentFamily = {
+          id: fid,
+          father: hid ? (personMap[hid]?.dn || hid) : null,
+          fatherId: hid || null,
+          mother: wid ? (personMap[wid]?.dn || wid) : null,
+          motherId: wid || null
+        };
+        ctx.siblings = (fam.children || []).filter(c => c !== personId).map(c => ({
+          id: c,
+          name: personMap[c]?.dn || c,
+          gender: personMap[c]?.g || ''
+        }));
+        break;
+      }
+    }
+
+    // Spouse families
+    for (const [fid, fam] of Object.entries(familyMap)) {
+      const hid = fam.husband_id || '';
+      const wid = fam.wife_id || '';
+      if (hid === personId || wid === personId) {
+        const spouseId = hid === personId ? wid : hid;
+        ctx.spouseFamilies.push({
+          id: fid,
+          spouseId: spouseId || null,
+          spouseName: spouseId && personMap[spouseId] ? personMap[spouseId].dn : null,
+          children: (fam.children || []).map(c => ({
+            id: c,
+            name: personMap[c]?.dn || c,
+            gender: personMap[c]?.g || ''
+          }))
+        });
+      }
+    }
+
+    // Lineage path: walk up parent chain
+    const path = [{ id: personId, name: p.dn || p.fn || personId }];
+    let curId = personId;
+    let safety = 0;
+    while (safety++ < 15) {
+      let found = false;
+      for (const fam of Object.values(familyMap)) {
+        if ((fam.children || []).includes(curId)) {
+          const pid = fam.husband_id || fam.wife_id || '';
+          if (pid && personMap[pid]) {
+            path.unshift({ id: pid, name: personMap[pid].dn || pid });
+            curId = pid;
+            found = true;
+          }
+          break;
+        }
+      }
+      if (!found) break;
+    }
+    ctx.lineagePath = path;
+    return ctx;
+  }, [personMap, familyMap]);
 
   const reconcileExternalFamily = useCallback(async (extFam, ftlsFamId, options={}) => {
     if (!extFam || !ftlsFamId) throw new Error('Family reconciliation needs both an external family and an FTLS family');
@@ -6340,40 +6483,130 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
                   <div style={{ fontSize:12, color:DM, lineHeight:1.5 }}>
                     These external GEDCOM IDs already exist in FTLS, but another FTLS row also looks like the same person.
                     This usually means an older import created a duplicate before fuzzy matching caught it.
-                    They are shown here so you can review them during merge/diff instead of losing sight of them.
+                    Review each pair and merge if they are truly the same person.
                   </div>
                 </div>
-                {diffResult.duplicateExactMatches.map(m => (<div key={m.currentId + '|' + m.duplicateId} style={{ marginBottom:10, border:'1px solid rgba(208,160,126,0.3)', borderRadius:8, overflow:'hidden' }}>
-                  <div style={{ padding:'10px 14px', background:'rgba(208,160,126,0.04)', display:'flex', alignItems:'center', justifyContent:'space-between' }}>
+                {diffResult.duplicateExactMatches.map(m => {
+                  const isResolved = fuzzyResolved[m.currentId + '|' + m.duplicateId];
+                  const isExpanded = expandedDiffs.has('dup|' + m.currentId + '|' + m.duplicateId);
+                  return (<div key={m.currentId + '|' + m.duplicateId} style={{ marginBottom:10, border:'1px solid rgba(208,160,126,0.3)', borderRadius:8, overflow:'hidden' }}>
+                  <div style={{ padding:'10px 14px', background:'rgba(208,160,126,0.04)', display:'flex', alignItems:'center', justifyContent:'space-between', cursor:'pointer' }}
+                    onClick={() => toggleExpand('dup|' + m.currentId + '|' + m.duplicateId)}>
                     <div>
-                      <div style={{ fontSize:13, color:TX, fontWeight:500 }}>{m.current.dn||m.ext.dn||'?'} <span style={{ fontSize:10, color:DM, fontWeight:400 }}>duplicate score: {m.score}</span></div>
+                      <div style={{ fontSize:13, color:TX, fontWeight:500 }}>{m.current.dn||m.ext.dn||'?'} <span style={{ fontSize:10, color:DM, fontWeight:400 }}>score: {m.score}</span></div>
                       <div style={{ fontSize:11, color:DM, marginTop:2 }}>
-                        External / current FTLS ID: <span style={{ color:'#7eb8d0' }}>{m.currentId}</span> · Possible duplicate FTLS ID: <span style={{ color:GC }}>{m.duplicateId}</span>
+                        Current: <span style={{ color:'#7eb8d0' }}>{m.currentId}</span> · Duplicate: <span style={{ color:GC }}>{m.duplicateId}</span>
                       </div>
                     </div>
-                    <span style={{ fontSize:11, color:'#d0a07e' }}>{m.currentStatus} ↔ {m.duplicateStatus}</span>
+                    <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+                      {isResolved && <span style={{ fontSize:11, color:'#6b9e72' }}>✓ Merged</span>}
+                      <span style={{ fontSize:11, color:'#d0a07e' }}>{m.currentStatus} ↔ {m.duplicateStatus}</span>
+                      <span style={{ color:DM, fontSize:14 }}>{isExpanded ? '▾' : '▸'}</span>
+                    </div>
                   </div>
-                  <div style={{ padding:'0 14px 10px' }}>
-                    <table style={{ width:'100%', borderCollapse:'collapse', fontSize:12 }}>
-                      <thead><tr style={{ borderBottom:'1px solid '+BR }}>
-                        <th style={{ textAlign:'left', padding:'4px 0', color:DM, fontWeight:400, width:'30%' }}>Field</th>
-                        <th style={{ textAlign:'left', padding:'4px 0', color:'#7eb8d0', fontWeight:400, width:'35%' }}>External / Current ID</th>
-                        <th style={{ textAlign:'left', padding:'4px 0', color:GC, fontWeight:400, width:'35%' }}>Other FTLS ID</th>
-                      </tr></thead>
-                      <tbody>{m.diffs.map(d => (<tr key={d.key} style={{ borderBottom:'1px solid rgba(255,255,255,0.03)' }}>
-                        <td style={{ padding:'3px 0', color:DM }}>{d.label}</td>
-                        <td style={{ padding:'3px 0', color:d.ftls?TX:'#5a5548' }}>{d.ftls || '(empty)'}</td>
-                        <td style={{ padding:'3px 0', color:d.ext?GC:'#5a5548' }}>{d.ext || '(empty)'}</td>
-                      </tr>))}</tbody>
-                    </table>
-                    {m.diffs.length === 0 && <div style={{ paddingTop:8, fontSize:11, color:'#6b9e72' }}>✓ These two FTLS rows look identical apart from the ID.</div>}
-                  </div>
-                  <div style={{ padding:'0 14px 10px', display:'flex', gap:8, alignItems:'center' }}>
-                    <span style={{ fontSize:10, color:DM }}>
-                      Review-only for now: the GEDCOM/import ID already exists in FTLS, so an automatic ID-alignment action is not offered here.
-                    </span>
-                  </div>
-                </div>))}
+                  {isExpanded && !isResolved && (<div style={{ padding:'0 14px 10px' }}>
+                    {/* Match reasoning */}
+                    {m.matchReasons && m.matchReasons.length > 0 && (
+                      <div style={{ padding:'8px 10px', marginBottom:10, background:'rgba(196,163,90,0.06)', border:'1px solid rgba(196,163,90,0.15)', borderRadius:6 }}>
+                        <div style={{ fontSize:10, color:'#c4a35a', textTransform:'uppercase', letterSpacing:1.2, marginBottom:4 }}>Why Flagged</div>
+                        {m.matchReasons.map((r, i) => (
+                          <div key={i} style={{ fontSize:11, color:DM, lineHeight:1.6 }}>• {r}</div>
+                        ))}
+                      </div>
+                    )}
+
+                    {/* Side-by-side context cards */}
+                    {(() => {
+                      const ctxA = buildPersonContext(m.currentId);
+                      const ctxB = buildPersonContext(m.duplicateId);
+                      return (
+                        <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:8, marginBottom:10 }}>
+                          {[{ ctx: ctxA, label: 'Current FTLS Record', id: m.currentId, color: '#7eb8d0', person: m.current },
+                            { ctx: ctxB, label: 'Possible Duplicate', id: m.duplicateId, color: GC, person: m.duplicate }].map((side, si) => (
+                            <div key={si} style={{ padding:10, border:'1px solid '+BR, borderRadius:8, background:'rgba(255,255,255,0.02)', fontSize:11 }}>
+                              <div style={{ fontSize:10, color:side.color, textTransform:'uppercase', letterSpacing:1.2, marginBottom:6 }}>{side.label}</div>
+                              <div style={{ color:TX, fontSize:13, fontWeight:500, marginBottom:2 }}>{side.person.dn || '?'}</div>
+                              <div style={{ color:DM, marginBottom:6 }}>{side.id}</div>
+                              {side.person.dob && <div style={{ color:DM }}>Born: <span style={{ color:TX }}>{side.person.dob}</span>{side.person.loc ? ' · ' + side.person.loc : ''}</div>}
+                              {side.person.dod && <div style={{ color:DM }}>Died: <span style={{ color:TX }}>{side.person.dod}</span></div>}
+                              {(side.person.nk) && <div style={{ color:DM }}>Nick: <span style={{ color:TX }}>{side.person.nk}</span></div>}
+                              {(side.person.ci || side.person.co) && <div style={{ color:DM }}>Location: <span style={{ color:TX }}>{[side.person.ci, side.person.st, side.person.co].filter(Boolean).join(', ')}</span></div>}
+                              {side.person.prof && <div style={{ color:DM }}>Occupation: <span style={{ color:TX }}>{side.person.prof}</span></div>}
+                              {side.ctx && side.ctx.parentFamily && (
+                                <div style={{ marginTop:6, paddingTop:6, borderTop:'1px solid rgba(255,255,255,0.05)' }}>
+                                  <div style={{ color:'#c4a35a', fontSize:10, textTransform:'uppercase', letterSpacing:1, marginBottom:2 }}>Parents</div>
+                                  <div style={{ color:TX }}>{side.ctx.parentFamily.father || '?'} & {side.ctx.parentFamily.mother || '?'}</div>
+                                  <div style={{ color:DM, fontSize:10 }}>{side.ctx.parentFamily.id}</div>
+                                </div>
+                              )}
+                              {side.ctx && !side.ctx.parentFamily && (
+                                <div style={{ marginTop:6, paddingTop:6, borderTop:'1px solid rgba(255,255,255,0.05)' }}>
+                                  <div style={{ color:'#c49a6c', fontSize:10 }}>No parent family linked</div>
+                                </div>
+                              )}
+                              {side.ctx && side.ctx.siblings.length > 0 && (
+                                <div style={{ marginTop:4 }}>
+                                  <div style={{ color:DM, fontSize:10 }}>Siblings: <span style={{ color:TX }}>{side.ctx.siblings.map(s => s.name).join(', ')}</span></div>
+                                </div>
+                              )}
+                              {side.ctx && side.ctx.spouseFamilies.length > 0 && (
+                                <div style={{ marginTop:6, paddingTop:6, borderTop:'1px solid rgba(255,255,255,0.05)' }}>
+                                  <div style={{ color:'#c4a35a', fontSize:10, textTransform:'uppercase', letterSpacing:1, marginBottom:2 }}>Spouse & Children</div>
+                                  {side.ctx.spouseFamilies.map(sf => (
+                                    <div key={sf.id} style={{ marginBottom:4 }}>
+                                      <div style={{ color:TX }}>⚭ {sf.spouseName || '(unknown)'}</div>
+                                      {sf.children.length > 0 && <div style={{ color:DM, fontSize:10, marginLeft:10 }}>{sf.children.map(c => c.name).join(', ')}</div>}
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                              {side.ctx && side.ctx.lineagePath.length > 1 && (
+                                <div style={{ marginTop:6, paddingTop:6, borderTop:'1px solid rgba(255,255,255,0.05)' }}>
+                                  <div style={{ color:'#c4a35a', fontSize:10, textTransform:'uppercase', letterSpacing:1, marginBottom:2 }}>Lineage</div>
+                                  <div style={{ color:DM, fontSize:10 }}>{side.ctx.lineagePath.map(l => l.name).join(' → ')}</div>
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      );
+                    })()}
+
+                    {/* Field diff table */}
+                    {m.diffs.length > 0 && (
+                      <table style={{ width:'100%', borderCollapse:'collapse', fontSize:12, marginBottom:10 }}>
+                        <thead><tr style={{ borderBottom:'1px solid '+BR }}>
+                          <th style={{ textAlign:'left', padding:'4px 0', color:DM, fontWeight:400, width:'30%' }}>Field</th>
+                          <th style={{ textAlign:'left', padding:'4px 0', color:'#7eb8d0', fontWeight:400, width:'35%' }}>Current</th>
+                          <th style={{ textAlign:'left', padding:'4px 0', color:GC, fontWeight:400, width:'35%' }}>Duplicate</th>
+                        </tr></thead>
+                        <tbody>{m.diffs.map(d => (<tr key={d.key} style={{ borderBottom:'1px solid rgba(255,255,255,0.03)' }}>
+                          <td style={{ padding:'3px 0', color:DM }}>{d.label}</td>
+                          <td style={{ padding:'3px 0', color:d.ftls?TX:'#5a5548' }}>{d.ftls || '(empty)'}</td>
+                          <td style={{ padding:'3px 0', color:d.ext?GC:'#5a5548' }}>{d.ext || '(empty)'}</td>
+                        </tr>))}</tbody>
+                      </table>
+                    )}
+                    {m.diffs.length === 0 && <div style={{ paddingTop:4, paddingBottom:8, fontSize:11, color:'#6b9e72' }}>✓ These two FTLS rows look identical apart from the ID.</div>}
+
+                    {/* Action buttons */}
+                    <div style={{ display:'flex', gap:8, alignItems:'center', flexWrap:'wrap' }}>
+                      <button onClick={() => setFtlsDupReview({
+                        currentId: m.currentId, duplicateId: m.duplicateId,
+                        current: m.current, duplicate: m.duplicate,
+                        matchReasons: m.matchReasons, score: m.score
+                      })}
+                        style={{ background:'rgba(107,158,114,0.12)', border:'1px solid rgba(107,158,114,0.3)', color:MC, padding:'5px 14px', borderRadius:5, cursor:'pointer', fontSize:11 }}>
+                        🧬 Merge Duplicate
+                      </button>
+                      <button onClick={() => setFuzzyResolved(prev => ({...prev, [m.currentId + '|' + m.duplicateId]: 'ignored'}))}
+                        style={{ background:'transparent', border:'1px solid '+BR, color:DM, padding:'5px 14px', borderRadius:5, cursor:'pointer', fontSize:11 }}>
+                        Not a Duplicate
+                      </button>
+                    </div>
+                  </div>)}
+                </div>);
+                })}
               </>)}
 
               {/* ── FAMILY FUZZY MATCHES ── */}
@@ -6617,18 +6850,59 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
           />
         );
       })()}
+      {ftlsDupReview && (() => {
+        const currentPerson = personMap[ftlsDupReview.currentId];
+        const dupPerson = personMap[ftlsDupReview.duplicateId];
+        if (!currentPerson || !dupPerson) return null;
+        return (
+          <DuplicateResolveModal
+            orphanPerson={dupPerson}
+            candidatePerson={currentPerson}
+            candidateMeta={{ score: ftlsDupReview.score, status: 'duplicate' }}
+            personMap={personMap}
+            familyMap={familyMap}
+            initialKeepId={currentPerson.id}
+            busy={merging}
+            matchReasons={ftlsDupReview.matchReasons}
+            buildPersonContext={buildPersonContext}
+            onBack={() => setFtlsDupReview(null)}
+            onClose={() => setFtlsDupReview(null)}
+            onConfirm={async ({ keepId, removeId, preferSource, fieldSelections }) => {
+              try {
+                setMerging(true);
+                await mergeDuplicatePeople(keepId, removeId, user?.email || 'GEDCOM duplicate merge', { preferSource, fieldSelections });
+                setFuzzyResolved(prev => ({...prev, [ftlsDupReview.currentId + '|' + ftlsDupReview.duplicateId]: 'merged'}));
+                setMergeLog(prev => [...prev, '✓ Duplicate merged: ' + (currentPerson.dn||'?') + ' — kept ' + keepId + ', removed ' + removeId]);
+                setFtlsDupReview(null);
+              } catch(e) {
+                alert('Duplicate merge failed: ' + e.message);
+                setMergeLog(prev => [...prev, '✗ Duplicate merge failed: ' + e.message]);
+              } finally {
+                setMerging(false);
+              }
+            }}
+          />
+        );
+      })()}
     </div>
   );
 }
 
 /* ───── MOVE BRANCH MODAL ───── */
-function DuplicateResolveModal({ orphanPerson, candidatePerson, candidateMeta, personMap, familyMap, initialKeepId, onConfirm, onBack, onClose, busy }) {
+function DuplicateResolveModal({ orphanPerson, candidatePerson, candidateMeta, personMap, familyMap, initialKeepId, matchReasons, buildPersonContext, onConfirm, onBack, onClose, busy }) {
   const [keepId, setKeepId] = useState(initialKeepId || candidatePerson.id);
   const [defaultSource, setDefaultSource] = useState(initialKeepId === orphanPerson.id ? 'orphan' : 'existing');
   const [fieldSource, setFieldSource] = useState({});
 
   const duplicateDiffs = useMemo(() => diffPersonFields(candidatePerson, orphanPerson), [candidatePerson, orphanPerson]);
+
+  // Build context for both sides (if buildPersonContext is available)
+  const candidateCtx = useMemo(() => buildPersonContext ? buildPersonContext(candidatePerson.id) : null, [candidatePerson.id, buildPersonContext]);
+  const orphanCtx = useMemo(() => buildPersonContext ? buildPersonContext(orphanPerson.id) : null, [orphanPerson.id, buildPersonContext]);
+
+  // Fallback: basic related families (used when buildPersonContext is not provided)
   const relatedFamilies = useMemo(() => {
+    if (candidateCtx) return []; // skip when rich context is available
     const items = [];
     for (const [fid, fam] of Object.entries(familyMap)) {
       const kids = fam.children || [];
@@ -6645,7 +6919,7 @@ function DuplicateResolveModal({ orphanPerson, candidatePerson, candidateMeta, p
       });
     }
     return items;
-  }, [candidatePerson.id, familyMap, personMap]);
+  }, [candidatePerson.id, familyMap, personMap, candidateCtx]);
 
   const getUiSource = (key) => fieldSource[key] || defaultSource;
   const mapUiSourceToMergeSource = (source) => {
@@ -6692,19 +6966,82 @@ function DuplicateResolveModal({ orphanPerson, candidatePerson, candidateMeta, p
         </div>
 
         <div style={{ flex:1, overflowY:'auto', padding:20 }}>
+          {/* ── MATCH REASONING ── */}
+          {matchReasons && matchReasons.length > 0 && (
+            <div style={{ padding:'10px 12px', marginBottom:16, background:'rgba(196,163,90,0.06)', border:'1px solid rgba(196,163,90,0.15)', borderRadius:8 }}>
+              <div style={{ fontSize:10, color:'#c4a35a', textTransform:'uppercase', letterSpacing:1.2, marginBottom:4 }}>Why These Were Flagged as Duplicates</div>
+              {matchReasons.map((r, i) => (
+                <div key={i} style={{ fontSize:11, color:DM, lineHeight:1.6 }}>• {r}</div>
+              ))}
+            </div>
+          )}
+
+          {/* ── SIDE-BY-SIDE CONTEXT CARDS ── */}
           <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12, marginBottom:16 }}>
-            <div style={{ padding:12, border:'1px solid '+BR, borderRadius:8, background:'rgba(255,255,255,0.02)' }}>
-              <div style={{ fontSize:11, color:DM, textTransform:'uppercase', letterSpacing:1.4, marginBottom:6 }}>Existing FTLS / Tree Record</div>
-              <div style={{ fontSize:15, color:TX }}>{candidatePerson.dn || candidatePerson.fn || candidatePerson.id}</div>
-              <div style={{ fontSize:11, color:DM, marginTop:4 }}>{candidatePerson.id}</div>
-              {relatedFamilies.length > 0 && <div style={{ fontSize:11, color:DM, marginTop:8 }}>{relatedFamilies.length} linked family record{relatedFamilies.length===1?'':'s'}</div>}
-            </div>
-            <div style={{ padding:12, border:'1px solid '+BR, borderRadius:8, background:'rgba(126,184,208,0.05)' }}>
-              <div style={{ fontSize:11, color:DM, textTransform:'uppercase', letterSpacing:1.4, marginBottom:6 }}>Current Orphan / Imported Record</div>
-              <div style={{ fontSize:15, color:TX }}>{orphanPerson.dn || orphanPerson.fn || orphanPerson.id}</div>
-              <div style={{ fontSize:11, color:DM, marginTop:4 }}>{orphanPerson.id}</div>
-              <div style={{ fontSize:11, color:DM, marginTop:8 }}>This is the record currently showing in Tree Health as the orphan.</div>
-            </div>
+            {[{ person: candidatePerson, ctx: candidateCtx, label: 'Existing FTLS / Tree Record', color: MC, bgAccent: 'rgba(255,255,255,0.02)' },
+              { person: orphanPerson, ctx: orphanCtx, label: 'Duplicate / Orphan / Import', color: '#7eb8d0', bgAccent: 'rgba(126,184,208,0.05)' }].map((side, si) => (
+              <div key={si} style={{ padding:12, border:'1px solid '+BR, borderRadius:8, background:side.bgAccent }}>
+                <div style={{ fontSize:10, color:side.color, textTransform:'uppercase', letterSpacing:1.4, marginBottom:6 }}>{side.label}</div>
+                <div style={{ fontSize:15, color:TX, fontWeight:500 }}>{side.person.dn || side.person.fn || side.person.id}</div>
+                <div style={{ fontSize:11, color:DM, marginTop:4 }}>{side.person.id}</div>
+                {side.person.g && <div style={{ fontSize:11, color:DM, marginTop:4 }}>Gender: <span style={{ color:TX }}>{side.person.g === 'M' ? 'Male' : side.person.g === 'F' ? 'Female' : side.person.g}</span></div>}
+                {side.person.dob && <div style={{ fontSize:11, color:DM }}>Born: <span style={{ color:TX }}>{side.person.dob}</span>{side.person.loc ? ' · ' + side.person.loc : ''}</div>}
+                {side.person.dod && <div style={{ fontSize:11, color:DM }}>Died: <span style={{ color:TX }}>{side.person.dod}</span></div>}
+                {side.person.nk && <div style={{ fontSize:11, color:DM }}>Nickname: <span style={{ color:TX }}>{side.person.nk}</span></div>}
+                {(side.person.ci || side.person.st || side.person.co) && <div style={{ fontSize:11, color:DM }}>Address: <span style={{ color:TX }}>{[side.person.a1, side.person.ci, side.person.st, side.person.co].filter(Boolean).join(', ')}</span></div>}
+                {side.person.prof && <div style={{ fontSize:11, color:DM }}>Occupation: <span style={{ color:TX }}>{side.person.prof}</span></div>}
+
+                {/* Parents */}
+                {side.ctx && side.ctx.parentFamily && (
+                  <div style={{ marginTop:8, paddingTop:8, borderTop:'1px solid rgba(255,255,255,0.06)' }}>
+                    <div style={{ color:'#c4a35a', fontSize:10, textTransform:'uppercase', letterSpacing:1, marginBottom:3 }}>Parents</div>
+                    <div style={{ fontSize:12, color:TX }}>{side.ctx.parentFamily.father || '?'} & {side.ctx.parentFamily.mother || '?'}</div>
+                    <div style={{ fontSize:10, color:DM }}>{side.ctx.parentFamily.id}</div>
+                  </div>
+                )}
+                {side.ctx && !side.ctx.parentFamily && (
+                  <div style={{ marginTop:8, paddingTop:8, borderTop:'1px solid rgba(255,255,255,0.06)' }}>
+                    <div style={{ fontSize:10, color:'#c49a6c' }}>No parent family linked</div>
+                  </div>
+                )}
+
+                {/* Siblings */}
+                {side.ctx && side.ctx.siblings.length > 0 && (
+                  <div style={{ marginTop:4 }}>
+                    <div style={{ fontSize:10, color:DM }}>Siblings: <span style={{ color:TX }}>{side.ctx.siblings.map(s => s.name).join(', ')}</span></div>
+                  </div>
+                )}
+
+                {/* Spouse & Children */}
+                {side.ctx && side.ctx.spouseFamilies.length > 0 && (
+                  <div style={{ marginTop:8, paddingTop:8, borderTop:'1px solid rgba(255,255,255,0.06)' }}>
+                    <div style={{ color:'#c4a35a', fontSize:10, textTransform:'uppercase', letterSpacing:1, marginBottom:3 }}>Spouse & Children</div>
+                    {side.ctx.spouseFamilies.map(sf => (
+                      <div key={sf.id} style={{ marginBottom:4 }}>
+                        <div style={{ fontSize:12, color:TX }}>⚭ {sf.spouseName || '(unknown)'}</div>
+                        {sf.children.length > 0 && <div style={{ fontSize:10, color:DM, marginLeft:12 }}>{sf.children.map(c => c.name).join(', ')}</div>}
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Lineage path */}
+                {side.ctx && side.ctx.lineagePath.length > 1 && (
+                  <div style={{ marginTop:8, paddingTop:8, borderTop:'1px solid rgba(255,255,255,0.06)' }}>
+                    <div style={{ color:'#c4a35a', fontSize:10, textTransform:'uppercase', letterSpacing:1, marginBottom:3 }}>Lineage</div>
+                    <div style={{ fontSize:10, color:DM }}>{side.ctx.lineagePath.map(l => l.name).join(' → ')}</div>
+                  </div>
+                )}
+
+                {/* Fallback: basic linked families count (when no buildPersonContext) */}
+                {!side.ctx && si === 0 && relatedFamilies.length > 0 && (
+                  <div style={{ fontSize:11, color:DM, marginTop:8 }}>{relatedFamilies.length} linked family record{relatedFamilies.length===1?'':'s'}</div>
+                )}
+                {!side.ctx && si === 1 && (
+                  <div style={{ fontSize:11, color:DM, marginTop:8 }}>This is the record to be merged/removed.</div>
+                )}
+              </div>
+            ))}
           </div>
 
           <div style={{ marginBottom:16, padding:12, border:'1px solid '+BR, borderRadius:8, background:'rgba(196,163,90,0.05)' }}>
@@ -6734,7 +7071,7 @@ function DuplicateResolveModal({ orphanPerson, candidatePerson, candidateMeta, p
             </div>
           </div>
 
-          {relatedFamilies.length > 0 && (
+          {relatedFamilies.length > 0 && !candidateCtx && (
             <div style={{ marginBottom:16, padding:12, border:'1px solid '+BR, borderRadius:8, background:'rgba(255,255,255,0.02)' }}>
               <div style={{ fontSize:11, color:DM, textTransform:'uppercase', letterSpacing:1.4, marginBottom:8 }}>Existing Family Context</div>
               {relatedFamilies.map(f => (
