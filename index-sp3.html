@@ -1694,7 +1694,8 @@ function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap)
   //      Siblings with no spouses/kids (placeholder names like Brother 1/2) are allowed through.
   //   5. Different-parent exclusion: if both have parent families and they differ, skip
   //      (same name + different parents = cousins/namesakes, not duplicates)
-  //      Exception: one has no parent (orphan/spouse-only) — that's exactly the duplicate pattern
+  //      When one has no parent (orphan/spouse-only), let through for admin review —
+  //      the context panel shows lineage, spouses, children so admin can decide.
   //   6. Match reasoning captured for admin context panel
 
   function isParentChildRelation(idA, idB) {
@@ -1791,8 +1792,8 @@ function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap)
     // Note structural evidence
     const parentA = findParentFamily(personA.id, ftlsFamilyMap);
     const parentB = findParentFamily(personB.id, ftlsFamilyMap);
-    if (!parentA && !parentB) reasons.push('Neither has a parent family (both orphan/spouse-only)');
-    else if (!parentA || !parentB) reasons.push('One has no parent family — classic duplicate pattern');
+    if (!parentA && !parentB) reasons.push('Neither has a parent family (both disconnected)');
+    else if (!parentA || !parentB) reasons.push('One has no parent family — possible spouse stub');
     else if (sameParentFamily(parentA, parentB)) reasons.push('Same parent family');
     const spousesA = getSpouseIds(personA.id);
     const spousesB = getSpouseIds(personB.id);
@@ -1822,8 +1823,9 @@ function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap)
 
     // Different-parent exclusion: if BOTH have parent families and they differ,
     // these are cousins/namesakes, not duplicates.
-    // Exception: if one has NO parent (orphan/spouse-only) — that's the classic duplicate pattern
-    // where someone was imported as a spouse stub and also exists as a child elsewhere.
+    // When one has NO parent (orphan/spouse-only), let it through for admin review —
+    // this is the classic duplicate pattern (spouse stub + full child record),
+    // and the context panel shows enough info for the admin to decide.
     const currentParentFam = findParentFamily(match.id, ftlsFamilyMap);
     const dupParentFam = findParentFamily(dup.person.id, ftlsFamilyMap);
     if (currentParentFam && dupParentFam && !sameParentFamily(currentParentFam, dupParentFam)) continue;
