@@ -1307,7 +1307,19 @@ function namesEquivalent(aPerson, bPerson) {
 function hasStrongDuplicateNameEvidence(aPerson, bPerson) {
   const a = getNameSignals(aPerson);
   const b = getNameSignals(bPerson);
-  const sharedCore = countEquivalentTokens(a.coreTokens, b.coreTokens);
+  // For duplicate detection, count only EXACT token matches — no fuzzy/edit-distance.
+  // This prevents ron≈mon from counting as a shared token alongside george=george.
+  const countExactSharedTokens = (aToks, bToks) => {
+    if (!aToks.length || !bToks.length) return 0;
+    const used = new Set();
+    let count = 0;
+    for (const at of aToks) {
+      const idx = bToks.findIndex((bt, i) => !used.has(i) && at === bt);
+      if (idx >= 0) { used.add(idx); count++; }
+    }
+    return count;
+  };
+  const sharedCore = countExactSharedTokens(a.coreTokens, b.coreTokens);
   const duplicateTokenEquivalent = (left, right) => {
     if (!left || !right) return false;
     if (left === right) return true;
@@ -1344,7 +1356,18 @@ function isStrongDuplicatePersonMatch(aPerson, bPerson, score=0) {
 
   const a = getNameSignals(aPerson);
   const b = getNameSignals(bPerson);
-  const sharedCore = countEquivalentTokens(a.coreTokens, b.coreTokens);
+  // Same strict exact-only token count as hasStrongDuplicateNameEvidence
+  const countExactSharedTokens = (aToks, bToks) => {
+    if (!aToks.length || !bToks.length) return 0;
+    const used = new Set();
+    let count = 0;
+    for (const at of aToks) {
+      const idx = bToks.findIndex((bt, i) => !used.has(i) && at === bt);
+      if (idx >= 0) { used.add(idx); count++; }
+    }
+    return count;
+  };
+  const sharedCore = countExactSharedTokens(a.coreTokens, b.coreTokens);
   const duplicateTokenEquivalent = (left, right) => {
     if (!left || !right) return false;
     if (left === right) return true;
@@ -3873,7 +3896,7 @@ function TreeHealthTab({ personMap, familyMap, flat, tree, user, onPlaceOrphan }
               .filter(other => other.id !== pid)
               .map(other => {
                 const match = fuzzyMatchPerson(p, [other]);
-                if (!match || match.score < 42 || !isStrongDuplicatePersonMatch(p, other, match.score)) return null;
+                if (!match || match.score < 65 || !isStrongDuplicatePersonMatch(p, other, match.score)) return null;
                 return {
                   id: other.id,
                   dn: other.dn || other.fn || other.id,
