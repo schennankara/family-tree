@@ -662,7 +662,7 @@ async function migrateGedcomToSupabase(gedcomText, onProgress) {
 
   for (const el of elements) {
     if (el.tag === 'INDI' && el.pointer) {
-      let fn='',mn='',ln='',nk='',md='';
+      let fn='',mn='',ln='',nk='',md='',parsedBirthOrder=0;
       const nameEls = el.children.filter(c => c.tag === 'NAME');
       for (const nameEl of nameEls) {
         const typeEl = nameEl.children.find(c => c.tag === 'TYPE');
@@ -674,7 +674,11 @@ async function migrateGedcomToSupabase(gedcomText, onProgress) {
           const givnEl = nameEl.children.find(c => c.tag === 'GIVN');
           const surnEl = nameEl.children.find(c => c.tag === 'SURN');
           const secgEl = nameEl.children.find(c => c.tag === 'SECG');
-          if (givnEl) { let v=givnEl.value.replace(/^\d+\.\s*/,''); const parts=v.split(' '); fn=parts[0]||''; if(parts.length>1&&!mn)mn=parts.slice(1).join(' '); }
+          if (givnEl) { 
+            const boMatch = givnEl.value.match(/^(\d+)\.\s*/);
+            if (boMatch) parsedBirthOrder = parseInt(boMatch[1]);
+            let v=givnEl.value.replace(/^\d+\.\s*/,''); const parts=v.split(' '); fn=parts[0]||''; if(parts.length>1&&!mn)mn=parts.slice(1).join(' '); 
+          }
           if (surnEl) ln = surnEl.value;
           if (secgEl && !mn) mn = secgEl.value;
           if (!fn && !ln) {
@@ -707,7 +711,7 @@ async function migrateGedcomToSupabase(gedcomText, onProgress) {
       persons.push({
         id: el.pointer, first_name: fn, middle_name: mn, last_name: ln,
         display_name: dn, nickname: nk, maiden_name: md, gender: g,
-        date_of_birth: dob, date_of_death: dod, is_deceased: hasDeat || !!dod, birth_order: 0,
+        date_of_birth: dob, date_of_death: dod, is_deceased: hasDeat || !!dod, birth_order: parsedBirthOrder,
         email: gv(el,'EMAI')||gv(el,'EMAIL'), phone: gv(el,'PHON'),
         address1:a1, address2:a2, city:ci, state:st, zip:zp, country:co,
         facebook: gv(el,'_FACEBOOK'), instagram: gv(el,'_INSTAGRAM'),
@@ -739,7 +743,7 @@ async function migrateGedcomToSupabase(gedcomText, onProgress) {
   const pMap = {};
   persons.forEach(p => pMap[p.id] = p);
   families.forEach(f => {
-    (f.children||[]).forEach((cid, i) => { if (pMap[cid]) pMap[cid].birth_order = i + 1; });
+    (f.children||[]).forEach((cid, i) => { if (pMap[cid] && !pMap[cid].birth_order) pMap[cid].birth_order = i + 1; });
   });
 
   onProgress(`Parsed: ${persons.length} persons, ${families.length} families`);
@@ -903,13 +907,21 @@ function MigrateDialog({onDone, onCancel}) {
 function personToGedcomLines(person) {
   const L = [`0 ${person.id} INDI`];
 
-  // Primary NAME
+  // Primary NAME — match MacFamilyTree format:
+  //   1 NAME {bo}. {fn} {mn} /{ln}/
+  //   2 GIVN {bo}. {fn}
+  //   2 SURN {ln}
+  //   2 SECG {mn}
   const fn = person.fn || '', mn = person.mn || '', ln = person.ln || '';
-  const givn = (fn + (mn ? ' ' + mn : '')).trim();
-  const nameStr = ln ? `${givn} /${ln}/` : (givn || person.dn || '(Unknown)');
+  const bo = person.bo || 0;
+  const givnPrefix = bo > 0 ? `${bo}. ` : '';
+  const givn = givnPrefix + fn;
+  const fullGivn = (givn + (mn ? ' ' + mn : '')).trim();
+  const nameStr = ln ? `${fullGivn} /${ln}/` : (fullGivn || person.dn || '(Unknown)');
   L.push(`1 NAME ${nameStr}`);
-  if (fn) L.push(`2 GIVN ${fn}`);
+  if (fn || givnPrefix) L.push(`2 GIVN ${givn.trim()}`);
   if (ln) L.push(`2 SURN ${ln}`);
+  if (mn) L.push(`2 SECG ${mn}`);
 
   // Nickname
   if (person.nk) { L.push(`1 NAME ${person.nk} //`); L.push(`2 TYPE nick`); L.push(`2 GIVN ${person.nk}`); }
@@ -2856,7 +2868,7 @@ function parseIndi(el) {
   const id = el.pointer;
 
   // Primary name
-  let fn = '', mn = '', ln = '', nk = '', md = '';
+  let fn = '', mn = '', ln = '', nk = '', md = '', parsedBirthOrder = 0;
   const nameEls = el.children.filter(c => c.tag === 'NAME');
 
   for (const nameEl of nameEls) {
@@ -2878,6 +2890,8 @@ function parseIndi(el) {
 
       if (givnEl) {
         // Strip leading birth-order number prefix like "4. Samuel" → "Samuel"
+        const boMatch = givnEl.value.match(/^(\d+)\.\s*/);
+        if (boMatch) parsedBirthOrder = parseInt(boMatch[1]);
         fn = givnEl.value.replace(/^\d+\.\s*/, '');
       }
       if (surnEl) ln = surnEl.value;
@@ -2981,7 +2995,7 @@ function parseIndi(el) {
 
   return {
     id, fn, mn, ln, dn, nk, md, g,
-    dob, dod, dec: hasDeat || !!dod, bo: 0,
+    dob, dod, dec: hasDeat || !!dod, bo: parsedBirthOrder,
     em, ph, a1, a2, ci, st, zp, co,
     fb, ig, li, ws, pp, bio, loc,
     prof, emp, stories, notes, pgl, dl,
