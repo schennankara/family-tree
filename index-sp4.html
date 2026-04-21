@@ -716,12 +716,23 @@ async function migrateGedcomToSupabase(gedcomText, onProgress) {
         address1:a1, address2:a2, city:ci, state:st, zip:zp, country:co,
         facebook: gv(el,'_FACEBOOK'), instagram: gv(el,'_INSTAGRAM'),
         linkedin: gv(el,'_LINKEDIN'), website: gv(el,'WWW'),
-        profile_photo: gv(el,'_PHOTO'), bio: '', location: loc,
+        profile_photo: gv(el,'_PHOTO'), location: loc,
         profession: gv(el,'OCCU'), employer: gv(el,'_EMPLOYER'),
-        stories: '', notes: gv(el,'NOTE'),
         photo_gallery_link: gv(el,'_PHOTOGALLERY'), documents_link: gv(el,'_DOCUMENTS'),
         updated_by: 'GEDCOM migration',
       });
+      // Parse notes, bio, stories from multiple NOTE tags (after push so we can update)
+      const pRec = persons[persons.length - 1];
+      const noteEls2 = el.children.filter(c => c.tag === 'NOTE');
+      let pNotes = '', pBio = '', pStories = '';
+      for (const noteEl of noteEls2) {
+        const val = noteEl.value || '';
+        if (val.startsWith('=== FTLS Profile ===')) continue; // skip encapsulated FTLS note
+        if (val.startsWith('BIO: ')) { pBio = val.substring(5); }
+        else if (val.startsWith('STORY: ')) { pStories = val.substring(7); }
+        else if (val) { if (pNotes) pNotes += '\n'; pNotes += val; }
+      }
+      pRec.notes = pNotes; pRec.bio = pBio; pRec.stories = pStories;
     } else if (el.tag === 'FAM' && el.pointer) {
       const divEl2 = el.children.find(c => c.tag === 'DIV');
       const divorced2 = divEl2 ? (divEl2.value === 'Y' || divEl2.value === '' || divEl2.children.length > 0) : false;
@@ -902,10 +913,13 @@ function MigrateDialog({onDone, onCancel}) {
 
 /* ───── SHARED: Convert person object → GEDCOM INDI lines ───── */
 // Used by full export, diff export, and merged export.
-// Returns array of GEDCOM lines (without FAMS/FAMC — caller adds those).
+// Returns { indi: string[], standalone: string[] }
+//   indi: GEDCOM lines for the INDI record (without FAMS/FAMC — caller adds those)
+//   standalone: top-level NOTE records referenced by the INDI (MacFamilyTree format)
 // Cardinal features (OBJE, RESI, CHAN, _CRE, etc.) come via person._xg.
 function personToGedcomLines(person) {
   const L = [`0 ${person.id} INDI`];
+  const standalone = []; // standalone NOTE records to emit at top level
 
   // Primary NAME — match MacFamilyTree format:
   //   1 NAME {bo}. {fn} {mn} /{ln}/
@@ -922,11 +936,13 @@ function personToGedcomLines(person) {
   if (fn || givnPrefix) L.push(`2 GIVN ${givn.trim()}`);
   if (ln) L.push(`2 SURN ${ln}`);
   if (mn) L.push(`2 SECG ${mn}`);
+  // Title prefix (Dr., Rev., etc.)
+  if (person.tp) L.push(`2 NPFX ${person.tp}`);
 
   // Nickname
   if (person.nk) { L.push(`1 NAME ${person.nk} //`); L.push(`2 TYPE nick`); L.push(`2 GIVN ${person.nk}`); }
-  // Maiden name
-  if (person.md) { L.push(`1 NAME ${person.md} //`); L.push(`2 TYPE birth`); }
+  // Maiden name — MacFamilyTree uses TYPE maiden (not TYPE birth)
+  if (person.md) { L.push(`1 NAME ${person.md} //`); L.push(`2 TYPE maiden`); }
   // SEX
   if (person.g) L.push(`1 SEX ${person.g}`);
   // BIRT
@@ -966,18 +982,27 @@ function personToGedcomLines(person) {
   if (person.prof) L.push(`1 OCCU ${person.prof}`);
   // Website
   if (person.ws) L.push(`1 WWW ${person.ws}`);
-  // Notes — split multi-line text into CONT lines for GEDCOM compliance
-  const pushNote = (level, text) => {
-    const noteLines = text.split('\n');
-    L.push(`${level} NOTE ${noteLines[0]}`);
-    for (let i = 1; i < noteLines.length; i++) {
-      L.push(`${level+1} CONT ${noteLines[i]}`);
-    }
+
+  // Helper: create a standalone NOTE record and add pointer to INDI
+  // MacFamilyTree uses standalone NOTE records (0-level) referenced by pointer
+  let noteCounter = 0;
+  const addStandaloneNote = (text) => {
+    noteCounter++;
+    const noteId = `@N_${person.id.replace(/@/g, '')}_${noteCounter}@`;
+    L.push(`1 NOTE ${noteId}`);
+    const noteLines = [`0 ${noteId} NOTE`];
+    text.split('\n').forEach(line => noteLines.push(`1 CONT ${line}`));
+    standalone.push(...noteLines);
   };
-  if (person.notes) pushNote(1, person.notes);
-  if (person.bio) pushNote(1, 'BIO: ' + person.bio);
-  if (person.stories) pushNote(1, 'STORY: ' + person.stories);
-  // Custom tags
+
+  // Person's own notes
+  if (person.notes) addStandaloneNote(person.notes);
+  // Bio as standalone note
+  if (person.bio) addStandaloneNote('BIO: ' + person.bio);
+  // Stories as standalone note
+  if (person.stories) addStandaloneNote('STORY: ' + person.stories);
+
+  // Custom tags — for FTLS re-import (machine-readable)
   if (person.fb) L.push(`1 _FACEBOOK ${person.fb}`);
   if (person.ig) L.push(`1 _INSTAGRAM ${person.ig}`);
   if (person.li) L.push(`1 _LINKEDIN ${person.li}`);
@@ -986,7 +1011,22 @@ function personToGedcomLines(person) {
   if (person.pgl) L.push(`1 _PHOTOGALLERY ${person.pgl}`);
   if (person.dl) L.push(`1 _DOCUMENTS ${person.dl}`);
 
-  return L;
+  // Encapsulated FTLS Profile NOTE — human-readable for MacFamilyTree users
+  // Contains the same data as custom tags above (no drift)
+  const ftlsLines = [];
+  if (person.fb) ftlsLines.push(`Facebook: ${person.fb}`);
+  if (person.ig) ftlsLines.push(`Instagram: ${person.ig}`);
+  if (person.li) ftlsLines.push(`LinkedIn: ${person.li}`);
+  if (person.ws) ftlsLines.push(`Website: ${person.ws}`);
+  if (person.emp) ftlsLines.push(`Employer: ${person.emp}`);
+  if (person.pp) ftlsLines.push(`Profile Photo: ${person.pp}`);
+  if (person.pgl) ftlsLines.push(`Photo Gallery: ${person.pgl}`);
+  if (person.dl) ftlsLines.push(`Documents: ${person.dl}`);
+  if (ftlsLines.length > 0) {
+    addStandaloneNote('=== FTLS Profile ===\n' + ftlsLines.join('\n'));
+  }
+
+  return { indi: L, standalone };
 }
 
 /* ───── GEDCOM 5.5.1 EXPORTER ───── */
@@ -994,6 +1034,7 @@ function exportTreeToGedcom(tree, personMap, familyMap) {
   const lines = [];
   const indis = [];
   const fams = [];
+  const standaloneNotes = []; // standalone NOTE records generated by personToGedcomLines
   const exportedPersons = new Set();
   const exportedFamilies = new Set();
 
@@ -1028,7 +1069,8 @@ function exportTreeToGedcom(tree, personMap, familyMap) {
   function buildIndi(person) {
     if (exportedPersons.has(person.id)) return null;
     exportedPersons.add(person.id);
-    const L = personToGedcomLines(person);
+    const { indi: L, standalone } = personToGedcomLines(person);
+    if (standalone.length > 0) standaloneNotes.push(...standalone);
     // Add FAMS/FAMC refs
     (famsLookup[person.id] || []).forEach(ref => L.push(`1 FAMS ${ref}`));
     (famcLookup[person.id] || []).forEach(ref => L.push(`1 FAMC ${ref}`));
@@ -1102,7 +1144,8 @@ function exportTreeToGedcom(tree, personMap, familyMap) {
         ].filter(Boolean));
         if (spouse && spouse.id && !exportedPersons.has(spouse.id)) {
           exportedPersons.add(spouse.id);
-          const spIndi = personToGedcomLines(spouse);
+          const { indi: spIndi, standalone: spSt } = personToGedcomLines(spouse);
+          if (spSt.length > 0) standaloneNotes.push(...spSt);
           spIndi.push(`1 FAMS ${famId}`);
           if (spouse._xg) { spouse._xg.split('\n').forEach(xl => { if (xl.trim()) spIndi.push(xl); }); }
           indis.push(spIndi);
@@ -1111,7 +1154,8 @@ function exportTreeToGedcom(tree, personMap, familyMap) {
       }
       if (!exportedPersons.has(node.id)) {
         exportedPersons.add(node.id);
-        const nIndi = personToGedcomLines(node);
+        const { indi: nIndi, standalone: nSt } = personToGedcomLines(node);
+        if (nSt.length > 0) standaloneNotes.push(...nSt);
         nodeRefs.forEach(ref => nIndi.push(`1 FAMS ${ref}`));
         if (parentFamId) nIndi.push(`1 FAMC ${parentFamId}`);
         if (node._xg) { node._xg.split('\n').forEach(xl => { if (xl.trim()) nIndi.push(xl); }); }
@@ -1137,6 +1181,7 @@ function exportTreeToGedcom(tree, personMap, familyMap) {
 
   indis.forEach(indi => lines.push(...indi));
   fams.forEach(fam => lines.push(...fam));
+  if (standaloneNotes.length > 0) lines.push(...standaloneNotes);
   lines.push('0 TRLR');
 
   return lines.join('\n') + '\n';
@@ -2482,10 +2527,12 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, 
     '0 @SUBM1@ SUBM','1 NAME FTLS Export');
 
   // INDI records — for each person, include FAMC/FAMS from ALL families
+  const diffStandaloneNotes = [];
   for (const [pid, person] of Object.entries(pMap)) {
     if (exportedPersons.has(pid)) continue;
     exportedPersons.add(pid);
-    const L = personToGedcomLines(person);
+    const { indi: L, standalone } = personToGedcomLines(person);
+    if (standalone.length > 0) diffStandaloneNotes.push(...standalone);
     // FAMS/FAMC from FULL family map
     (famsLookup[pid] || []).forEach(ref => L.push(`1 FAMS ${ref}`));
     (famcLookup[pid] || []).forEach(ref => L.push(`1 FAMC ${ref}`));
@@ -2563,7 +2610,8 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, 
     const anchor = anchorMap[refId];
     if (anchor) {
       // Full INDI from personMap — gives importing app enough to match
-      const L = personToGedcomLines(anchor);
+      const { indi: L, standalone } = personToGedcomLines(anchor);
+      if (standalone.length > 0) diffStandaloneNotes.push(...standalone);
       (famsLookup[refId] || []).forEach(ref => L.push(`1 FAMS ${ref}`));
       (famcLookup[refId] || []).forEach(ref => L.push(`1 FAMC ${ref}`));
       if (anchor._xg) { anchor._xg.split('\n').forEach(xl => { if (xl.trim()) L.push(xl); }); }
@@ -2595,6 +2643,9 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, 
     }
   }
 
+  // Include standalone NOTE records generated by personToGedcomLines
+  if (diffStandaloneNotes.length > 0) lines.push(...diffStandaloneNotes);
+
   lines.push('0 TRLR');
   return lines.join('\n') + '\n';
 }
@@ -2621,8 +2672,10 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
   const newPIds = new Set(newPersons.map(p => p.id));
 
   // Add ONLY truly new INDI records
+  const mergedStandaloneNotes = [];
   for (const p of newPersons) {
-    const L = personToGedcomLines(p);
+    const { indi: L, standalone } = personToGedcomLines(p);
+    if (standalone.length > 0) mergedStandaloneNotes.push(...standalone);
     // Add FAMS/FAMC refs
     for (const [fid, fam] of Object.entries(ftlsFamilyMap)) {
       if ((fam.husband_id||fam.husb) === p.id || (fam.wife_id||fam.wife) === p.id) L.push(`1 FAMS ${fid}`);
@@ -2684,7 +2737,8 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
   }
   
   function buildReplacementIndi(p) {
-    const L = personToGedcomLines(p);
+    const { indi: L, standalone } = personToGedcomLines(p);
+    if (standalone.length > 0) mergedStandaloneNotes.push(...standalone);
     // Add FAMS/FAMC refs from the family map
     (famsLookup2[p.id] || []).forEach(ref => L.push(`1 FAMS ${ref}`));
     (famcLookup2[p.id] || []).forEach(ref => L.push(`1 FAMC ${ref}`));
@@ -2734,7 +2788,7 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
   }
 
 
-  return [...before, ...newLines, '0 TRLR'].join('\n') + '\n';
+  return [...before, ...newLines, ...mergedStandaloneNotes, '0 TRLR'].join('\n') + '\n';
 }
 
 
@@ -2957,10 +3011,12 @@ function parseIndi(el) {
   const prof = getChildValue(el, 'OCCU');
   
   // Notes, Bio, Stories — handle multiple NOTE tags with prefixes
+  // Skip "=== FTLS Profile ===" NOTE block — that data comes from custom tags (_FACEBOOK etc.)
   let notes = '', bio = '', stories = '';
   const noteEls = el.children.filter(c => c.tag === 'NOTE');
   for (const noteEl of noteEls) {
     const val = noteEl.value || '';
+    if (val.startsWith('=== FTLS Profile ===')) continue; // skip encapsulated FTLS note
     if (val.startsWith('BIO: ')) {
       bio = val.substring(5);
     } else if (val.startsWith('STORY: ')) {
