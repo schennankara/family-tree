@@ -995,8 +995,15 @@ function personToGedcomLines(person) {
     standalone.push(...noteLines);
   };
 
-  // Person's own notes
-  if (person.notes) addStandaloneNote(person.notes);
+  // Person's own notes — detect if it's a pointer to existing NOTE record or actual text
+  if (person.notes) {
+    if (/^@[^@]+@$/.test(person.notes.trim())) {
+      // It's a pointer to an existing standalone NOTE record in gedcom_meta
+      L.push(`1 NOTE ${person.notes.trim()}`);
+    } else {
+      addStandaloneNote(person.notes);
+    }
+  }
   // Bio as standalone note
   if (person.bio) addStandaloneNote('BIO: ' + person.bio);
   // Stories as standalone note
@@ -1196,12 +1203,16 @@ async function downloadGedcom(tree, personMap, familyMap) {
   try {
     const meta = await sbFetch('gedcom_meta?select=*');
     if (meta && meta.length > 0) {
-      // Collect all @pointer@ references from all persons' _xg fields
+      // Collect all @pointer@ references from persons' _xg fields AND notes field
       const referencedIds = new Set();
       for (const p of Object.values(personMap)) {
         if (p._xg) {
           const refs = p._xg.match(/@[^@]+@/g);
           if (refs) refs.forEach(r => referencedIds.add(r));
+        }
+        // Notes field may contain a pointer to a standalone NOTE record
+        if (p.notes && /^@[^@]+@$/.test(p.notes.trim())) {
+          referencedIds.add(p.notes.trim());
         }
       }
       for (const m of meta) {
@@ -2628,13 +2639,17 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, 
   // App config (_STE, _STF, _PTF, _PTE, LABL, REPO): always included — MacFT needs them to parse the file
   const PERSON_SPECIFIC_META = new Set(['OBJE','_STO','NOTE','SOUR']);
   if (window.gedcomMetaRecords && window.gedcomMetaRecords.length > 0) {
-    // Collect all @pointer@ references from exported persons' _xg fields
+    // Collect all @pointer@ references from exported persons' _xg AND notes fields
     const referencedIds = new Set();
     for (const pid of exportedPersons) {
       const person = pMap[pid] || anchorMap[pid];
       if (person && person._xg) {
         const refs = person._xg.match(/@[^@]+@/g);
         if (refs) refs.forEach(r => referencedIds.add(r));
+      }
+      // Notes field may contain a pointer to a standalone NOTE record
+      if (person && person.notes && /^@[^@]+@$/.test((person.notes||'').trim())) {
+        referencedIds.add(person.notes.trim());
       }
     }
     for (const meta of window.gedcomMetaRecords) {
