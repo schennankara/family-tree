@@ -1,4 +1,4 @@
-.<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -2561,7 +2561,163 @@ async function remapFamilyId(oldId, newId, editUser) {
     });
   } catch(e) { console.warn('Could not log family remap:', e); }
 }
-// Smart export: only new families, existing families handled via FAMC/FAMS on persons
+
+/* ───── ORPHAN META PRUNER ─────
+   Finds rows in gedcom_meta that are no longer referenced by any live
+   person._extra_gedcom, person.notes, or family._extra_gedcom, and optionally
+   moves them to gedcom_meta_archive so they can be restored if needed.
+
+   Only person-specific record types are candidates (see PERSON_SPECIFIC_META).
+   App-config types (_STE, _STF, _PTE, _PTF, LABL, REPO) are left alone because
+   MFT's export format requires them whether or not individual persons reference
+   them directly.
+
+   Usage:
+     const preview = await pruneOrphanMeta({ dryRun: true });
+     // → { candidates: [{id, record_type, preview}], counts: {OBJE: 391, NOTE: 6, ...}, totalCandidates: 399 }
+
+     const result = await pruneOrphanMeta({
+       dryRun: false,
+       user: 'me@example.com',
+       reason: 'manual_admin_prune'
+     });
+     // → { archived: 399, deleted: 399 }
+*/
+async function pruneOrphanMeta({ dryRun = true, user = '', reason = 'manual_admin_prune' } = {}) {
+  if (!isAdmin()) throw new Error('Only admins can prune orphan records');
+
+  // 1. Pull all gedcom_meta rows that are eligible (person-specific types only)
+  const eligibleTypes = [...PERSON_SPECIFIC_META].map(t => `"${t}"`).join(',');
+  const allMeta = await sbFetch(`gedcom_meta?record_type=in.(${eligibleTypes})&select=id,record_type,raw_gedcom,created_at`);
+
+  if (allMeta.length === 0) {
+    return { candidates: [], counts: {}, totalCandidates: 0, archived: 0, deleted: 0 };
+  }
+
+  // 2. Build a set of all xrefs referenced from live persons/families
+  //    Pull only the fields we need to keep the payload small
+  const [personsRefs, familiesRefs] = await Promise.all([
+    sbFetch('persons?select=_extra_gedcom,notes'),
+    sbFetch('families?select=_extra_gedcom'),
+  ]);
+
+  const referenced = new Set();
+  const collectRefs = (text) => {
+    if (!text || typeof text !== 'string') return;
+    const matches = text.match(/@[^@\s]+@/g);
+    if (matches) for (const m of matches) referenced.add(m);
+  };
+  for (const p of personsRefs) { collectRefs(p._extra_gedcom); collectRefs(p.notes); }
+  for (const f of familiesRefs) { collectRefs(f._extra_gedcom); }
+
+  // 3. Partition eligible meta into orphans vs. still-referenced
+  const orphans = allMeta.filter(m => !referenced.has(m.id));
+
+  // Build counts for the preview
+  const counts = {};
+  for (const o of orphans) {
+    counts[o.record_type] = (counts[o.record_type] || 0) + 1;
+  }
+
+  if (dryRun || orphans.length === 0) {
+    return {
+      candidates: orphans.map(o => ({
+        id: o.id,
+        record_type: o.record_type,
+        preview: (o.raw_gedcom || '').slice(0, 120)
+      })),
+      counts,
+      totalCandidates: orphans.length,
+      archived: 0,
+      deleted: 0,
+    };
+  }
+
+  // 4. Not a dry run — archive, then delete.
+  //    Insert in batches to keep request size sane.
+  const BATCH = 50;
+  let archived = 0, deleted = 0;
+  for (let i = 0; i < orphans.length; i += BATCH) {
+    const batch = orphans.slice(i, i + BATCH);
+    const archiveRows = batch.map(o => ({
+      id: o.id,
+      record_type: o.record_type,
+      raw_gedcom: o.raw_gedcom,
+      created_at: o.created_at,
+      pruned_by: user || 'unknown',
+      prune_reason: reason,
+    }));
+    // Archive batch
+    await sbFetch('gedcom_meta_archive', {
+      method: 'POST',
+      body: JSON.stringify(archiveRows),
+      headers: { 'Prefer': 'return=minimal' }
+    });
+    archived += batch.length;
+
+    // Delete batch from live table. PostgREST's in.(…) operator takes a
+    // parenthesized, comma-separated list; the xref id values contain @ and
+    // digits so no quoting/escaping is required beyond URI encoding.
+    const idList = batch.map(o => o.id).join(',');
+    await sbFetch(`gedcom_meta?id=in.(${encodeURIComponent(idList)})`, {
+      method: 'DELETE',
+      headers: { 'Prefer': 'return=minimal' }
+    });
+    deleted += batch.length;
+  }
+
+  // 5. Audit-log the prune action so it shows up in the admin log
+  try {
+    await sbFetch('edit_log', {
+      method: 'POST',
+      body: JSON.stringify({
+        person_id: null,
+        family_id: null,
+        action: 'prune_orphan_meta',
+        changes: { archived, reason, counts },
+        edited_by: user || 'unknown',
+      }),
+      headers: { 'Prefer': 'return=minimal' }
+    });
+  } catch(e) { console.warn('Could not log prune action:', e); }
+
+  return {
+    candidates: orphans.map(o => ({
+      id: o.id, record_type: o.record_type,
+      preview: (o.raw_gedcom || '').slice(0, 120)
+    })),
+    counts,
+    totalCandidates: orphans.length,
+    archived,
+    deleted,
+  };
+}
+
+// Restore a previously-pruned gedcom_meta row from the archive back to the
+// live table. Useful if a prune was too aggressive.
+async function restorePrunedMeta(archiveId) {
+  if (!isAdmin()) throw new Error('Only admins can restore archived records');
+  const rows = await sbFetch(`gedcom_meta_archive?archive_id=eq.${archiveId}&select=*`);
+  if (rows.length === 0) throw new Error('Archive row not found');
+  const r = rows[0];
+  // Check it doesn't already exist live (could happen if re-imported since)
+  const existing = await sbFetch(`gedcom_meta?id=eq.${encodeURIComponent(r.id)}&select=id`);
+  if (existing.length > 0) throw new Error('Live gedcom_meta still has ' + r.id + ' — restore would create duplicate');
+  await sbFetch('gedcom_meta', {
+    method: 'POST',
+    body: JSON.stringify({
+      id: r.id, record_type: r.record_type, raw_gedcom: r.raw_gedcom, created_at: r.created_at
+    }),
+    headers: { 'Prefer': 'return=minimal' }
+  });
+  // Delete from archive
+  await sbFetch(`gedcom_meta_archive?archive_id=eq.${archiveId}`, {
+    method: 'DELETE', headers: { 'Prefer': 'return=minimal' }
+  });
+  return { restored: r.id };
+}
+
+
 function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, allPersonMap) {
   const extIds = extFamilyIds || new Set();
   const extFams = extFamiliesMap || {};
@@ -4334,7 +4490,7 @@ function TreeHealthTab({ personMap, familyMap, flat, tree, user, onPlaceOrphan }
   );
 }
 
-function AdminPanel({onClose, onReloadTree, onShowMigrate, onShowDiff, onShowBackfill, personMap, familyMap, flat, tree, user, onPlaceOrphan}) {
+function AdminPanel({onClose, onReloadTree, onShowMigrate, onShowDiff, onShowBackfill, onShowPrune, personMap, familyMap, flat, tree, user, onPlaceOrphan}) {
   const [tab, setTab] = useState('updates'); // 'updates' | 'accounts' | 'users' | 'log' | 'tools' | 'health'
   const [updateReqs, setUpdateReqs] = useState([]);
   const [accessReqs, setAccessReqs] = useState([]);
@@ -4808,6 +4964,12 @@ function AdminPanel({onClose, onReloadTree, onShowMigrate, onShowDiff, onShowBac
             <div style={{fontSize:12,color:'#7a7568',lineHeight:1.6,marginBottom:12}}>Parse a GEDCOM and populate _extra_gedcom, addresses, titles, burial dates for existing persons. Safe — only fills empty fields, matches by ID, never touches names or family links.</div>
             <button onClick={onShowBackfill} style={{background:'rgba(90,163,196,0.08)',border:'1px solid rgba(90,163,196,0.3)',color:'#5aa3c4',padding:'8px 18px',borderRadius:6,cursor:'pointer',fontSize:13}}>📦 Open Backfill Tool</button>
             <div style={{fontSize:10,color:'#7a7568',marginTop:8}}>✓ Non-destructive — only adds missing data</div>
+          </div>
+          <div style={{flex:'1 1 300px',background:'rgba(159,126,178,0.04)',border:'1px solid rgba(159,126,178,0.15)',borderRadius:8,padding:16}}>
+            <div style={{fontSize:14,color:'#9f7eb2',fontWeight:500,marginBottom:8}}>🧹 Prune Orphan Meta</div>
+            <div style={{fontSize:12,color:'#7a7568',lineHeight:1.6,marginBottom:12}}>Find gedcom_meta rows (stale OBJE photo refs, orphan NOTEs, etc.) no longer referenced by any person or family. Dry-run preview first; archives to <code style={{color:TX}}>gedcom_meta_archive</code> — not hard-deleted.</div>
+            <button onClick={onShowPrune} style={{background:'rgba(159,126,178,0.08)',border:'1px solid rgba(159,126,178,0.3)',color:'#9f7eb2',padding:'8px 18px',borderRadius:6,cursor:'pointer',fontSize:13}}>🧹 Open Prune Tool</button>
+            <div style={{fontSize:10,color:'#7a7568',marginTop:8}}>✓ Reversible — archived rows can be restored</div>
           </div>
         </div>
       </div>}
@@ -7949,6 +8111,148 @@ function MoveBranchModal({ node, personMap, familyMap, flat, tree, user, onMove,
    burial_date for existing persons in Supabase. Only fills empty fields, matches by ID,
    never touches names, family links, or any field that already has data.
 */
+/* ───── PRUNE ORPHAN META MODAL ─────
+   Lets an admin find and archive rows in gedcom_meta (OBJE photo refs, orphan
+   NOTEs, etc.) that are no longer referenced by any live person/family record.
+   Runs a dry-run first so the admin sees exactly what will be archived before
+   committing. Archived rows land in gedcom_meta_archive and can be restored. */
+function PruneOrphanMetaModal({ onClose, user }) {
+  const [phase, setPhase] = useState('idle'); // idle | scanning | preview | running | done | error
+  const [preview, setPreview] = useState(null);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState('');
+  const [expanded, setExpanded] = useState(false);
+
+  const runDryRun = async () => {
+    setPhase('scanning');
+    setError('');
+    try {
+      const p = await pruneOrphanMeta({ dryRun: true });
+      setPreview(p);
+      setPhase(p.totalCandidates === 0 ? 'done' : 'preview');
+    } catch (e) {
+      setError(e.message);
+      setPhase('error');
+    }
+  };
+
+  const runPrune = async () => {
+    if (!confirm(`Archive ${preview.totalCandidates} orphan gedcom_meta row${preview.totalCandidates === 1 ? '' : 's'}?\n\nRows will be moved to gedcom_meta_archive and can be restored individually if needed. This is not a hard delete.\n\nContinue?`)) return;
+    setPhase('running');
+    setError('');
+    try {
+      const r = await pruneOrphanMeta({
+        dryRun: false,
+        user: user?.email || 'admin',
+        reason: 'manual_admin_prune'
+      });
+      setResult(r);
+      setPhase('done');
+    } catch (e) {
+      setError(e.message);
+      setPhase('error');
+    }
+  };
+
+  // Kick off dry-run on first open
+  useEffect(() => { runDryRun(); /* eslint-disable-line */ }, []);
+
+  const btn = { padding: '8px 18px', borderRadius: 6, cursor: 'pointer', fontSize: 13, border: '1px solid' };
+  const cardCount = preview?.counts || {};
+
+  return (
+    <div style={{ position:'fixed', inset:0, background:'rgba(10,10,8,0.85)', zIndex:200, display:'flex', alignItems:'center', justifyContent:'center', padding:20 }}>
+      <div style={{ background:'#141410', border:'1px solid '+BR, borderRadius:10, maxWidth:640, width:'100%', maxHeight:'85vh', display:'flex', flexDirection:'column' }}>
+        <div style={{ padding:'16px 20px', borderBottom:'1px solid '+BR, display:'flex', alignItems:'center', justifyContent:'space-between' }}>
+          <div style={{ fontSize:16, color:TX, fontWeight:500 }}>🧹 Prune Orphan Meta Records</div>
+          <button onClick={onClose} style={{ background:'transparent', border:'none', color:DM, fontSize:20, cursor:'pointer' }}>×</button>
+        </div>
+        <div style={{ padding:20, overflow:'auto', flex:1 }}>
+          <div style={{ fontSize:12, color:DM, lineHeight:1.6, marginBottom:16 }}>
+            Scans <code style={{ color:TX }}>gedcom_meta</code> for person-specific records
+            (OBJE photo refs, NOTEs, SOUR, _STO) that no live person or family points to.
+            App-config records (_STE, _STF, _PTE, _PTF, LABL, REPO) are left alone.
+            Matches are moved to <code style={{ color:TX }}>gedcom_meta_archive</code> — not hard-deleted —
+            so they can be restored one at a time if needed.
+          </div>
+
+          {phase === 'scanning' && (
+            <div style={{ color:DM, fontSize:13, padding:20, textAlign:'center' }}>Scanning…</div>
+          )}
+
+          {phase === 'error' && (
+            <div style={{ color:'#c45a5a', fontSize:13, padding:12, background:'rgba(196,90,90,0.08)', borderRadius:6 }}>
+              Error: {error}
+            </div>
+          )}
+
+          {preview && phase !== 'scanning' && (<>
+            <div style={{ fontSize:14, color:TX, marginBottom:10 }}>
+              Found <span style={{ color:GC, fontWeight:500 }}>{preview.totalCandidates}</span> orphan record{preview.totalCandidates === 1 ? '' : 's'}
+              {phase === 'done' && result && ` — archived ${result.archived}`}
+            </div>
+            {preview.totalCandidates > 0 && (
+              <div style={{ background:'rgba(196,163,90,0.04)', border:'1px solid '+BR, borderRadius:6, padding:12, marginBottom:12 }}>
+                <div style={{ display:'grid', gridTemplateColumns:'1fr auto', gap:'4px 12px', fontSize:12 }}>
+                  {Object.entries(cardCount).map(([type, n]) => (
+                    <React.Fragment key={type}>
+                      <div style={{ color:TX }}>{type}</div>
+                      <div style={{ color:GC, textAlign:'right' }}>{n}</div>
+                    </React.Fragment>
+                  ))}
+                </div>
+                {(cardCount['_STO'] || cardCount['SOUR']) && (
+                  <div style={{ marginTop:10, padding:'8px 10px', background:'rgba(208,160,126,0.08)', border:'1px solid rgba(208,160,126,0.3)', borderRadius:4, fontSize:11, color:'#d0a07e', lineHeight:1.5 }}>
+                    ⚠ <strong>Heads-up:</strong> {cardCount['_STO'] ? `${cardCount['_STO']} _STO (story/narrative) ` : ''}{cardCount['_STO'] && cardCount['SOUR'] ? 'and ' : ''}{cardCount['SOUR'] ? `${cardCount['SOUR']} SOUR (submission header) ` : ''}
+                    record{(cardCount['_STO'] || 0) + (cardCount['SOUR'] || 0) === 1 ? ' is' : 's are'} included.
+                    These may hold your Family History narrative or the GEDCOM's submitter info. Expand the sample below to review before archiving.
+                  </div>
+                )}
+                <button
+                  onClick={() => setExpanded(!expanded)}
+                  style={{ background:'transparent', border:'none', color:DM, fontSize:11, cursor:'pointer', padding:'8px 0 0', textDecoration:'underline' }}>
+                  {expanded ? 'Hide' : 'Show'} sample rows ({Math.min(preview.candidates.length, 20)} of {preview.totalCandidates})
+                </button>
+                {expanded && (
+                  <div style={{ marginTop:8, fontSize:11, color:DM, fontFamily:'monospace', maxHeight:200, overflow:'auto', background:'#0a0a08', padding:8, borderRadius:4 }}>
+                    {preview.candidates.slice(0, 20).map(c => (
+                      <div key={c.id} style={{ marginBottom:6, paddingBottom:6, borderBottom:'1px solid rgba(196,163,90,0.08)' }}>
+                        <span style={{ color:GC }}>{c.id}</span> <span style={{ color:'#7eb8d0' }}>[{c.record_type}]</span>
+                        <div style={{ color:DM, whiteSpace:'pre-wrap', marginTop:2 }}>{c.preview}{c.preview.length >= 120 ? '…' : ''}</div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {preview.totalCandidates === 0 && (
+              <div style={{ fontSize:13, color:MC, padding:12, background:'rgba(107,158,114,0.08)', borderRadius:6 }}>
+                ✓ No orphan records found. Nothing to prune.
+              </div>
+            )}
+          </>)}
+        </div>
+
+        <div style={{ padding:'12px 20px', borderTop:'1px solid '+BR, display:'flex', gap:8, justifyContent:'flex-end' }}>
+          {phase === 'preview' && (<>
+            <button onClick={onClose} style={{ ...btn, background:'transparent', borderColor:BR, color:DM }}>Cancel</button>
+            <button onClick={runPrune} style={{ ...btn, background:'rgba(107,158,114,0.15)', borderColor:'rgba(107,158,114,0.4)', color:MC }}>
+              🧹 Archive {preview.totalCandidates} record{preview.totalCandidates === 1 ? '' : 's'}
+            </button>
+          </>)}
+          {phase === 'running' && (
+            <div style={{ color:DM, fontSize:12 }}>Archiving…</div>
+          )}
+          {(phase === 'done' || phase === 'error') && (
+            <button onClick={onClose} style={{ ...btn, background:'rgba(196,163,90,0.1)', borderColor:'rgba(196,163,90,0.3)', color:GC }}>Close</button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function BackfillModal({onClose, onComplete}) {
   const [status, setStatus] = useState('idle'); // idle | parsing | preview | running | done
   const [log, setLog] = useState([]);
@@ -8363,6 +8667,7 @@ function App(){
   const [resetToken,setResetToken]=useState(null);
   const [showDiff,setShowDiff]=useState(false);
   const [showBackfill,setShowBackfill]=useState(false);
+  const [showPrune,setShowPrune]=useState(false);
   const [movingBranch,setMovingBranch]=useState(null); // person node to move
   const flat=useMemo(()=>tree?flattenAll(tree):[],[tree]);
 
@@ -9124,7 +9429,7 @@ function App(){
         </>;
       })()}
       </>}
-      {activeTab==='admin'&&user&&isAdmin()&&<AdminPanel onReloadTree={()=>reloadTree(true)} onShowMigrate={()=>setShowMigrate(true)} onShowDiff={()=>setShowDiff(true)} onShowBackfill={()=>setShowBackfill(true)} personMap={personMap} familyMap={familyMap} flat={flat} tree={tree} user={user} onPlaceOrphan={(person)=>setMovingBranch(person)}/>}
+      {activeTab==='admin'&&user&&isAdmin()&&<AdminPanel onReloadTree={()=>reloadTree(true)} onShowMigrate={()=>setShowMigrate(true)} onShowDiff={()=>setShowDiff(true)} onShowBackfill={()=>setShowBackfill(true)} onShowPrune={()=>setShowPrune(true)} personMap={personMap} familyMap={familyMap} flat={flat} tree={tree} user={user} onPlaceOrphan={(person)=>setMovingBranch(person)}/>}
       
       {/* ───── PHOTOS GALLERY TAB ───── */}
       {activeTab==='photos'&&user&&<PhotoGallery flat={flat} user={user}/>}
@@ -9134,6 +9439,7 @@ function App(){
       {showMigrate&&<MigrateDialog onDone={()=>setShowMigrate(false)} onCancel={()=>setShowMigrate(false)}/>}
       {showDiff&&<GedcomDiffModal onClose={()=>setShowDiff(false)} personMap={personMap} familyMap={familyMap} user={user} onMergeComplete={()=>{setShowDiff(false);setMsg('Merging complete — refreshing...');reloadTree(false)}}/>}
       {showBackfill&&<BackfillModal onClose={()=>setShowBackfill(false)} onComplete={()=>{setShowBackfill(false);setMsg('Backfill complete — refreshing...');reloadTree(false)}}/>}
+      {showPrune&&<PruneOrphanMetaModal onClose={()=>setShowPrune(false)} user={user}/>}
       {movingBranch&&<MoveBranchModal node={movingBranch} personMap={personMap} familyMap={familyMap} flat={flat} tree={tree} user={user} onMove={handleMove} onRequestMove={handleRequestMove} onResolveDuplicate={handleResolveDuplicate} onClose={()=>setMovingBranch(null)}/>}
       {user&&user.role!=='viewer'&&<div style={{position:'fixed',bottom:16,right:16,background:CD,border:'1px solid '+BR,borderRadius:8,padding:'8px 14px',fontSize:11,color:DM,zIndex:80,display:'flex',alignItems:'center',gap:8}}>
         <span style={{width:6,height:6,borderRadius:'50%',background:MC}}/>
