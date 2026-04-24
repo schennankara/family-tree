@@ -737,15 +737,19 @@ async function migrateGedcomToSupabase(gedcomText, onProgress) {
           if (givnEl) { 
             const boMatch = givnEl.value.match(/^(\d+)\.\s*/);
             if (boMatch) parsedBirthOrder = parseInt(boMatch[1]);
-            let v=givnEl.value.replace(/^\d+\.\s*/,''); const parts=v.split(' '); fn=parts[0]||''; if(parts.length>1&&!mn)mn=parts.slice(1).join(' '); 
+            // FAITHFUL: GIVN holds the entire given/personal name. Don't split
+            // on whitespace — that fabricates structure that isn't in the data
+            // and produces fn="T", mn="O" for inputs like "T O Jacob".
+            // Middle name comes from SECG (set below); never invent it from GIVN.
+            fn = givnEl.value.replace(/^\d+\.\s*/, '');
           }
           if (surnEl) ln = surnEl.value;
           if (secgEl && !mn) mn = secgEl.value;
           if (!fn && !ln) {
             const nv = nameEl.value.replace(/^\d+\.\s*/,'');
             const sm = nv.match(/^(.*?)\/([^\/]*)\//);
-            if (sm) { const gp=sm[1].trim(); ln=sm[2].trim(); const gs=gp.split(' '); fn=gs[0]||''; if(gs.length>1)mn=gs.slice(1).join(' '); }
-            else fn = nv.replace(/\//g, '').trim();
+            if (sm) { const gp=sm[1].trim(); ln=sm[2]; const gs=gp.split(' '); fn=gs[0]||''; if(gs.length>1)mn=gs.slice(1).join(' '); }
+            else fn = nv.replace(/\//g, '');
           }
         }
       }
@@ -986,12 +990,19 @@ function personToGedcomLines(person) {
   //   2 GIVN {bo}. {fn}
   //   2 SURN {ln}
   //   2 SECG {mn}
+  // CRITICAL: GEDCOM 5.5.1 requires NAME values to contain surname slashes
+  // (either /Surname/ or empty //). A NAME like "2. Henry" with no slashes is
+  // non-conformant and MFT responds by minting a duplicate INDI under a fresh
+  // xref, breaking round-trip identity. We always emit slashes — empty // when
+  // there is no surname — so MFT can parse the line and recognize the xref.
   const fn = person.fn || '', mn = person.mn || '', ln = person.ln || '';
   const bo = person.bo || 0;
   const givnPrefix = bo > 0 ? `${bo}. ` : '';
   const givn = givnPrefix + fn;
   const fullGivn = (givn + (mn ? ' ' + mn : '')).trim();
-  const nameStr = ln ? `${fullGivn} /${ln}/` : (fullGivn || person.dn || '(Unknown)');
+  // Always emit slashes (// when ln is empty) so the line is GEDCOM-conformant.
+  const baseStr = fullGivn || person.dn || '(Unknown)';
+  const nameStr = ln ? `${fullGivn} /${ln}/` : `${baseStr} //`;
   L.push(`1 NAME ${nameStr}`);
   if (fn || givnPrefix) L.push(`2 GIVN ${givn.trim()}`);
   if (ln) L.push(`2 SURN ${ln}`);
@@ -3136,11 +3147,13 @@ function parseIndi(el) {
     const type = typeEl ? typeEl.value : '';
 
     if (type === 'nick') {
-      // FAITHFUL: strip slashes (they're GEDCOM syntax, not user data) but
-      // preserve trailing whitespace so round-trip to MFT is byte-identical.
-      nk = nameEl.value.replace(/\//g, '');
+      // FAITHFUL: strip slashes plus the single space MFT puts between name and
+      // // delimiter (e.g. "Baby //" → "Baby" not "Baby "). The space before //
+      // is GEDCOM syntactic delimiter, not user data. Internal whitespace is
+      // still preserved.
+      nk = nameEl.value.replace(/\s*\/\/\s*$/, '').replace(/\//g, '');
     } else if (type === 'birth') {
-      md = nameEl.value.replace(/\//g, '');
+      md = nameEl.value.replace(/\s*\/\/\s*$/, '').replace(/\//g, '');
     } else if (type === 'married') {
       // Skip married-name-only entries (the "George married to George" issue)
       continue;
