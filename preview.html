@@ -34,7 +34,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.7.21';
+    const APP_VERSION = 'v4.7.22';
     const BUILD_DATE = '2026-04-25';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
@@ -588,13 +588,21 @@ function dedupeNoteTextLines(text) {
 function collectGedcomNotes(el, noteMap = {}) {
   const pieces = [];
   const seen = new Set();
-  const pushPiece = (scope, text) => {
-    const cleaned = cleanGedcomNoteText(text || '');
+  // Dedupe key is computed from the RAW (unlabeled) text. This way a person-level
+  // NOTE and a DEAT/BIRT/etc. event NOTE carrying the same underlying sentence
+  // collapse to one piece — even though the labeled output differs ("Death note: X"
+  // vs bare "X"). Without this, both keys differ and both pieces survive,
+  // producing the round-trip duplication seen in MFT-sourced GEDCOMs.
+  // First-wins: in practice the unlabeled person NOTE appears first in MFT output
+  // and is kept; the event-label gets dropped. That's the cleaner outcome.
+  const pushPiece = (scope, rawText, labeledText) => {
+    const cleaned = cleanGedcomNoteText(rawText || '');
     if (!cleaned || isFtlsGeneratedNoteText(cleaned)) return;
     const key = normalizeGedcomNoteDedupeKey(cleaned);
     if (!key || seen.has(key)) return;
     seen.add(key);
-    pieces.push({ scope, text: cleaned });
+    const emit = labeledText !== undefined ? cleanGedcomNoteText(labeledText) : cleaned;
+    pieces.push({ scope, text: emit });
   };
   for (const child of (el.children || [])) {
     if (child.tag === 'NOTE') {
@@ -610,7 +618,7 @@ function collectGedcomNotes(el, noteMap = {}) {
       if (grand.tag !== 'NOTE') continue;
       const val = resolveGedcomNoteValue(grand.value, noteMap);
       if (!val || isFtlsGeneratedNoteText(val)) continue;
-      pushPiece(child.tag, `${gedcomEventLabel(child.tag)} note: ${val}`);
+      pushPiece(child.tag, val, `${gedcomEventLabel(child.tag)} note: ${val}`);
     }
   }
   return pieces;
@@ -1848,13 +1856,17 @@ function personToGedcomLines(person, context = {}) {
       // It's a pointer to an existing standalone NOTE record in gedcom_meta
       L.push(`1 NOTE ${person.notes.trim()}`);
     } else {
-      addStandaloneNote(person.notes);
+      // Dedupe on export — guarantees FTLS never originates duplicated notes
+      // in its GEDCOMs, regardless of how dirty the in-memory value is.
+      // Belt-and-suspenders with the on-write dedup; if MFT later re-emits
+      // the same text duplicated, the import side will catch it again.
+      addStandaloneNote(dedupeNoteTextLines(person.notes));
     }
   }
   // Bio as standalone note
-  if (person.bio) addStandaloneNote('BIO: ' + person.bio);
+  if (person.bio) addStandaloneNote('BIO: ' + dedupeNoteTextLines(person.bio));
   // Stories as standalone note
-  if (person.stories) addStandaloneNote('STORY: ' + person.stories);
+  if (person.stories) addStandaloneNote('STORY: ' + dedupeNoteTextLines(person.stories));
 
   // Custom tags — for FTLS re-import (machine-readable)
   if (person.fb) L.push(`1 _FACEBOOK ${person.fb}`);
