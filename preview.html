@@ -34,7 +34,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.7.18';
+    const APP_VERSION = 'v4.7.19';
     const BUILD_DATE = '2026-04-25';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
@@ -145,10 +145,46 @@ function normalizedValue(v) {
 function normalizedPerson(p) {
   if (!p) return p;
   const out = { ...p };
-  for (const k of ['fn', 'mn', 'ln', 'dn', 'nk', 'md', 'tp', 'dob', 'dod', 'loc']) {
+  for (const k of ['fn', 'mn', 'ln', 'dn', 'nk', 'md', 'tp', 'sx', 'dob', 'dod', 'loc', 'burd']) {
     if (typeof out[k] === 'string') out[k] = out[k].trim();
   }
   return out;
+}
+
+function getNameSuffixFromNotes(notes) {
+  const text = notes == null ? '' : String(notes);
+  const m = text.match(/(?:^|\n)\s*(?:Name\s+suffix|Suffix)\s*:\s*([^\n]+)/i);
+  return m ? m[1].trim() : '';
+}
+
+function upsertNameSuffixIntoNotes(notes, suffix) {
+  const sx = suffix == null ? '' : String(suffix).trim();
+  const text = notes == null ? '' : String(notes);
+  if (!sx) return text;
+  const line = `Name suffix: ${sx}`;
+  if (/(?:^|\n)\s*(?:Name\s+suffix|Suffix)\s*:/i.test(text)) {
+    return text.replace(/(^|\n)\s*(?:Name\s+suffix|Suffix)\s*:[^\n]*/i, `$1${line}`);
+  }
+  return text ? `${text}\n${line}` : line;
+}
+
+function hasGedcomLevel1Block(raw, tag) {
+  if (!raw) return false;
+  return new RegExp('^1\\s+' + tag + '(?:\\s|$)', 'm').test(String(raw));
+}
+
+function stripGedcomLevel1Block(raw, tags) {
+  if (!raw) return raw || '';
+  const tagSet = new Set(Array.isArray(tags) ? tags : [tags]);
+  const lines = String(raw).split('\n');
+  const kept = [];
+  let skipping = false;
+  for (const line of lines) {
+    const m = line.match(/^(\d+)\s+(\S+)/);
+    if (m && m[1] === '1') skipping = tagSet.has(m[2]);
+    if (!skipping) kept.push(line);
+  }
+  return kept.filter(x => x.trim()).join('\n');
 }
 
 
@@ -268,6 +304,7 @@ function applyFtlsReconciliationSnapshotDefaults(person, snapshot) {
   fill('nk', ['Nickname']);
   fill('md', ['Maiden Name']);
   fill('tp', ['Title Prefix']);
+  fill('sx', ['Name Suffix', 'Suffix']);
   fill('g', ['Gender']);
   fill('bo', ['Birth Order'], v => {
     const n = parseInt(v, 10);
@@ -329,7 +366,7 @@ function applyFtlsReconciliationSnapshotDefaultsToDbRow(row, snapshot) {
   const person = {
     id: row.id,
     fn: row.first_name, mn: row.middle_name, ln: row.last_name, dn: row.display_name,
-    nk: row.nickname, md: row.maiden_name, g: row.gender,
+    nk: row.nickname, md: row.maiden_name, sx: getNameSuffixFromNotes(row.notes), g: row.gender,
     dob: row.date_of_birth, dod: row.date_of_death, dec: row.is_deceased, bo: row.birth_order,
     em: row.email, ph: row.phone,
     a1: row.address1, a2: row.address2, ci: row.city, st: row.state, zp: row.zip, co: row.country,
@@ -370,7 +407,7 @@ function applyFtlsReconciliationSnapshotDefaultsToDbRow(row, snapshot) {
   row.profession = merged.prof || '';
   row.employer = merged.emp || '';
   row.stories = merged.stories || '';
-  row.notes = merged.notes || '';
+  row.notes = upsertNameSuffixIntoNotes(merged.notes || '', merged.sx || '');
   row.photo_gallery_link = merged.pgl || '';
   row.documents_link = merged.dl || '';
   row.title_prefix = merged.tp || '';
@@ -769,7 +806,7 @@ function buildTreeFromDB(persons, families) {
 function personRowToTreePerson(p) {
   return {
     id:p.id, fn:p.first_name, mn:p.middle_name, ln:p.last_name,
-    dn:p.display_name, nk:p.nickname, md:p.maiden_name, g:p.gender,
+    dn:p.display_name, nk:p.nickname, md:p.maiden_name, sx:getNameSuffixFromNotes(p.notes), g:p.gender,
     dob:p.date_of_birth, dod:p.date_of_death, dec:p.is_deceased, bo:p.birth_order,
     em:p.email, ph:p.phone, a1:p.address1, a2:p.address2,
     ci:p.city, st:p.state, zp:p.zip, co:p.country,
@@ -795,7 +832,7 @@ async function savePerson(person, editUser) {
     facebook: person.fb||'', instagram: person.ig||'', linkedin: person.li||'',
     website: person.ws||'', profile_photo: person.pp||'', bio: person.bio||'',
     location: person.loc||'', profession: person.prof||'', employer: person.emp||'',
-    stories: person.stories||'', notes: person.notes||'',
+    stories: person.stories||'', notes: upsertNameSuffixIntoNotes(person.notes||'', person.sx||''),
     photo_gallery_link: person.pgl||'', documents_link: person.dl||'',
     title_prefix: person.tp||'', burial_date: person.burd||'',
     _extra_gedcom: person._xg||'',
@@ -1131,7 +1168,7 @@ async function migrateGedcomToSupabase(gedcomText, onProgress) {
 
   for (const el of elements) {
     if (el.tag === 'INDI' && el.pointer) {
-      let fn='',mn='',ln='',nk='',md='',parsedBirthOrder=0;
+      let fn='',mn='',ln='',nk='',md='',tp='',sx='',parsedBirthOrder=0;
       const nameEls = el.children.filter(c => c.tag === 'NAME');
       for (const nameEl of nameEls) {
         const typeEl = nameEl.children.find(c => c.tag === 'TYPE');
@@ -1143,6 +1180,10 @@ async function migrateGedcomToSupabase(gedcomText, onProgress) {
           const givnEl = nameEl.children.find(c => c.tag === 'GIVN');
           const surnEl = nameEl.children.find(c => c.tag === 'SURN');
           const secgEl = nameEl.children.find(c => c.tag === 'SECG');
+          const npfxEl = nameEl.children.find(c => c.tag === 'NPFX');
+          const nsfxEl = nameEl.children.find(c => c.tag === 'NSFX');
+          if (npfxEl && !tp) tp = npfxEl.value;
+          if (nsfxEl && !sx) sx = nsfxEl.value;
           if (givnEl) { 
             const boMatch = givnEl.value.match(/^(\d+)\.\s*/);
             if (boMatch) parsedBirthOrder = parseInt(boMatch[1]);
@@ -1166,6 +1207,7 @@ async function migrateGedcomToSupabase(gedcomText, onProgress) {
       const dob = gnv(el, 'BIRT', 'DATE');
       const loc = gnv(el, 'BIRT', 'PLAC');
       const dod = gnv(el, 'DEAT', 'DATE');
+      const burd = gnv(el, 'BURI', 'DATE');
       const deatEl1 = el.children.find(c => c.tag === 'DEAT');
       const hasDeat = deatEl1 ? (deatEl1.value === 'Y' || !!dod) : false;
       let dn = (fn + (mn ? ' ' + mn : '') + (ln ? ' ' + ln : '')).trim();
@@ -1192,6 +1234,7 @@ async function migrateGedcomToSupabase(gedcomText, onProgress) {
         linkedin: gv(el,'_LINKEDIN'), website: gv(el,'WWW'),
         profile_photo: gv(el,'_PHOTO'), location: loc,
         profession: gv(el,'OCCU'), employer: gv(el,'_EMPLOYER'),
+        title_prefix: tp, burial_date: burd,
         photo_gallery_link: gv(el,'_PHOTOGALLERY'), documents_link: gv(el,'_DOCUMENTS'),
         updated_by: 'GEDCOM migration',
       });
@@ -1206,7 +1249,7 @@ async function migrateGedcomToSupabase(gedcomText, onProgress) {
         else if (val.startsWith('STORY: ')) { pStories = val.substring(7); }
         else if (val) { if (pNotes) pNotes += '\n'; pNotes += val; }
       }
-      pRec.notes = pNotes; pRec.bio = pBio; pRec.stories = pStories;
+      pRec.notes = upsertNameSuffixIntoNotes(pNotes, sx); pRec.bio = pBio; pRec.stories = pStories;
       // If this GEDCOM contains an FTLS reconciliation worksheet, use it as
       // fallback data for FTLS-only fields that MFT did not export normally.
       // This keeps destructive GEDCOM → Supabase migration consistent with
@@ -1430,6 +1473,7 @@ function buildFtlsReconciliationSnapshot(person, context = {}) {
     show('Nickname', person.nk),
     show('Maiden Name', person.md),
     show('Title Prefix', person.tp),
+    show('Name Suffix', person.sx || getNameSuffixFromNotes(person.notes)),
     show('Gender', person.g),
     show('Birth Order', person.bo),
     'MFT edit location: Person > Names / Facts. Update the actual MFT name fields rather than only this note.',
@@ -1505,6 +1549,7 @@ function personToGedcomLines(person, context = {}) {
   // xref, breaking round-trip identity. We always emit slashes — empty // when
   // there is no surname — so MFT can parse the line and recognize the xref.
   const fn = person.fn || '', mn = person.mn || '', ln = person.ln || '';
+  const sx = person.sx || getNameSuffixFromNotes(person.notes);
   const bo = person.bo || 0;
   const givnPrefix = bo > 0 ? `${bo}. ` : '';
   const givn = givnPrefix + fn;
@@ -1518,6 +1563,7 @@ function personToGedcomLines(person, context = {}) {
   if (mn) L.push(`2 SECG ${mn}`);
   // Title prefix (Dr., Rev., etc.)
   if (person.tp) L.push(`2 NPFX ${person.tp}`);
+  if (sx) L.push(`2 NSFX ${sx}`);
 
   // Nickname
   if (person.nk) { L.push(`1 NAME ${person.nk} //`); L.push(`2 TYPE nick`); L.push(`2 GIVN ${person.nk}`); }
@@ -1529,6 +1575,13 @@ function personToGedcomLines(person, context = {}) {
   if (person.dob || person.loc) { L.push('1 BIRT'); if (person.dob) L.push(`2 DATE ${person.dob}`); if (person.loc) L.push(`2 PLAC ${person.loc}`); }
   // DEAT
   if (person.dod || person.dec) { L.push('1 DEAT'); if (person.dod) L.push(`2 DATE ${person.dod}`); }
+  // BURI — FTLS manages burial_date as a first-class field. If present,
+  // emit it here and strip any old preserved BURI block to avoid duplicates.
+  if (person.burd) {
+    L.push('1 BURI');
+    L.push(`2 DATE ${person.burd}`);
+    if (person._xg && hasGedcomLevel1Block(person._xg, 'BURI')) person._xg = stripGedcomLevel1Block(person._xg, 'BURI');
+  }
   // Contact
   if (person.ph) L.push(`1 PHON ${person.ph}`);
   if (person.em) L.push(`1 EMAI ${person.em}`);
@@ -1829,7 +1882,7 @@ async function downloadGedcom(tree, personMap, familyMap) {
 
 const PERSON_DIFF_FIELDS = [
   ['fn','First Name'],['mn','Middle Name'],['ln','Last Name'],['dn','Display Name'],
-  ['nk','Nickname'],['md','Maiden Name'],['tp','Title Prefix'],['g','Gender'],['bo','Birth Order'],
+  ['nk','Nickname'],['md','Maiden Name'],['tp','Title Prefix'],['sx','Name Suffix'],['g','Gender'],['bo','Birth Order'],
   ['dob','Birth Date'],['dod','Death Date'],['burd','Burial Date'],['loc','Birth Place'],
   ['prof','Occupation'],['emp','Employer'],['ph','Phone'],['em','Email'],
   ['a1','Address'],['a2','Address 2'],['ci','City'],['st','State'],['co','Country'],['zp','Zip'],
@@ -1862,6 +1915,14 @@ function diffPersonFields(left, right, fields=PERSON_DIFF_FIELDS) {
       // positive birth-order value that actually conflicts or fills a blank.
       if (!isMeaningfulBirthOrder(value)) return '';
       return String(parseInt(String(value).trim(), 10));
+    }
+    if (key === 'notes') {
+      // Name suffix is preserved in notes only because FTLS has no DB column for it.
+      // Compare it via the dedicated sx field instead, so one NSFX import does not
+      // also create a duplicate Notes diff.
+      return (value ?? '').toString()
+        .replace(/(^|\n)\s*(?:Name\s+suffix|Suffix)\s*:[^\n]*/ig, '$1')
+        .trim();
     }
     if (typeof value === 'boolean') return String(value);
     return (value ?? '').toString().trim();
@@ -2738,13 +2799,14 @@ async function mergeFieldsToDb(ftlsPerson, fieldsToApply, ext, editUser) {
       const p = rows[0];
       current = {
         id:p.id, fn:p.first_name, mn:p.middle_name, ln:p.last_name,
-        dn:p.display_name, nk:p.nickname, md:p.maiden_name, g:p.gender,
+        dn:p.display_name, nk:p.nickname, md:p.maiden_name, sx:getNameSuffixFromNotes(p.notes), g:p.gender,
         dob:p.date_of_birth, dod:p.date_of_death, dec:p.is_deceased, bo:p.birth_order,
         em:p.email, ph:p.phone, a1:p.address1, a2:p.address2,
         ci:p.city, st:p.state, zp:p.zip, co:p.country,
         fb:p.facebook, ig:p.instagram, li:p.linkedin, ws:p.website,
         pp:p.profile_photo, bio:p.bio, loc:p.location, prof:p.profession, emp:p.employer,
         stories:p.stories, notes:p.notes, pgl:p.photo_gallery_link, dl:p.documents_link,
+        tp:p.title_prefix, burd:p.burial_date,
       };
     }
   } catch(e) { console.warn('Could not re-fetch person, using in-memory data'); }
@@ -3732,7 +3794,7 @@ function parseIndi(el, noteMap = {}) {
   const id = el.pointer;
 
   // Primary name
-  let fn = '', mn = '', ln = '', nk = '', md = '', parsedBirthOrder = 0;
+  let fn = '', mn = '', ln = '', nk = '', md = '', tp = '', sx = '', parsedBirthOrder = 0;
   const nameEls = el.children.filter(c => c.tag === 'NAME');
 
   for (const nameEl of nameEls) {
@@ -3755,6 +3817,10 @@ function parseIndi(el, noteMap = {}) {
       const givnEl = nameEl.children.find(c => c.tag === 'GIVN');
       const surnEl = nameEl.children.find(c => c.tag === 'SURN');
       const secgEl = nameEl.children.find(c => c.tag === 'SECG');
+      const npfxEl = nameEl.children.find(c => c.tag === 'NPFX');
+      const nsfxEl = nameEl.children.find(c => c.tag === 'NSFX');
+      if (npfxEl && !tp) tp = npfxEl.value;
+      if (nsfxEl && !sx) sx = nsfxEl.value;
 
       if (givnEl) {
         // Strip leading birth-order number prefix like "4. Samuel" → "Samuel"
@@ -3803,6 +3869,7 @@ function parseIndi(el, noteMap = {}) {
   const dob = getNestedValue(el, 'BIRT', 'DATE');
   const loc = getNestedValue(el, 'BIRT', 'PLAC');
   const dod = getNestedValue(el, 'DEAT', 'DATE');
+  const burd = getNestedValue(el, 'BURI', 'DATE');
   const deatEl2 = el.children.find(c => c.tag === 'DEAT');
   const hasDeat = deatEl2 ? (deatEl2.value === 'Y' || !!dod) : false;
 
@@ -3864,9 +3931,11 @@ function parseIndi(el, noteMap = {}) {
     dn = `Mrs. ${ln} (name unknown)`;
   }
 
+  notes = upsertNameSuffixIntoNotes(notes, sx);
+
   const parsedPerson = {
-    id, fn, mn, ln, dn, nk, md, g,
-    dob, dod, dec: hasDeat || !!dod, bo: parsedBirthOrder,
+    id, fn, mn, ln, dn, nk, md, tp, sx, g,
+    dob, dod, burd, dec: hasDeat || !!dod, bo: parsedBirthOrder,
     em, ph, a1, a2, ci, st, zp, co,
     fb, ig, li, ws, pp, bio, loc,
     prof, emp, stories, notes, pgl, dl,
