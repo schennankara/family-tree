@@ -34,7 +34,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.7.22';
+    const APP_VERSION = 'v4.7.23';
     const BUILD_DATE = '2026-04-25';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
@@ -588,21 +588,13 @@ function dedupeNoteTextLines(text) {
 function collectGedcomNotes(el, noteMap = {}) {
   const pieces = [];
   const seen = new Set();
-  // Dedupe key is computed from the RAW (unlabeled) text. This way a person-level
-  // NOTE and a DEAT/BIRT/etc. event NOTE carrying the same underlying sentence
-  // collapse to one piece — even though the labeled output differs ("Death note: X"
-  // vs bare "X"). Without this, both keys differ and both pieces survive,
-  // producing the round-trip duplication seen in MFT-sourced GEDCOMs.
-  // First-wins: in practice the unlabeled person NOTE appears first in MFT output
-  // and is kept; the event-label gets dropped. That's the cleaner outcome.
-  const pushPiece = (scope, rawText, labeledText) => {
-    const cleaned = cleanGedcomNoteText(rawText || '');
+  const pushPiece = (scope, text) => {
+    const cleaned = cleanGedcomNoteText(text || '');
     if (!cleaned || isFtlsGeneratedNoteText(cleaned)) return;
     const key = normalizeGedcomNoteDedupeKey(cleaned);
     if (!key || seen.has(key)) return;
     seen.add(key);
-    const emit = labeledText !== undefined ? cleanGedcomNoteText(labeledText) : cleaned;
-    pieces.push({ scope, text: emit });
+    pieces.push({ scope, text: cleaned });
   };
   for (const child of (el.children || [])) {
     if (child.tag === 'NOTE') {
@@ -618,7 +610,7 @@ function collectGedcomNotes(el, noteMap = {}) {
       if (grand.tag !== 'NOTE') continue;
       const val = resolveGedcomNoteValue(grand.value, noteMap);
       if (!val || isFtlsGeneratedNoteText(val)) continue;
-      pushPiece(child.tag, val, `${gedcomEventLabel(child.tag)} note: ${val}`);
+      pushPiece(child.tag, `${gedcomEventLabel(child.tag)} note: ${val}`);
     }
   }
   return pieces;
@@ -1856,17 +1848,13 @@ function personToGedcomLines(person, context = {}) {
       // It's a pointer to an existing standalone NOTE record in gedcom_meta
       L.push(`1 NOTE ${person.notes.trim()}`);
     } else {
-      // Dedupe on export — guarantees FTLS never originates duplicated notes
-      // in its GEDCOMs, regardless of how dirty the in-memory value is.
-      // Belt-and-suspenders with the on-write dedup; if MFT later re-emits
-      // the same text duplicated, the import side will catch it again.
-      addStandaloneNote(dedupeNoteTextLines(person.notes));
+      addStandaloneNote(person.notes);
     }
   }
   // Bio as standalone note
-  if (person.bio) addStandaloneNote('BIO: ' + dedupeNoteTextLines(person.bio));
+  if (person.bio) addStandaloneNote('BIO: ' + person.bio);
   // Stories as standalone note
-  if (person.stories) addStandaloneNote('STORY: ' + dedupeNoteTextLines(person.stories));
+  if (person.stories) addStandaloneNote('STORY: ' + person.stories);
 
   // Custom tags — for FTLS re-import (machine-readable)
   if (person.fb) L.push(`1 _FACEBOOK ${person.fb}`);
@@ -3619,8 +3607,9 @@ async function restorePrunedMeta(archiveId) {
 }
 
 
-function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, allPersonMap) {
+function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, allPersonMap, forcedFamilyIds) {
   const extIds = extFamilyIds || new Set();
+  const forcedFamIds = forcedFamilyIds instanceof Set ? forcedFamilyIds : new Set(forcedFamilyIds || []);
   const extFams = extFamiliesMap || {};
   const personIds = new Set(persons.map(p => p.id));
   const pMap = {};
@@ -3693,11 +3682,13 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, 
     const kids = fam.children || [];
     const involvesOur = personIds.has(hid) || personIds.has(wid) || kids.some(k => personIds.has(k));
     const referencedByExport = referencedFamIds.has(fid);
-    if (!involvesOur && !referencedByExport) continue;
+    const forceFamilyExport = forcedFamIds.has(fid);
+    if (!involvesOur && !referencedByExport && !forceFamilyExport) continue;
     
     // If family exists in external AND not referenced by any exported person,
-    // only include if children list changed
-    if (extIds.has(fid) && !referencedByExport) {
+    // only include if children list changed — unless the user explicitly selected
+    // this FAM record's marriage/divorce facts for export.
+    if (extIds.has(fid) && !referencedByExport && !forceFamilyExport) {
       const extFam = extFams[fid];
       if (extFam) {
         const extKids = (extFam.children || []).sort().join(',');
@@ -3793,7 +3784,8 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, 
 }
 
 // Merge FTLS additions into the original external GEDCOM text
-function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamilyMap, extFamilyIds) {
+function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamilyMap, extFamilyIds, forcedFamilyIds) {
+  const forcedFamIds = forcedFamilyIds instanceof Set ? forcedFamilyIds : new Set(forcedFamilyIds || []);
   const originalElements = tokenizeGedcom(originalText);
   const originalNoteMap = buildGedcomNoteMap(originalElements);
   const generatedNoteIds = findGeneratedFtlsNoteIds(originalElements, originalNoteMap);
@@ -3844,7 +3836,7 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
     const hid = fam.husband_id || fam.husb || '';
     const wid = fam.wife_id || fam.wife || '';
     const kids = fam.children || [];
-    if (newPIds.has(hid) || newPIds.has(wid) || kids.some(k => newPIds.has(k))) {
+    if (forcedFamIds.has(fid) || newPIds.has(hid) || newPIds.has(wid) || kids.some(k => newPIds.has(k))) {
       const F = [`0 ${fid} FAM`];
       if (hid) F.push(`1 HUSB ${hid}`);
       if (wid) F.push(`1 WIFE ${wid}`);
@@ -3883,7 +3875,7 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
   const exportPersonIdsForFamilies = new Set(exportPersons.map(p => p.id));
   const exportPersonNameMapForFamilies = {};
   exportPersons.forEach(p => { exportPersonNameMapForFamilies[p.id] = p; });
-  const familyIdsToSync = new Set();
+  const familyIdsToSync = new Set(forcedFamIds);
   for (const [fid, fam] of Object.entries(ftlsFamilyMap)) {
     const hid = fam.husband_id || fam.husb || '';
     const wid = fam.wife_id || fam.wife || '';
@@ -6751,6 +6743,11 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
   const [fieldDir, setFieldDir] = useState({});
   // extFamDir: { famId: 'import'|null }
   const [extFamDir, setExtFamDir] = useState({});
+  // familyFactDir: { famId: { fieldKey: 'import'|'export'|null } }
+  // Same-ID family/marriage diffs are FAM-level facts, not person fields, so
+  // they need their own basket state. Without this, Review Marriage Facts could
+  // update FTLS but there was no way to mark those FAM facts for GEDCOM export.
+  const [familyFactDir, setFamilyFactDir] = useState({});
   const [fuzzyResolved, setFuzzyResolved] = useState({}); // { extId: 'remapped' | 'ignored' }
   const [fuzzyFamResolved, setFuzzyFamResolved] = useState({}); // { extFamId: 'remapped' | 'ignored' }
   const [showAddrOnly, setShowAddrOnly] = useState(false);
@@ -6795,7 +6792,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
           setDiffResult(result);
           setTab('summary');
           // Reset all directions
-          setExtDir({}); setFtlsDir({}); setChangedDir({}); setFieldDir({}); setExtFamDir({});
+          setExtDir({}); setFtlsDir({}); setChangedDir({}); setFieldDir({}); setExtFamDir({}); setFamilyFactDir({});
           setExpandedDiffs(new Set()); setMergeLog([]);
           setFuzzyResolved({}); setFuzzyFamResolved({});
           setFollowOnMatches([]); setFollowOnResolved({});
@@ -7110,6 +7107,26 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
     }));
   };
 
+  // Same-ID family/marriage fact direction helpers. These drive the basket for
+  // FAM-level facts like MARR DATE/PLAC, which cannot be represented as person
+  // field exports.
+  const getFamilyFactDirection = (familyId, fieldKey) => (familyFactDir[familyId]||{})[fieldKey] || null;
+  const setFamilyFactDirection = (familyId, fieldKey, dir) => {
+    setFamilyFactDir(prev => ({
+      ...prev,
+      [familyId]: { ...(prev[familyId]||{}), [fieldKey]: dir }
+    }));
+  };
+  const setFamilyFactAllDirection = (familyId, diffs, dir) => {
+    setFamilyFactDir(prev => {
+      const next = { ...prev };
+      if (!dir) { delete next[familyId]; return next; }
+      next[familyId] = {};
+      (diffs || []).forEach(d => { next[familyId][d.field || d.key] = dir; });
+      return next;
+    });
+  };
+
   // ── Family breadcrumb helpers ──
   // Build "Father & Mother → Spouse, children: A, B, C" string for a person
   // Build lineage path: walk up through parent families to root
@@ -7245,10 +7262,11 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
 
   // ── Compute basket contents ──
   const basket = useMemo(() => {
-    if (!diffResult) return { imports: [], exports: [], importFams: [], orphanFams: [] };
+    if (!diffResult) return { imports: [], exports: [], importFams: [], orphanFams: [], familyFactImports: [] };
     const imports = []; // { type, person, fields? }
-    const exports = []; // { type, person, fields? }
+    const exports = []; // { type, person, fields? } or { type:'family_facts', familyId, family, fields }
     const importFams = [];
+    const familyFactImports = [];
 
     // Ext-only persons marked for import
     diffResult.extOnly.forEach(p => { if (extDir[p.id] === 'import') imports.push({ type: 'ext_person', person: p }); });
@@ -7270,6 +7288,23 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
       if (expFields.length > 0) exports.push({ type: 'changed_fields', person: m.ftls, fields: expFields });
     });
 
+    // Changed same-ID FAM records — split marriage/divorce facts by direction.
+    // These are intentionally separate from person diffs because MARR DATE/PLAC
+    // live on GEDCOM FAM records. Exporting one of these should add the FAM record
+    // to the GEDCOM basket even if no person record is selected.
+    (diffResult.familyDiffs || []).filter(f => f.type === 'different').forEach(f => {
+      const dirs = familyFactDir[f.id] || {};
+      const impFields = [], expFields = [];
+      (f.diffs || []).forEach(d => {
+        const key = d.field || d.key;
+        const dir = dirs[key];
+        if (dir === 'import') impFields.push(d);
+        else if (dir === 'export') expFields.push(d);
+      });
+      if (impFields.length > 0) familyFactImports.push({ type:'family_facts', familyId:f.id, ftls:f.ftls, ext:f.ext, fields:impFields });
+      if (expFields.length > 0) exports.push({ type:'family_facts', familyId:f.id, family:f.ftls, ext:f.ext, fields:expFields });
+    });
+
     // ── ORPHAN FAMILIES: ext-only families whose members already exist in FTLS DB ──
     // These are families that failed to import (FK error) or were never selected
     const markedFamIds = new Set(importFams.map(f => f.id));
@@ -7282,8 +7317,8 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
       if (hasDbMember) orphanFams.push(fam);
     });
 
-    return { imports, exports, importFams, orphanFams };
-  }, [diffResult, extDir, ftlsDir, changedDir, fieldDir, extFamDir, personMap]);
+    return { imports, exports, importFams, orphanFams, familyFactImports };
+  }, [diffResult, extDir, ftlsDir, changedDir, fieldDir, extFamDir, familyFactDir, personMap]);
 
   const orphanFamilyCandidates = useMemo(() => {
     return basket.orphanFams.map(fam => {
@@ -7350,6 +7385,26 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
         else log.push('✓ Family ' + fam.id + ' — ' + (result?.action || 'created'));
       } catch(e) { log.push('✗ Family ' + fam.id + ': ' + e.message); }
     }
+    for (const item of (basket.familyFactImports || [])) {
+      try {
+        const patch = {};
+        for (const d of item.fields || []) {
+          const key = d.field || d.key;
+          if (key === 'mdate') patch.marriage_date = item.ext.mdate || item.ext.marriage_date || '';
+          if (key === 'mplace') patch.marriage_place = item.ext.mplace || item.ext.marriage_place || '';
+          if (key === 'divdate') patch.divorce_date = item.ext.divdate || item.ext.divorce_date || '';
+        }
+        if (item.ext.divorced && !item.ftls?.divorced) patch.divorced = true;
+        if (Object.keys(patch).length > 0) {
+          await sbFetch(`families?id=eq.${item.familyId}`, {
+            method:'PATCH',
+            body:JSON.stringify(patch),
+            headers:{'Prefer':'return=minimal'}
+          });
+          log.push('✓ Updated family facts on ' + item.familyId + ' (' + item.fields.map(f => f.label || f.field).join(', ') + ')');
+        }
+      } catch(e) { log.push('✗ Family facts ' + item.familyId + ': ' + e.message); }
+    }
     // Auto-update: find ALL external families that reference any imported person
     // This catches cases where a new child was added to an existing FTLS family
     const importedPersonIds = new Set(
@@ -7396,15 +7451,16 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
     basket.exports.filter(e => e.type === 'changed_fields').forEach(e => {
       if (!persons.find(p => p.id === e.person.id)) persons.push(e.person);
     });
-    if (persons.length === 0) { alert('No items to export.'); return; }
+    const forcedFamilyIds = new Set(basket.exports.filter(e => e.type === 'family_facts').map(e => e.familyId));
+    if (persons.length === 0 && forcedFamilyIds.size === 0) { alert('No items to export.'); return; }
     // Load ALL gedcom_meta records for lossless MacFamilyTree round-trip export
     try { window.gedcomMetaRecords = await sbFetch('gedcom_meta?select=*'); } catch(e) { window.gedcomMetaRecords = []; }
-    const content = exportDiffGedcom(persons, familyMap, extFamilyIds, extFamiliesMap, personMap);
+    const content = exportDiffGedcom(persons, familyMap, extFamilyIds, extFamiliesMap, personMap, forcedFamilyIds);
     const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob); const a = document.createElement('a');
     a.href = url; a.download = 'FTLS_Export_For_Merge.ged';
     document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
-    setMergeLog(prev => [...prev, '⬆ Exported ' + persons.length + ' persons as new GEDCOM']);
+    setMergeLog(prev => [...prev, '⬆ Exported ' + persons.length + ' persons and ' + forcedFamilyIds.size + ' family fact record(s) as new GEDCOM']);
   };
 
   // ── MERGE INTO LOADED GEDCOM ──
@@ -7414,16 +7470,18 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
     basket.exports.filter(e => e.type === 'changed_fields').forEach(e => {
       if (!persons.find(p => p.id === e.person.id)) persons.push(e.person);
     });
+    const forcedFamilyIds = new Set(basket.exports.filter(e => e.type === 'family_facts').map(e => e.familyId));
+    if (persons.length === 0 && forcedFamilyIds.size === 0) { alert('No items to export.'); return; }
     const expFields = basket.exports.filter(e => e.type === 'changed_fields').map(e => ({
       personId: e.person.id,
       fields: e.fields.map(f => ({ key: f.key, value: f.ftls }))
     }));
-    const content = buildMergedGedcom(extGedcomText, persons, expFields, familyMap, extFamilyIds);
+    const content = buildMergedGedcom(extGedcomText, persons, expFields, familyMap, extFamilyIds, forcedFamilyIds);
     const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob); const a = document.createElement('a');
     a.href = url; a.download = fileName.replace('.ged', '') + '_merged.ged';
     document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
-    setMergeLog(prev => [...prev, '⬆ Merged into ' + fileName + ' (' + persons.length + ' persons, ' + expFields.length + ' field updates)']);
+    setMergeLog(prev => [...prev, '⬆ Merged into ' + fileName + ' (' + persons.length + ' persons, ' + expFields.length + ' field updates, ' + forcedFamilyIds.size + ' family fact record(s))']);
   };
 
   const S = diffResult?.stats;
@@ -7444,7 +7502,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
     </span>);
   };
 
-  const basketCount = basket.imports.length + basket.importFams.length + basket.exports.length + repairableOrphanFams.length + orphanFamilyCandidates.length;
+  const basketCount = basket.imports.length + basket.importFams.length + (basket.familyFactImports||[]).length + basket.exports.length + repairableOrphanFams.length + orphanFamilyCandidates.length;
 
   return (
     <div style={{ position:'fixed', inset:0, zIndex:200, display:'flex', alignItems:'center', justifyContent:'center' }}>
@@ -7652,23 +7710,48 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
                     const hName = personMap[hid]?.dn || extPeopleMap[hid]?.dn || hid || '—';
                     const wName = personMap[wid]?.dn || extPeopleMap[wid]?.dn || wid || '—';
                     return (<div key={f.id} style={{ marginBottom:8, border:'1px solid '+BR, borderRadius:8, overflow:'hidden' }}>
-                      <div style={{ padding:'9px 12px', background:'rgba(196,163,90,0.04)', display:'flex', alignItems:'center', justifyContent:'space-between', gap:8 }}>
+                      <div style={{ padding:'9px 12px', background:'rgba(196,163,90,0.04)', display:'flex', alignItems:'center', justifyContent:'space-between', gap:8, flexWrap:'wrap' }}>
                         <div>
                           <div style={{ color:TX, fontSize:13 }}>{hName} ⚭ {wName} <span style={badge('rgba(196,163,90,0.6)')}>{f.diffs.length} family diff{f.diffs.length>1?'s':''}</span></div>
                           <div style={{ fontSize:10, color:DM }}>{f.id}</div>
                         </div>
-                        <button onClick={() => setFamilyReview({ extFam: f.ext, ftlsFamId: f.id, source: 'same_id' })}
-                          style={{ background:'rgba(126,184,208,0.12)', border:'1px solid rgba(126,184,208,0.3)', color:'#7eb8d0', padding:'4px 12px', borderRadius:5, cursor:'pointer', fontSize:11 }}>
-                          Review Marriage Facts
-                        </button>
+                        <div style={{display:'flex',alignItems:'center',gap:8,flexWrap:'wrap'}}>
+                          <button onClick={() => setFamilyFactAllDirection(f.id, f.diffs, 'import')}
+                            style={{ background:'rgba(107,158,114,0.10)', border:'1px solid rgba(107,158,114,0.25)', color:MC, padding:'4px 10px', borderRadius:5, cursor:'pointer', fontSize:11 }}>
+                            ⬇ Import Facts
+                          </button>
+                          <button onClick={() => setFamilyFactAllDirection(f.id, f.diffs, 'export')}
+                            style={{ background:'rgba(196,163,90,0.10)', border:'1px solid rgba(196,163,90,0.25)', color:GC, padding:'4px 10px', borderRadius:5, cursor:'pointer', fontSize:11 }}>
+                            ⬆ Export Facts
+                          </button>
+                          <button onClick={() => setFamilyFactAllDirection(f.id, f.diffs, null)}
+                            style={{ background:'transparent', border:'1px solid '+BR, color:DM, padding:'4px 10px', borderRadius:5, cursor:'pointer', fontSize:11 }}>
+                            Clear
+                          </button>
+                          <button onClick={() => setFamilyReview({ extFam: f.ext, ftlsFamId: f.id, source: 'same_id' })}
+                            style={{ background:'rgba(126,184,208,0.12)', border:'1px solid rgba(126,184,208,0.3)', color:'#7eb8d0', padding:'4px 12px', borderRadius:5, cursor:'pointer', fontSize:11 }}>
+                            Review Marriage Facts
+                          </button>
+                        </div>
                       </div>
                       <div style={{ padding:'6px 12px' }}>
                         <table style={{ width:'100%', fontSize:12, borderCollapse:'collapse' }}>
-                          <tbody>{f.diffs.map(d => (<tr key={d.field} style={{ borderTop:'1px solid rgba(196,163,90,0.06)' }}>
-                            <td style={{ padding:'4px 8px', color:DM, width:140 }}>{d.label || d.field}</td>
-                            <td style={{ padding:'4px 8px', color:TX }}>{Array.isArray(d.ftls) ? d.ftls.join(', ') : (d.ftls || '(empty)')}</td>
-                            <td style={{ padding:'4px 8px', color:'#8ec496' }}>{Array.isArray(d.ext) ? d.ext.join(', ') : (d.ext || '(empty)')}</td>
-                          </tr>))}</tbody>
+                          <thead><tr>
+                            <th style={{ textAlign:'left', color:DM, padding:'4px 8px', width:130 }}>Direction</th>
+                            <th style={{ textAlign:'left', color:DM, padding:'4px 8px', width:140 }}>Field</th>
+                            <th style={{ textAlign:'left', color:GC, padding:'4px 8px' }}>FTLS</th>
+                            <th style={{ textAlign:'left', color:MC, padding:'4px 8px' }}>External</th>
+                          </tr></thead>
+                          <tbody>{f.diffs.map(d => {
+                            const key = d.field || d.key;
+                            const dir = getFamilyFactDirection(f.id, key);
+                            return (<tr key={key} style={{ borderTop:'1px solid rgba(196,163,90,0.06)' }}>
+                              <td style={{ padding:'4px 8px' }}><DirBtn dir={dir} onSet={(next)=>setFamilyFactDirection(f.id, key, next)} /></td>
+                              <td style={{ padding:'4px 8px', color:DM, width:140 }}>{d.label || d.field}</td>
+                              <td style={{ padding:'4px 8px', color:TX, background:dir==='export'?'rgba(196,163,90,0.06)':'transparent' }}>{Array.isArray(d.ftls) ? d.ftls.join(', ') : (d.ftls || '(empty)')}</td>
+                              <td style={{ padding:'4px 8px', color:'#8ec496', background:dir==='import'?'rgba(107,158,114,0.06)':'transparent' }}>{Array.isArray(d.ext) ? d.ext.join(', ') : (d.ext || '(empty)')}</td>
+                            </tr>);
+                          })}</tbody>
                         </table>
                       </div>
                     </div>);
@@ -8370,7 +8453,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
 
             {/* ──── BASKET ──── */}
             {tab==='basket' && (<div style={{ padding:'12px 0' }}>
-              {basket.imports.length===0 && basket.exports.length===0 && basket.importFams.length===0 && repairableOrphanFams.length===0 && orphanFamilyCandidates.length===0 ? (
+              {basket.imports.length===0 && basket.exports.length===0 && basket.importFams.length===0 && (basket.familyFactImports||[]).length===0 && repairableOrphanFams.length===0 && orphanFamilyCandidates.length===0 ? (
                 <div style={{ textAlign:'center', padding:'40px 20px', color:DM }}>
                   <div style={{ fontSize:36, marginBottom:12 }}>🧺</div>
                   <div style={{ fontSize:14 }}>Basket is empty</div>
@@ -8442,8 +8525,8 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
                 </>)}
 
                 {/* IMPORT SECTION */}
-                {(basket.imports.length>0 || basket.importFams.length>0) && (<>
-                  <div style={hdr}>⬇ Import into FTLS ({basket.imports.length + basket.importFams.length} items)</div>
+                {(basket.imports.length>0 || basket.importFams.length>0 || (basket.familyFactImports||[]).length>0) && (<>
+                  <div style={hdr}>⬇ Import into FTLS ({basket.imports.length + basket.importFams.length + (basket.familyFactImports||[]).length} items)</div>
                   {basket.imports.map((item, i) => (<div key={i} style={{ ...rowSt, display:'flex', alignItems:'center', gap:8 }}>
                     <span style={{ width:8, height:8, borderRadius:'50%', background:item.person.g==='M'?MC:FC, flexShrink:0 }} />
                     <span style={{ color:TX, flex:1 }}>
@@ -8459,9 +8542,19 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
                       📎 {hName} ⚭ {wName} — {(fam.children||[]).length} children <span style={badge('rgba(126,184,208,0.5)')}>new family</span>
                     </div>);
                   })}
+                  {(basket.familyFactImports||[]).map((item, i) => {
+                    const fam = item.ftls || {};
+                    const hid = fam.husband_id || fam.husb || item.ext?.husb || '';
+                    const wid = fam.wife_id || fam.wife || item.ext?.wife || '';
+                    const hName = personMap[hid]?.dn || extPeopleMap[hid]?.dn || hid || '—';
+                    const wName = personMap[wid]?.dn || extPeopleMap[wid]?.dn || wid || '—';
+                    return (<div key={'ffi'+i} style={{ ...rowSt, fontSize:12, color:TX }}>
+                      💍 {hName} ⚭ {wName} <span style={{ color:DM, fontSize:11, marginLeft:6 }}>({item.fields.map(f=>f.label||f.field).join(', ')})</span> <span style={badge('rgba(107,158,114,0.5)')}>family facts</span>
+                    </div>);
+                  })}
                   <div style={{ marginTop:12, display:'flex', gap:10, alignItems:'center' }}>
                     <button onClick={()=>{
-                      const count = basket.imports.length + basket.importFams.length;
+                      const count = basket.imports.length + basket.importFams.length + (basket.familyFactImports||[]).length;
                       if (confirm(`This will write ${count} item${count>1?'s':''} to the FTLS database. New persons will be added; existing persons will have selected fields updated.\n\nContinue?`)) {
                         batchImport();
                       }
@@ -8475,14 +8568,31 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
                 {/* EXPORT SECTION */}
                 {basket.exports.length>0 && (<>
                   <div style={{...hdr, marginTop: (basket.imports.length>0||basket.importFams.length>0)?24:0}}>⬆ Export from FTLS ({basket.exports.length} items)</div>
-                  {basket.exports.map((item, i) => (<div key={i} style={{ ...rowSt, display:'flex', alignItems:'center', gap:8 }}>
-                    <span style={{ width:8, height:8, borderRadius:'50%', background:item.person.g==='M'?MC:FC, flexShrink:0 }} />
-                    <span style={{ color:TX, flex:1 }}>
-                      {item.person.dn||'?'}
-                      {item.type==='changed_fields' && <span style={{ color:DM, fontSize:11, marginLeft:6 }}>({item.fields.map(f=>f.label).join(', ')})</span>}
-                      {item.type==='ftls_person' && <span style={badge('rgba(155,130,196,0.5)')}>new</span>}
-                    </span>
-                  </div>))}
+                  {basket.exports.map((item, i) => {
+                    if (item.type === 'family_facts') {
+                      const fam = item.family || {};
+                      const hid = fam.husband_id || fam.husb || item.ext?.husb || '';
+                      const wid = fam.wife_id || fam.wife || item.ext?.wife || '';
+                      const hName = personMap[hid]?.dn || extPeopleMap[hid]?.dn || hid || '—';
+                      const wName = personMap[wid]?.dn || extPeopleMap[wid]?.dn || wid || '—';
+                      return (<div key={'famx'+i} style={{ ...rowSt, display:'flex', alignItems:'center', gap:8 }}>
+                        <span style={{ width:8, height:8, borderRadius:'50%', background:GC, flexShrink:0 }} />
+                        <span style={{ color:TX, flex:1 }}>
+                          💍 {hName} ⚭ {wName}
+                          <span style={{ color:DM, fontSize:11, marginLeft:6 }}>({item.fields.map(f=>f.label||f.field).join(', ')})</span>
+                          <span style={badge('rgba(196,163,90,0.5)')}>family facts</span>
+                        </span>
+                      </div>);
+                    }
+                    return (<div key={i} style={{ ...rowSt, display:'flex', alignItems:'center', gap:8 }}>
+                      <span style={{ width:8, height:8, borderRadius:'50%', background:item.person.g==='M'?MC:FC, flexShrink:0 }} />
+                      <span style={{ color:TX, flex:1 }}>
+                        {item.person.dn||'?'}
+                        {item.type==='changed_fields' && <span style={{ color:DM, fontSize:11, marginLeft:6 }}>({item.fields.map(f=>f.label).join(', ')})</span>}
+                        {item.type==='ftls_person' && <span style={badge('rgba(155,130,196,0.5)')}>new</span>}
+                      </span>
+                    </div>);
+                  })}
                   <div style={{ marginTop:12, display:'flex', gap:10, flexWrap:'wrap' }}>
                     <button onClick={batchExportGedcom} style={{ background:'rgba(196,163,90,0.1)', border:'1px solid '+GD, color:GC, padding:'8px 20px', borderRadius:6, cursor:'pointer', fontSize:13 }}>
                       📄 Download as New GEDCOM
