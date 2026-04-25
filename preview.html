@@ -34,7 +34,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.7.17';
+    const APP_VERSION = 'v4.7.18';
     const BUILD_DATE = '2026-04-25';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
@@ -1847,11 +1847,37 @@ const PERSON_VISIBLE_DIFF_FIELDS = PERSON_DIFF_FIELDS.filter(([key]) => key !== 
 
 function diffPersonFields(left, right, fields=PERSON_DIFF_FIELDS) {
   const diffs = [];
+  const isMeaningfulBirthOrder = (v) => {
+    if (v === null || v === undefined) return false;
+    const s = String(v).trim();
+    if (!s || s === '0') return false;
+    const n = parseInt(s, 10);
+    return Number.isFinite(n) && n > 0;
+  };
+  const normalizeForDiff = (key, value) => {
+    if (key === 'bo') {
+      // Birth order is a parser/UI helper, not a GEDCOM fact. Most external
+      // files have no order prefix, so parseIndi() yields 0. Treat 0/blank as
+      // "not supplied" and only surface a diff when the external GEDCOM has a
+      // positive birth-order value that actually conflicts or fills a blank.
+      if (!isMeaningfulBirthOrder(value)) return '';
+      return String(parseInt(String(value).trim(), 10));
+    }
+    if (typeof value === 'boolean') return String(value);
+    return (value ?? '').toString().trim();
+  };
   for (const [key, label] of fields) {
     const leftVal = left?.[key];
     const rightVal = right?.[key];
-    const leftNorm = typeof leftVal === 'boolean' ? String(leftVal) : (leftVal ?? '').toString().trim();
-    const rightNorm = typeof rightVal === 'boolean' ? String(rightVal) : (rightVal ?? '').toString().trim();
+    const leftNorm = normalizeForDiff(key, leftVal);
+    const rightNorm = normalizeForDiff(key, rightVal);
+
+    // For birth order specifically, an empty/0 external value means "MFT did
+    // not provide this," not "clear FTLS birth_order." Do not create noise for
+    // FTLS 1/2/3/etc. versus external 0/blank. If external has a positive
+    // order and FTLS is blank or different, show it.
+    if (key === 'bo' && !rightNorm) continue;
+
     if (leftNorm !== rightNorm && (leftNorm || rightNorm)) {
       diffs.push({ key, label, ftls: leftNorm, ext: rightNorm });
     }
