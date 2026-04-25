@@ -1768,7 +1768,13 @@ function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap)
   // Uses fuzzy person identity so parent-family diffs don't light up just because IDs drifted.
   function sameParentFamily(ftlsParent, extParent) {
     if (!ftlsParent && !extParent) return true;
-    if (!ftlsParent || !extParent) return false;
+    // If one side has no parent family, that's missing data — not a conflict.
+    // A partial GEDCOM import won't include every ancestor's parent family
+    // (e.g. importing Luca Joy under his mother Alexa won't necessarily include
+    // Alexa's own parents). Treating that as "different parents" generates
+    // false-alarm diffs in the Changed Fields tab. Real conflicts (both sides
+    // specify a family AND they differ) are still caught below.
+    if (!ftlsParent || !extParent) return true;
     if (ftlsParent.familyId === extParent.familyId) return true;
     const hMatch = personsEquivalent(ftlsParent.husband, extParent.husband);
     const wMatch = personsEquivalent(ftlsParent.wife, extParent.wife);
@@ -2353,16 +2359,42 @@ async function mergeDuplicatePeople(keepId, removeId, editUser, options={}) {
   const opts = typeof options === 'string' ? { preferSource: options } : (options || {});
   const preferSource = opts.preferSource || 'keep';
   const fieldSelections = opts.fieldSelections || {};
+  // Optional: caller can pass an already-parsed external person object as the
+  // 'remove' side (e.g. from a GEDCOM parse where that person is not in
+  // Supabase). When present, skip the sbFetch for removeId — the object is
+  // treated as the source of field values only, and no Supabase row is deleted
+  // because there was never a row to begin with.
+  const removePersonOverride = opts.removePersonOverride || null;
+  // When true (typical for external merges): skip remap of other tables to
+  // point at keepId (the external removeId was never referenced anywhere).
+  const skipRemap = !!opts.skipRemap;
 
   const keepRows = await sbFetch(`persons?id=eq.${keepId}&select=*`);
-  const removeRows = await sbFetch(`persons?id=eq.${removeId}&select=*`);
   const keepRow = keepRows[0];
-  const removeRow = removeRows[0];
   if (!keepRow) throw new Error('Keep record ' + keepId + ' not found');
-  if (!removeRow) throw new Error('Duplicate record ' + removeId + ' not found');
+
+  let removeRow = null;
+  let removePerson;
+  if (removePersonOverride) {
+    // External merge: build a dummy "row-like" object for audit logging, but
+    // do not try to read it from Supabase.
+    removePerson = { ...removePersonOverride };
+    removeRow = {
+      id: removeId,
+      display_name: removePersonOverride.dn || '',
+      first_name: removePersonOverride.fn || '',
+      last_name: removePersonOverride.ln || '',
+      gender: removePersonOverride.g || '',
+      city: removePersonOverride.ci || ''
+    };
+  } else {
+    const removeRows = await sbFetch(`persons?id=eq.${removeId}&select=*`);
+    removeRow = removeRows[0];
+    if (!removeRow) throw new Error('Duplicate record ' + removeId + ' not found');
+    removePerson = personRowToTreePerson(removeRow);
+  }
 
   const keepPerson = personRowToTreePerson(keepRow);
-  const removePerson = personRowToTreePerson(removeRow);
   const merged = { ...keepPerson, id: keepId };
   const allKeys = new Set(PERSON_DIFF_FIELDS.map(([key]) => key));
 
@@ -2432,6 +2464,12 @@ async function mergeDuplicatePeople(keepId, removeId, editUser, options={}) {
       }
     });
   } catch(e) { console.warn('Duplicate merge log failed:', e); }
+
+  // The rest of this function reassigns references from removeId → keepId across
+  // families, users, family_members, media, then deletes removeId.
+  // For external merges (removeId was never in Supabase), there's nothing to
+  // reassign and nothing to delete. skipRemap short-circuits.
+  if (skipRemap) return;
 
   const famsH = await sbFetch(`families?husband_id=eq.${removeId}&select=id`);
   for (const f of famsH) {
@@ -5802,6 +5840,16 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
   const [showOthers, setShowOthers] = useState(false);
   const [familyReview, setFamilyReview] = useState(null);
   const [ftlsDupReview, setFtlsDupReview] = useState(null); // { currentId, duplicateId, current, duplicate, matchReasons, score }
+  // External-merge review state: opens DuplicateResolveModal with keepId = FTLS id,
+  // orphan = external person (from ext data, not Supabase). This is what wires the
+  // fuzzy-matched-person "Keep FTLS ID, merge fields" flow.
+  const [extMergeReview, setExtMergeReview] = useState(null); // { ftlsId, extId, ftlsPerson, extPerson, matchReasons, score }
+  // Follow-on matches queued after a successful merge — rendered at the top of
+  // the Fuzzy tab so the user can walk the chain one step at a time (Option A
+  // cascade: nothing auto-merges, each step needs explicit confirmation).
+  // Each entry: { kind: 'person'|'family', ...context, originId: string, sourceLabel: string }
+  const [followOnMatches, setFollowOnMatches] = useState([]);
+  const [followOnResolved, setFollowOnResolved] = useState({}); // { followOnKey: 'merged'|'skipped' }
 
   const handleFile = () => {
     const input = document.createElement('input');
@@ -5831,6 +5879,8 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
           // Reset all directions
           setExtDir({}); setFtlsDir({}); setChangedDir({}); setFieldDir({}); setExtFamDir({});
           setExpandedDiffs(new Set()); setMergeLog([]);
+          setFuzzyResolved({}); setFuzzyFamResolved({});
+          setFollowOnMatches([]); setFollowOnResolved({});
         } catch (err) { alert('Error parsing GEDCOM: ' + err.message); }
       };
       reader.readAsText(file, 'utf-8');
@@ -5947,6 +5997,118 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
     ctx.lineagePath = path;
     return ctx;
   }, [personMap, familyMap]);
+
+  // After a person merge (ftlsId ↔ extId), compute the follow-on candidates that
+  // stem from the newly-linked identity. Walks parent and spouse families on both
+  // sides; anywhere the FTLS side has xref X and the external side has xref Y
+  // for what appears to be the same role (parent, spouse, family-unit), surface
+  // Y as a new match candidate. The user then merges or skips each one.
+  //
+  // Returns an array of follow-on entries. Types:
+  //   { kind: 'person', ftlsId, extId, ftlsPerson, extPerson, reason, originLabel }
+  //   { kind: 'family', ftlsFamId, extFam, ftlsFam, reason, originLabel }
+  // Each entry has a stable `key` built from its identifying xrefs so the user's
+  // merged/skipped state survives re-computation.
+  const computeFollowOnMatches = useCallback((ftlsId, extId, originLabel) => {
+    const out = [];
+    const ftlsPerson = personMap[ftlsId];
+    const extPerson = extPeopleMap[extId];
+    if (!ftlsPerson || !extPerson) return out;
+
+    const seen = new Set(); // dedup by key
+
+    // Helper: push a person follow-on if xrefs differ and both ends exist
+    const tryPersonPair = (fId, eId, reason) => {
+      if (!fId || !eId || fId === eId) return;
+      const f = personMap[fId];
+      const e = extPeopleMap[eId];
+      if (!f || !e) return;
+      // Skip if the FTLS side already exists at the external xref (i.e., this
+      // particular mismatch has already been resolved elsewhere)
+      if (personMap[eId]) return;
+      const key = 'person|' + fId + '|' + eId;
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push({
+        key, kind: 'person',
+        ftlsId: fId, extId: eId,
+        ftlsPerson: f, extPerson: e,
+        reason, originLabel
+      });
+    };
+
+    // Helper: push a family follow-on if xrefs differ
+    const tryFamilyPair = (fFamId, eFamId, reason) => {
+      if (!fFamId || !eFamId || fFamId === eFamId) return;
+      const ff = familyMap[fFamId];
+      const ef = extFamiliesMap[eFamId];
+      if (!ff || !ef) return;
+      // Skip if FTLS already has the external family id (already reconciled)
+      if (familyMap[eFamId]) return;
+      const key = 'family|' + fFamId + '|' + eFamId;
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push({
+        key, kind: 'family',
+        ftlsFamId: fFamId, extFamId: eFamId,
+        ftlsFam: ff, extFam: ef,
+        reason, originLabel
+      });
+    };
+
+    // Parent family walk
+    const ftlsParentFam = Object.entries(familyMap).find(([,f]) => (f.children || []).includes(ftlsId));
+    const extParentFam = Object.entries(extFamiliesMap).find(([,f]) => (f.children || []).includes(extId));
+    if (ftlsParentFam && extParentFam) {
+      const [fFamId, fFam] = ftlsParentFam;
+      const [eFamId, eFam] = extParentFam;
+      if (fFamId !== eFamId) {
+        tryFamilyPair(fFamId, eFamId, 'Parent family of ' + (extPerson.dn || extId));
+      }
+      // Parents themselves — father and mother of the merged person
+      const fHusb = fFam.husband_id || fFam.husb || '';
+      const eHusb = eFam.husband_id || eFam.husb || '';
+      tryPersonPair(fHusb, eHusb, 'Father of ' + (extPerson.dn || extId));
+      const fWife = fFam.wife_id || fFam.wife || '';
+      const eWife = eFam.wife_id || eFam.wife || '';
+      tryPersonPair(fWife, eWife, 'Mother of ' + (extPerson.dn || extId));
+    }
+
+    // Spouse-family walk
+    const ftlsSpouseFams = Object.entries(familyMap).filter(([,f]) =>
+      (f.husband_id === ftlsId) || (f.wife_id === ftlsId)
+    );
+    const extSpouseFams = Object.entries(extFamiliesMap).filter(([,f]) =>
+      ((f.husband_id || f.husb) === extId) || ((f.wife_id || f.wife) === extId)
+    );
+    // If each side has exactly one spouse family, pair them up as likely the same
+    if (ftlsSpouseFams.length === 1 && extSpouseFams.length === 1) {
+      const [fFamId, fFam] = ftlsSpouseFams[0];
+      const [eFamId, eFam] = extSpouseFams[0];
+      if (fFamId !== eFamId) {
+        tryFamilyPair(fFamId, eFamId, 'Spouse family of ' + (extPerson.dn || extId));
+      }
+      // The spouse themselves
+      const fSpouse = fFam.husband_id === ftlsId ? (fFam.wife_id || '') : (fFam.husband_id || '');
+      const eSpouse = ((eFam.husband_id || eFam.husb) === extId)
+        ? ((eFam.wife_id || eFam.wife) || '')
+        : ((eFam.husband_id || eFam.husb) || '');
+      tryPersonPair(fSpouse, eSpouse, 'Spouse of ' + (extPerson.dn || extId));
+      // Children who share names/positions — pair by birth order if present
+      const fKids = fFam.children || [];
+      const eKids = eFam.children || [];
+      if (fKids.length === eKids.length && fKids.length > 0) {
+        // Only safe-pair when sets differ and lengths match; otherwise the user
+        // reviews children via the family merge flow.
+        for (let i = 0; i < fKids.length; i++) {
+          tryPersonPair(fKids[i], eKids[i], 'Child of ' + (extPerson.dn || extId));
+        }
+      }
+    }
+
+    // Filter out anything the user already resolved in this session
+    return out.filter(entry => !followOnResolved[entry.key]);
+  }, [personMap, familyMap, extPeopleMap, extFamiliesMap, followOnResolved]);
 
   const reconcileExternalFamily = useCallback(async (extFam, ftlsFamId, options={}) => {
     if (!extFam || !ftlsFamId) throw new Error('Family reconciliation needs both an external family and an FTLS family');
@@ -6819,6 +6981,92 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
                   Review the differences below. If they are the same person and the external has newer data, you can import the changed fields.
                 </div>
               </div>
+              {/* Related matches: follow-on candidates queued by previous merges
+                  in this session. Each entry lets the user walk one hop at a
+                  time — merge, skip, or open the full comparison dialog. */}
+              {(() => {
+                const pending = followOnMatches.filter(m => !followOnResolved[m.key]);
+                if (pending.length === 0) return null;
+                return (
+                  <div style={{ padding:'12px 14px', marginBottom:16, background:'rgba(159,126,178,0.08)', border:'1px solid rgba(159,126,178,0.3)', borderRadius:8 }}>
+                    <div style={{ fontSize:13, color:'#b89fcc', fontWeight:500, marginBottom:6 }}>🔗 Related Matches ({pending.length})</div>
+                    <div style={{ fontSize:12, color:DM, lineHeight:1.5, marginBottom:10 }}>
+                      These follow-on candidates came up because of merges you just did. Each one is reviewed separately — nothing happens unless you click.
+                    </div>
+                    {pending.map(entry => {
+                      if (entry.kind === 'person') {
+                        const fDn = entry.ftlsPerson?.dn || entry.ftlsId;
+                        const eDn = entry.extPerson?.dn || entry.extId;
+                        const fDob = entry.ftlsPerson?.dob || '';
+                        const eDob = entry.extPerson?.dob || '';
+                        return (
+                          <div key={entry.key} style={{ padding:'8px 10px', marginBottom:6, background:'rgba(255,255,255,0.03)', border:'1px solid rgba(159,126,178,0.15)', borderRadius:6 }}>
+                            <div style={{ fontSize:11, color:'#b89fcc', marginBottom:4 }}>{entry.reason} · from merge of {entry.originLabel}</div>
+                            <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', gap:10, flexWrap:'wrap' }}>
+                              <div style={{ fontSize:12, color:TX }}>
+                                <span style={{ color:'#7eb8d0' }}>FTLS: {fDn}</span>
+                                {fDob && <span style={{ color:DM, marginLeft:4 }}>b.{fDob}</span>}
+                                <span style={{ color:DM }}> ↔ </span>
+                                <span style={{ color:GC }}>Ext: {eDn}</span>
+                                {eDob && <span style={{ color:DM, marginLeft:4 }}>b.{eDob}</span>}
+                              </div>
+                              <div style={{ display:'flex', gap:6 }}>
+                                <button onClick={() => {
+                                  setExtMergeReview({
+                                    ftlsId: entry.ftlsId,
+                                    extId: entry.extId,
+                                    ftlsPerson: entry.ftlsPerson,
+                                    extPerson: entry.extPerson,
+                                    matchReasons: [entry.reason],
+                                    score: null,
+                                    followOnKey: entry.key
+                                  });
+                                }} style={{ background:'rgba(107,158,114,0.15)', border:'1px solid rgba(107,158,114,0.4)', color:MC, padding:'3px 10px', borderRadius:4, cursor:'pointer', fontSize:11 }}>
+                                  🧬 Merge
+                                </button>
+                                <button onClick={() => setFollowOnResolved(prev => ({ ...prev, [entry.key]: 'skipped' }))}
+                                  style={{ background:'transparent', border:'1px solid '+BR, color:DM, padding:'3px 10px', borderRadius:4, cursor:'pointer', fontSize:11 }}>
+                                  Skip
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      }
+                      // kind === 'family'
+                      const ff = entry.ftlsFam;
+                      const ef = entry.extFam;
+                      const fH = ff.husband_id ? (personMap[ff.husband_id]?.dn || ff.husband_id) : '—';
+                      const fW = ff.wife_id ? (personMap[ff.wife_id]?.dn || ff.wife_id) : '—';
+                      const eH = (ef.husband_id || ef.husb) ? (extPeopleMap[ef.husband_id || ef.husb]?.dn || personMap[ef.husband_id || ef.husb]?.dn || (ef.husband_id || ef.husb)) : '—';
+                      const eW = (ef.wife_id || ef.wife) ? (extPeopleMap[ef.wife_id || ef.wife]?.dn || personMap[ef.wife_id || ef.wife]?.dn || (ef.wife_id || ef.wife)) : '—';
+                      return (
+                        <div key={entry.key} style={{ padding:'8px 10px', marginBottom:6, background:'rgba(255,255,255,0.03)', border:'1px solid rgba(159,126,178,0.15)', borderRadius:6 }}>
+                          <div style={{ fontSize:11, color:'#b89fcc', marginBottom:4 }}>{entry.reason} · from merge of {entry.originLabel}</div>
+                          <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', gap:10, flexWrap:'wrap' }}>
+                            <div style={{ fontSize:12, color:TX }}>
+                              📎 <span style={{ color:'#7eb8d0' }}>FTLS: {fH} ⚭ {fW}</span>
+                              <span style={{ color:DM }}> ↔ </span>
+                              <span style={{ color:GC }}>Ext: {eH} ⚭ {eW}</span>
+                            </div>
+                            <div style={{ display:'flex', gap:6 }}>
+                              <button onClick={() => {
+                                setFamilyReview({ extFam: ef, ftlsFamId: entry.ftlsFamId, source: 'followon', followOnKey: entry.key });
+                              }} style={{ background:'rgba(126,184,208,0.12)', border:'1px solid rgba(126,184,208,0.3)', color:'#7eb8d0', padding:'3px 10px', borderRadius:4, cursor:'pointer', fontSize:11 }}>
+                                Review Family
+                              </button>
+                              <button onClick={() => setFollowOnResolved(prev => ({ ...prev, [entry.key]: 'skipped' }))}
+                                style={{ background:'transparent', border:'1px solid '+BR, color:DM, padding:'3px 10px', borderRadius:4, cursor:'pointer', fontSize:11 }}>
+                                Skip
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })()}
               {/* Bulk auto-remap for high-confidence fuzzy matches.
                   Why: without this, users remap one person at a time, skip some, and
                   duplicate xrefs accumulate silently across future imports. High-confidence
@@ -6916,9 +7164,27 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
                 <div style={{ padding:'6px 14px 10px', display:'flex', gap:8, alignItems:'center' }}>
                   {fuzzyResolved[m.extId] === 'remapped' ? (
                     <span style={{ fontSize:12, color:'#6b9e72' }}>✓ ID aligned to {m.extId}</span>
+                  ) : fuzzyResolved[m.extId] === 'merged_ftls' ? (
+                    <span style={{ fontSize:12, color:'#6b9e72' }}>✓ Merged into FTLS {m.ftlsId}</span>
                   ) : fuzzyResolved[m.extId] === 'ignored' ? (
                     <span style={{ fontSize:12, color:DM }}>— Ignored</span>
                   ) : (<>
+                    {/* Keep FTLS ID: opens the per-field merge dialog with
+                        keepId = FTLS xref. External person acts as the source
+                        of new field values (name corrections, DOBs, etc.) but
+                        the FTLS xref is preserved so nothing downstream breaks. */}
+                    <button onClick={() => {
+                      setExtMergeReview({
+                        ftlsId: m.ftlsId,
+                        extId: m.extId,
+                        ftlsPerson: personMap[m.ftlsId] || m.ftls,
+                        extPerson: m.ext,
+                        matchReasons: m.matchReasons || [],
+                        score: m.score
+                      });
+                    }} style={{ background:'rgba(107,158,114,0.15)', border:'1px solid rgba(107,158,114,0.4)', color:MC, padding:'4px 12px', borderRadius:5, cursor:'pointer', fontSize:11 }}>
+                      🧬 Keep FTLS ID, merge fields
+                    </button>
                     <button onClick={async () => {
                       if (!confirm(`This will change the FTLS ID from ${m.ftlsId} to ${m.extId} and update all family references.\n\nThis ensures future GEDCOM imports from Rolson won't create duplicates.\n\nContinue?`)) return;
                       try {
@@ -6936,7 +7202,6 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
                       style={{ background:'transparent', border:'1px solid '+BR, color:DM, padding:'4px 12px', borderRadius:5, cursor:'pointer', fontSize:11 }}>
                       Ignore
                     </button>
-                    <span style={{ fontSize:10, color:DM }}>Keeps the GEDCOM/import ID so future syncs match this person</span>
                   </>)}
                 </div>
               </div>))}
@@ -7300,6 +7565,11 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
                 setMerging(true);
                 const result = await reconcileExternalFamily(familyReview.extFam, familyReview.ftlsFamId, { keepMode, fieldSelections });
                 setFuzzyFamResolved(prev => ({ ...prev, [familyReview.extFam.id]: 'remapped' }));
+                // If this family review was opened from a follow-on card, mark
+                // that follow-on resolved so it stops appearing in the list.
+                if (familyReview.followOnKey) {
+                  setFollowOnResolved(prev => ({ ...prev, [familyReview.followOnKey]: 'merged' }));
+                }
                 const hName = familyReview.extFam.husb ? (extPeopleMap[familyReview.extFam.husb]?.dn || personMap[familyReview.extFam.husb]?.dn || familyReview.extFam.husb) : '—';
                 const wName = familyReview.extFam.wife ? (extPeopleMap[familyReview.extFam.wife]?.dn || personMap[familyReview.extFam.wife]?.dn || familyReview.extFam.wife) : '—';
                 setMergeLog(prev => [...prev, '✓ Family duplicate merged: ' + familyReview.ftlsFamId + ' → ' + result.targetId + ' (' + hName + ' ⚭ ' + wName + ')']);
@@ -7341,6 +7611,87 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
               } catch(e) {
                 alert('Duplicate merge failed: ' + e.message);
                 setMergeLog(prev => [...prev, '✗ Duplicate merge failed: ' + e.message]);
+              } finally {
+                setMerging(false);
+              }
+            }}
+          />
+        );
+      })()}
+      {/* External merge review: FTLS ↔ external fuzzy match, user keeps FTLS id
+          and picks which fields to take from the external side. This is the
+          Option-A flow — after the merge completes, follow-on candidates are
+          computed and surfaced at the top of the Fuzzy tab for the next step. */}
+      {extMergeReview && (() => {
+        // orphanPerson = external side (treated as merge source), candidatePerson = FTLS
+        const candidate = extMergeReview.ftlsPerson;
+        const orphan = { ...extMergeReview.extPerson }; // clone to avoid mutating extPeopleMap
+        return (
+          <DuplicateResolveModal
+            orphanPerson={orphan}
+            candidatePerson={candidate}
+            candidateMeta={{ score: extMergeReview.score, status: 'external_merge' }}
+            personMap={personMap}
+            familyMap={familyMap}
+            initialKeepId={extMergeReview.ftlsId}
+            busy={merging}
+            matchReasons={extMergeReview.matchReasons || []}
+            buildPersonContext={buildPersonContext}
+            onBack={() => setExtMergeReview(null)}
+            onClose={() => setExtMergeReview(null)}
+            onConfirm={async ({ keepId, removeId, preferSource, fieldSelections }) => {
+              try {
+                setMerging(true);
+                // Force keepId to FTLS — the external side has no Supabase row,
+                // so we cannot flip direction here. The modal's "keep" buttons
+                // are still shown for consistency, but only keepId = ftlsId is
+                // valid in this code path. If the user happened to pick the
+                // other direction, fall back to the GEDCOM-ID remap instead.
+                if (keepId !== extMergeReview.ftlsId) {
+                  await remapPersonId(extMergeReview.ftlsId, extMergeReview.extId, user?.email || 'GEDCOM merge');
+                  setFuzzyResolved(prev => ({ ...prev, [extMergeReview.extId]: 'remapped' }));
+                  setMergeLog(prev => [...prev, '✓ Remapped ' + (orphan.dn || '?') + ': ' + extMergeReview.ftlsId + ' → ' + extMergeReview.extId]);
+                } else {
+                  // External-source merge: orphan's field values overlay onto
+                  // the FTLS record (where field selection says so). The
+                  // external record itself is not in Supabase, so skipRemap
+                  // prevents the merge function from trying to reassign
+                  // references that don't exist.
+                  await mergeDuplicatePeople(
+                    keepId,
+                    extMergeReview.extId,
+                    user?.email || 'GEDCOM external merge',
+                    {
+                      preferSource,
+                      fieldSelections,
+                      removePersonOverride: orphan,
+                      skipRemap: true
+                    }
+                  );
+                  setFuzzyResolved(prev => ({ ...prev, [extMergeReview.extId]: 'merged_ftls' }));
+                  // If this merge was triggered by clicking Merge on a follow-on
+                  // card, mark that card resolved so it disappears from the list.
+                  if (extMergeReview.followOnKey) {
+                    setFollowOnResolved(prev => ({ ...prev, [extMergeReview.followOnKey]: 'merged' }));
+                  }
+                  setMergeLog(prev => [...prev, '✓ Merged external ' + extMergeReview.extId + ' into FTLS ' + extMergeReview.ftlsId + ' (' + (candidate.dn || '?') + ')']);
+                  // Compute follow-on candidates and queue them
+                  const originLabel = candidate.dn || extMergeReview.ftlsId;
+                  const followOns = computeFollowOnMatches(extMergeReview.ftlsId, extMergeReview.extId, originLabel);
+                  if (followOns.length > 0) {
+                    setFollowOnMatches(prev => {
+                      const existingKeys = new Set(prev.map(e => e.key));
+                      const novel = followOns.filter(f => !existingKeys.has(f.key));
+                      return [...prev, ...novel];
+                    });
+                    setMergeLog(prev => [...prev, '  → ' + followOns.length + ' follow-on match' + (followOns.length === 1 ? '' : 'es') + ' queued for review']);
+                  }
+                  if (onMergeComplete) onMergeComplete();
+                }
+                setExtMergeReview(null);
+              } catch(e) {
+                alert('External merge failed: ' + e.message);
+                setMergeLog(prev => [...prev, '✗ External merge failed: ' + e.message]);
               } finally {
                 setMerging(false);
               }
