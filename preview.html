@@ -34,8 +34,8 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.7.15';
-    const BUILD_DATE = '2026-04-24';
+    const APP_VERSION = 'v4.7.17';
+    const BUILD_DATE = '2026-04-25';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
 
@@ -214,6 +214,170 @@ function parseFtlsReconciliationSnapshotText(text) {
     out[key] = val;
   }
   return out;
+}
+
+function normalizeFtlsReconciliationValue(value) {
+  if (value === null || value === undefined) return '';
+  const v = String(value).trim();
+  if (!v) return '';
+  if (/^\(blank in FTLS\)$/i.test(v)) return '';
+  return v.replace(/\\n/g, '\n');
+}
+
+function getFtlsReconciliationValue(snapshot, labels) {
+  if (!snapshot) return '';
+  for (const label of labels) {
+    if (Object.prototype.hasOwnProperty.call(snapshot, label)) {
+      return normalizeFtlsReconciliationValue(snapshot[label]);
+    }
+  }
+  return '';
+}
+
+function splitFtlsReconciliationRefs(value) {
+  const v = normalizeFtlsReconciliationValue(value);
+  if (!v) return [];
+  return v.split(',').map(x => x.trim()).filter(Boolean);
+}
+
+function applyFtlsReconciliationSnapshotDefaults(person, snapshot) {
+  if (!snapshot) return person;
+  const out = { ...person, _ftlsSnapshot: snapshot };
+  const applied = [];
+  const isBlank = (v) => {
+    if (v === null || v === undefined) return true;
+    if (Array.isArray(v)) return v.length === 0;
+    if (typeof v === 'number') return !v;
+    if (typeof v === 'boolean') return false;
+    return String(v).trim() === '';
+  };
+  const fill = (key, labels, transform) => {
+    if (!isBlank(out[key])) return;
+    const raw = getFtlsReconciliationValue(snapshot, labels);
+    if (!raw) return;
+    const next = transform ? transform(raw) : raw;
+    if (next === null || next === undefined || next === '') return;
+    out[key] = next;
+    applied.push(key);
+  };
+
+  fill('dn', ['Display Name']);
+  fill('fn', ['First/Given Name', 'First Name']);
+  fill('mn', ['Middle/Second Name', 'Middle Name']);
+  fill('ln', ['Last/Surname', 'Last Name', 'Surname']);
+  fill('nk', ['Nickname']);
+  fill('md', ['Maiden Name']);
+  fill('tp', ['Title Prefix']);
+  fill('g', ['Gender']);
+  fill('bo', ['Birth Order'], v => {
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) ? n : 0;
+  });
+
+  fill('dob', ['Birth Date']);
+  fill('loc', ['Birth Place']);
+  fill('dod', ['Death Date']);
+  fill('burd', ['Burial Date']);
+
+  const decVal = getFtlsReconciliationValue(snapshot, ['Deceased Flag', 'Deceased']);
+  if (decVal && !out.dec) {
+    if (/^(true|yes|y|1)$/i.test(decVal)) { out.dec = true; applied.push('dec'); }
+  }
+
+  fill('a1', ['Address 1 / Residence Place', 'Address 1', 'Residence Place']);
+  fill('a2', ['Address 2']);
+  fill('ci', ['City']);
+  fill('st', ['State']);
+  fill('zp', ['Zip / Postal Code', 'Zip', 'Postal Code']);
+  fill('co', ['Country']);
+
+  fill('ph', ['Phone']);
+  fill('em', ['Email']);
+  fill('ws', ['Website']);
+  fill('fb', ['Facebook']);
+  fill('ig', ['Instagram']);
+  fill('li', ['LinkedIn']);
+  fill('prof', ['Profession / Occupation', 'Profession', 'Occupation']);
+  fill('emp', ['Employer']);
+  fill('pp', ['Profile Photo']);
+  fill('pgl', ['Photo Gallery Link', 'Photo Gallery']);
+  fill('dl', ['Documents Link', 'Documents']);
+
+  // These are FTLS-only content fields. MFT may not export them except through
+  // this worksheet, so the worksheet should repopulate them when normal NOTE
+  // parsing did not already produce values.
+  fill('notes', ['FTLS Notes', 'Notes']);
+  fill('bio', ['FTLS Bio', 'Bio']);
+  fill('stories', ['FTLS Stories / Memories', 'Stories', 'Story']);
+
+  if (isBlank(out.fams)) {
+    const refs = splitFtlsReconciliationRefs(getFtlsReconciliationValue(snapshot, ['Spouse-family refs (FAMS)', 'FAMS']));
+    if (refs.length) { out.fams = refs; applied.push('fams'); }
+  }
+  if (isBlank(out.famc)) {
+    const refs = splitFtlsReconciliationRefs(getFtlsReconciliationValue(snapshot, ['Parent-family refs (FAMC)', 'FAMC']));
+    if (refs.length) { out.famc = refs; applied.push('famc'); }
+  }
+  fill('primaryFamId', ['Primary Family ID']);
+
+  if (applied.length > 0) out._ftlsSnapshotApplied = applied;
+  return out;
+}
+
+function applyFtlsReconciliationSnapshotDefaultsToDbRow(row, snapshot) {
+  if (!snapshot) return row;
+  const person = {
+    id: row.id,
+    fn: row.first_name, mn: row.middle_name, ln: row.last_name, dn: row.display_name,
+    nk: row.nickname, md: row.maiden_name, g: row.gender,
+    dob: row.date_of_birth, dod: row.date_of_death, dec: row.is_deceased, bo: row.birth_order,
+    em: row.email, ph: row.phone,
+    a1: row.address1, a2: row.address2, ci: row.city, st: row.state, zp: row.zip, co: row.country,
+    fb: row.facebook, ig: row.instagram, li: row.linkedin, ws: row.website,
+    pp: row.profile_photo, bio: row.bio, loc: row.location,
+    prof: row.profession, emp: row.employer, stories: row.stories, notes: row.notes,
+    pgl: row.photo_gallery_link, dl: row.documents_link,
+    tp: row.title_prefix, burd: row.burial_date,
+    primaryFamId: row.primary_family_id,
+  };
+  const merged = applyFtlsReconciliationSnapshotDefaults(person, snapshot);
+  row.first_name = merged.fn || '';
+  row.middle_name = merged.mn || '';
+  row.last_name = merged.ln || '';
+  row.display_name = merged.dn || ((merged.fn || '') + (merged.mn ? ' ' + merged.mn : '') + (merged.ln ? ' ' + merged.ln : '')).trim() || merged.nk || '(Unknown)';
+  row.nickname = merged.nk || '';
+  row.maiden_name = merged.md || '';
+  row.gender = merged.g || '';
+  row.date_of_birth = merged.dob || '';
+  row.date_of_death = merged.dod || '';
+  row.is_deceased = !!merged.dec;
+  row.birth_order = merged.bo || 0;
+  row.email = merged.em || '';
+  row.phone = merged.ph || '';
+  row.address1 = merged.a1 || '';
+  row.address2 = merged.a2 || '';
+  row.city = merged.ci || '';
+  row.state = merged.st || '';
+  row.zip = merged.zp || '';
+  row.country = merged.co || '';
+  row.facebook = merged.fb || '';
+  row.instagram = merged.ig || '';
+  row.linkedin = merged.li || '';
+  row.website = merged.ws || '';
+  row.profile_photo = merged.pp || '';
+  row.bio = merged.bio || '';
+  row.location = merged.loc || '';
+  row.profession = merged.prof || '';
+  row.employer = merged.emp || '';
+  row.stories = merged.stories || '';
+  row.notes = merged.notes || '';
+  row.photo_gallery_link = merged.pgl || '';
+  row.documents_link = merged.dl || '';
+  row.title_prefix = merged.tp || '';
+  row.burial_date = merged.burd || '';
+  // Do not set primary_family_id during destructive migration: persons are inserted before families,
+  // and a FK constraint could reject otherwise-valid person rows.
+  return row;
 }
 
 function collectFtlsReconciliationSnapshots(el, noteMap = {}) {
@@ -1043,6 +1207,14 @@ async function migrateGedcomToSupabase(gedcomText, onProgress) {
         else if (val) { if (pNotes) pNotes += '\n'; pNotes += val; }
       }
       pRec.notes = pNotes; pRec.bio = pBio; pRec.stories = pStories;
+      // If this GEDCOM contains an FTLS reconciliation worksheet, use it as
+      // fallback data for FTLS-only fields that MFT did not export normally.
+      // This keeps destructive GEDCOM → Supabase migration consistent with
+      // parseGedcomFile()/Diff & Merge parsing.
+      applyFtlsReconciliationSnapshotDefaultsToDbRow(
+        pRec,
+        (collectFtlsReconciliationSnapshots(el, noteMap)[0] || null)
+      );
     } else if (el.tag === 'FAM' && el.pointer) {
       const divEl2 = el.children.find(c => c.tag === 'DIV');
       const divorced2 = divEl2 ? (divEl2.value === 'Y' || divEl2.value === '' || divEl2.children.length > 0) : false;
@@ -1657,7 +1829,7 @@ async function downloadGedcom(tree, personMap, familyMap) {
 
 const PERSON_DIFF_FIELDS = [
   ['fn','First Name'],['mn','Middle Name'],['ln','Last Name'],['dn','Display Name'],
-  ['nk','Nickname'],['md','Maiden Name'],['tp','Title Prefix'],['g','Gender'],
+  ['nk','Nickname'],['md','Maiden Name'],['tp','Title Prefix'],['g','Gender'],['bo','Birth Order'],
   ['dob','Birth Date'],['dod','Death Date'],['burd','Burial Date'],['loc','Birth Place'],
   ['prof','Occupation'],['emp','Employer'],['ph','Phone'],['em','Email'],
   ['a1','Address'],['a2','Address 2'],['ci','City'],['st','State'],['co','Country'],['zp','Zip'],
@@ -1665,6 +1837,13 @@ const PERSON_DIFF_FIELDS = [
   ['pp','Profile Photo'],['notes','Notes'],['bio','Bio'],['stories','Stories'],
   ['pgl','Photo Gallery'],['dl','Documents'],['_xg','Extra GEDCOM']
 ];
+
+// Normal Changed tab comparison. Keep _xg out of the ordinary field diff
+// because preserved MFT passthrough blocks (OBJE/CHAN/_CRE/RESI/etc.) are noisy,
+// but include every FTLS-managed human field. This catches cases where the
+// person identity changed only in display_name or birth-order prefix, e.g.
+// FTLS "Aabraham Avarachan Mathai" vs MFT "Kochu Avarachan".
+const PERSON_VISIBLE_DIFF_FIELDS = PERSON_DIFF_FIELDS.filter(([key]) => key !== '_xg');
 
 function diffPersonFields(left, right, fields=PERSON_DIFF_FIELDS) {
   const diffs = [];
@@ -1680,15 +1859,10 @@ function diffPersonFields(left, right, fields=PERSON_DIFF_FIELDS) {
   return diffs;
 }
 
-// Compare fields between two person objects, return changed fields
+// Compare fields between two person objects, return changed fields.
+// Use the app's existing parsed person objects; do not re-parse GEDCOM here.
 function diffPerson(ftls, ext) {
-  return diffPersonFields(ftls, ext, [
-    ['fn','First Name'],['mn','Middle Name'],['ln','Last Name'],['nk','Nickname'],
-    ['md','Maiden Name'],['g','Gender'],['dob','Birth Date'],['dod','Death Date'],
-    ['loc','Birth Place'],['ph','Phone'],['em','Email'],['prof','Occupation'],
-    ['a1','Address'],['ci','City'],['st','State'],['co','Country'],['zp','Zip'],
-    ['notes','Notes'],['bio','Bio']
-  ]);
+  return diffPersonFields(ftls, ext, PERSON_VISIBLE_DIFF_FIELDS);
 }
 
 function normalizeNameText(value) {
@@ -3664,7 +3838,7 @@ function parseIndi(el, noteMap = {}) {
     dn = `Mrs. ${ln} (name unknown)`;
   }
 
-  return {
+  const parsedPerson = {
     id, fn, mn, ln, dn, nk, md, g,
     dob, dod, dec: hasDeat || !!dod, bo: parsedBirthOrder,
     em, ph, a1, a2, ci, st, zp, co,
@@ -3673,6 +3847,11 @@ function parseIndi(el, noteMap = {}) {
     fams, famc,
     _ftlsSnapshot: ftlsSnapshots[0] || null,
   };
+
+  // Reconciliation worksheet fallback:
+  // Normal GEDCOM/MFT fields above are authoritative. The worksheet only
+  // refills fields that MFT did not export in a structured GEDCOM tag.
+  return applyFtlsReconciliationSnapshotDefaults(parsedPerson, ftlsSnapshots[0] || null);
 }
 
 function parseFam(el) {
