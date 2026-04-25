@@ -5811,7 +5811,7 @@ function MediaUploadModal({flat, user, onDone, onCancel}) {
 
 /* ───── GEDCOM DIFF & MERGE UI ───── */
 /* ───── GEDCOM DIFF & MERGE UI — BASKET WORKFLOW ───── */
-function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete }) {
+function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete, onSilentRefresh }) {
   const [diffResult, setDiffResult] = useState(null);
   const [fileName, setFileName] = useState('');
   const [extGedcomText, setExtGedcomText] = useState(''); // keep raw text for merge-into
@@ -7100,6 +7100,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
                           }
                         }
                         alert(`Done. Remapped ${ok}${fail > 0 ? ', ' + fail + ' failed (see merge log)' : ''}.`);
+                        if (ok > 0 && onSilentRefresh) onSilentRefresh();
                       }}
                       style={{ background:'rgba(107,158,114,0.18)', border:'1px solid rgba(107,158,114,0.5)', color:MC, padding:'6px 14px', borderRadius:6, cursor:'pointer', fontSize:12, fontWeight:500, whiteSpace:'nowrap' }}>
                       ⚡ Remap all ({eligible.length})
@@ -7191,6 +7192,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
                         await remapPersonId(m.ftlsId, m.extId, user?.email || 'GEDCOM merge');
                         setFuzzyResolved(prev => ({...prev, [m.extId]: 'remapped'}));
                         setMergeLog(prev => [...prev, '✓ Remapped ' + (m.ext.dn||'?') + ': ' + m.ftlsId + ' → ' + m.extId]);
+                        if (onSilentRefresh) onSilentRefresh();
                       } catch(e) {
                         alert('Remap failed: ' + e.message);
                         setMergeLog(prev => [...prev, '✗ Remap failed for ' + (m.ext.dn||'?') + ': ' + e.message]);
@@ -7574,6 +7576,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
                 const wName = familyReview.extFam.wife ? (extPeopleMap[familyReview.extFam.wife]?.dn || personMap[familyReview.extFam.wife]?.dn || familyReview.extFam.wife) : '—';
                 setMergeLog(prev => [...prev, '✓ Family duplicate merged: ' + familyReview.ftlsFamId + ' → ' + result.targetId + ' (' + hName + ' ⚭ ' + wName + ')']);
                 setFamilyReview(null);
+                if (onSilentRefresh) onSilentRefresh();
               } catch (e) {
                 alert('Family reconcile failed: ' + e.message);
                 setMergeLog(prev => [...prev, '✗ Family reconcile failed: ' + e.message]);
@@ -7608,6 +7611,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
                 setFuzzyResolved(prev => ({...prev, [ftlsDupReview.currentId + '|' + ftlsDupReview.duplicateId]: 'merged'}));
                 setMergeLog(prev => [...prev, '✓ Duplicate merged: ' + (currentPerson.dn||'?') + ' — kept ' + keepId + ', removed ' + removeId]);
                 setFtlsDupReview(null);
+                if (onSilentRefresh) onSilentRefresh();
               } catch(e) {
                 alert('Duplicate merge failed: ' + e.message);
                 setMergeLog(prev => [...prev, '✗ Duplicate merge failed: ' + e.message]);
@@ -7686,7 +7690,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete 
                     });
                     setMergeLog(prev => [...prev, '  → ' + followOns.length + ' follow-on match' + (followOns.length === 1 ? '' : 'es') + ' queued for review']);
                   }
-                  if (onMergeComplete) onMergeComplete();
+                  if (onSilentRefresh) onSilentRefresh();
                 }
                 setExtMergeReview(null);
               } catch(e) {
@@ -9801,7 +9805,7 @@ function App(){
       {showRequestAccount&&<RequestAccountModal flat={flat} onDone={()=>setShowRequestAccount(false)} onCancel={()=>setShowRequestAccount(false)}/>}
       {showViewerIdentity&&viewerSubmitData&&<ViewerIdentityModal submitData={viewerSubmitData} flat={flat} onDone={()=>{setShowViewerIdentity(false);setViewerSubmitData(null);setMsg('Update request submitted!')}} onCancel={()=>{setShowViewerIdentity(false);setViewerSubmitData(null)}}/>}
       {showMigrate&&<MigrateDialog onDone={()=>setShowMigrate(false)} onCancel={()=>setShowMigrate(false)}/>}
-      {showDiff&&<GedcomDiffModal onClose={()=>setShowDiff(false)} personMap={personMap} familyMap={familyMap} user={user} onMergeComplete={()=>{setShowDiff(false);setMsg('Merging complete — refreshing...');reloadTree(false)}}/>}
+      {showDiff&&<GedcomDiffModal onClose={()=>setShowDiff(false)} personMap={personMap} familyMap={familyMap} user={user} onMergeComplete={()=>{setShowDiff(false);setMsg('Merging complete — refreshing...');reloadTree(false)}} onSilentRefresh={()=>{reloadTree(true)}}/>}
       {showBackfill&&<BackfillModal onClose={()=>setShowBackfill(false)} onComplete={()=>{setShowBackfill(false);setMsg('Backfill complete — refreshing...');reloadTree(false)}}/>}
       {showPrune&&<PruneOrphanMetaModal onClose={()=>setShowPrune(false)} user={user}/>}
       {movingBranch&&<MoveBranchModal node={movingBranch} personMap={personMap} familyMap={familyMap} flat={flat} tree={tree} user={user} onMove={handleMove} onRequestMove={handleRequestMove} onResolveDuplicate={handleResolveDuplicate} onClose={()=>setMovingBranch(null)}/>}
