@@ -57,7 +57,12 @@ const SB_HEADERS = {
   'apikey': SUPABASE_KEY,
   'Authorization': 'Bearer ' + SUPABASE_KEY,
   'Content-Type': 'application/json',
-  'Prefer': 'return=representation'
+  // Default to return=minimal: PostgREST will not run an implicit SELECT after
+  // writes, which avoids 403s when the user's role lacks SELECT on the target
+  // table (the Ashley/edit_log bug class). No write in this app consumes the
+  // response body — if a future write needs the inserted row back, override
+  // per-call with: headers: { 'Prefer': 'return=representation' }
+  'Prefer': 'return=minimal'
 };
 
 /* ───── CLOUDINARY CONFIG ───── */
