@@ -34,7 +34,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.7.20';
+    const APP_VERSION = 'v4.7.21';
     const BUILD_DATE = '2026-04-25';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
@@ -431,7 +431,7 @@ function applyFtlsReconciliationSnapshotDefaultsToDbRow(row, snapshot) {
   row.profession = merged.prof || '';
   row.employer = merged.emp || '';
   row.stories = merged.stories || '';
-  row.notes = upsertNameSuffixIntoNotes(merged.notes || '', merged.sx || '');
+  row.notes = dedupeNoteTextLines(upsertNameSuffixIntoNotes(merged.notes || '', merged.sx || ''));
   row.photo_gallery_link = merged.pgl || '';
   row.documents_link = merged.dl || '';
   row.title_prefix = merged.tp || '';
@@ -562,22 +562,55 @@ function gedcomEventLabel(tag) {
   return labels[tag] || tag;
 }
 
+function normalizeGedcomNoteDedupeKey(text) {
+  return cleanGedcomNoteText(text || '')
+    .replace(/\r?\n/g, '\n')
+    .split('\n')
+    .map(line => line.replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+    .join('\n')
+    .toLowerCase();
+}
+
+function dedupeNoteTextLines(text) {
+  const seen = new Set();
+  const out = [];
+  for (const line of String(text || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n')) {
+    const key = normalizeGedcomNoteDedupeKey(line);
+    if (!key) continue;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(line.trim());
+  }
+  return out.join('\n');
+}
+
 function collectGedcomNotes(el, noteMap = {}) {
   const pieces = [];
+  const seen = new Set();
+  const pushPiece = (scope, text) => {
+    const cleaned = cleanGedcomNoteText(text || '');
+    if (!cleaned || isFtlsGeneratedNoteText(cleaned)) return;
+    const key = normalizeGedcomNoteDedupeKey(cleaned);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    pieces.push({ scope, text: cleaned });
+  };
   for (const child of (el.children || [])) {
     if (child.tag === 'NOTE') {
       const val = resolveGedcomNoteValue(child.value, noteMap);
-      if (!val || isFtlsGeneratedNoteText(val)) continue;
-      pieces.push({ scope: 'person', text: val });
+      pushPiece('person', val);
       continue;
     }
     // Capture event-level notes such as BIRT/DEAT/ADOP/MARR > NOTE @...@.
     // Store them in the same FTLS Notes field with a label so they are not lost.
+    // De-duplicate after round-trip: an FTLS export may contain the same text as
+    // a normal person NOTE and as an event-level NOTE preserved by MFT.
     for (const grand of (child.children || [])) {
       if (grand.tag !== 'NOTE') continue;
       const val = resolveGedcomNoteValue(grand.value, noteMap);
       if (!val || isFtlsGeneratedNoteText(val)) continue;
-      pieces.push({ scope: child.tag, text: `${gedcomEventLabel(child.tag)} note: ${val}` });
+      pushPiece(child.tag, `${gedcomEventLabel(child.tag)} note: ${val}`);
     }
   }
   return pieces;
@@ -927,7 +960,7 @@ async function savePerson(person, editUser) {
     facebook: person.fb||'', instagram: person.ig||'', linkedin: person.li||'',
     website: person.ws||'', profile_photo: person.pp||'', bio: person.bio||'',
     location: person.loc||'', profession: person.prof||'', employer: person.emp||'',
-    stories: person.stories||'', notes: upsertNameSuffixIntoNotes(person.notes||'', person.sx||''),
+    stories: person.stories||'', notes: dedupeNoteTextLines(upsertNameSuffixIntoNotes(person.notes||'', person.sx||'')),
     photo_gallery_link: person.pgl||'', documents_link: person.dl||'',
     title_prefix: person.tp||'', burial_date: person.burd||'',
     _extra_gedcom: person._xg||'',
@@ -1344,7 +1377,7 @@ async function migrateGedcomToSupabase(gedcomText, onProgress) {
         else if (val.startsWith('STORY: ')) { pStories = val.substring(7); }
         else if (val) { if (pNotes) pNotes += '\n'; pNotes += val; }
       }
-      pRec.notes = upsertNameSuffixIntoNotes(pNotes, sx); pRec.bio = pBio; pRec.stories = pStories;
+      pRec.notes = dedupeNoteTextLines(upsertNameSuffixIntoNotes(pNotes, sx)); pRec.bio = pBio; pRec.stories = pStories;
       // If this GEDCOM contains an FTLS reconciliation worksheet, use it as
       // fallback data for FTLS-only fields that MFT did not export normally.
       // This keeps destructive GEDCOM → Supabase migration consistent with
@@ -2099,9 +2132,11 @@ function diffPersonFields(left, right, fields=PERSON_DIFF_FIELDS) {
     if (key === 'notes') {
       // Name suffix is preserved in notes only because FTLS has no DB column for it.
       // Compare it via the dedicated sx field instead, so one NSFX import does not
-      // also create a duplicate Notes diff.
-      return (value ?? '').toString()
-        .replace(/(^|\n)\s*(?:Name\s+suffix|Suffix)\s*:[^\n]*/ig, '$1')
+      // also create a duplicate Notes diff. Also normalize duplicate note lines
+      // caused by round-tripping the same MFT event note both as person NOTE and
+      // as event-level NOTE (e.g. repeated Death note lines).
+      return dedupeNoteTextLines((value ?? '').toString()
+        .replace(/(^|\n)\s*(?:Name\s+suffix|Suffix)\s*:[^\n]*/ig, '$1'))
         .trim();
     }
     if (typeof value === 'boolean') return String(value);
@@ -4164,7 +4199,7 @@ function parseIndi(el, noteMap = {}) {
     dn = `Mrs. ${ln} (name unknown)`;
   }
 
-  notes = upsertNameSuffixIntoNotes(notes, sx);
+  notes = dedupeNoteTextLines(upsertNameSuffixIntoNotes(notes, sx));
 
   const parsedPerson = {
     id, fn, mn, ln, dn, nk, md, tp, sx, g,
