@@ -34,7 +34,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.7.24';
+    const APP_VERSION = 'v4.7.25';
     const BUILD_DATE = '2026-04-25';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
@@ -95,7 +95,7 @@ const KNOWN_INDI_L1 = new Set([
 ]);
 
 // L1 tags that FTLS manages on FAM records. Same principle as above.
-const KNOWN_FAM_L1 = new Set(['HUSB', 'WIFE', 'CHIL', 'MARR']);
+const KNOWN_FAM_L1 = new Set(['HUSB', 'WIFE', 'CHIL', 'MARR', 'DIV']);
 
 /* ───── CANONICAL GEDCOM TOKENIZER ─────
    The ONLY tokenizer in this app. Previously duplicated inline at three
@@ -1715,20 +1715,49 @@ function addStandaloneFamilyReconciliationNote(famLines, standaloneNotes, fam, p
   standaloneNotes.push(...noteLines);
 }
 
-function appendOrReplaceFamilyMarriageBlock(lines, fam) {
+function buildFamilyMarriageLines(fam) {
   const mdate = fam.marriage_date || fam.mdate || '';
   const mplace = fam.marriage_place || fam.mplace || '';
-  if (!mdate && !mplace) return lines;
+  if (!mdate && !mplace) return [];
+  const lines = ['1 MARR'];
+  if (mdate) lines.push(`2 DATE ${mdate}`);
+  if (mplace) lines.push(`2 PLAC ${mplace}`);
+  return lines;
+}
+
+function buildFamilyDivorceLines(fam) {
+  const ddate = fam.divorce_date || fam.divdate || '';
+  const divorced = !!fam.divorced || !!ddate;
+  if (!divorced) return [];
+  const lines = ['1 DIV Y'];
+  if (ddate) lines.push(`2 DATE ${ddate}`);
+  return lines;
+}
+
+function insertFamilyFactLinesBeforeChildren(lines, factLines) {
+  if (!factLines || factLines.length === 0) return lines;
+  const out = lines.slice();
+  let insertAt = out.findIndex(l => /^1\s+CHIL\s/.test(l));
+  if (insertAt < 0) insertAt = out.length;
+  out.splice(insertAt, 0, ...factLines);
+  return out;
+}
+
+function appendOrReplaceFamilyFactBlocks(lines, fam) {
+  const replacements = {
+    MARR: buildFamilyMarriageLines(fam),
+    DIV: buildFamilyDivorceLines(fam),
+  };
+  const inserted = { MARR: false, DIV: false };
   const out = [];
-  let inserted = false;
+
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    if (/^1\s+MARR(?:\s|$)/.test(line)) {
-      if (!inserted) {
-        out.push('1 MARR');
-        if (mdate) out.push(`2 DATE ${mdate}`);
-        if (mplace) out.push(`2 PLAC ${mplace}`);
-        inserted = true;
+    const m = line.match(/^1\s+(MARR|DIV)(?:\s|$)/);
+    if (m && replacements[m[1]].length > 0) {
+      if (!inserted[m[1]]) {
+        out.push(...replacements[m[1]]);
+        inserted[m[1]] = true;
       }
       i++;
       while (i < lines.length && !/^1\s+/.test(lines[i])) i++;
@@ -1737,15 +1766,16 @@ function appendOrReplaceFamilyMarriageBlock(lines, fam) {
     }
     out.push(line);
   }
-  if (!inserted) {
-    let insertAt = out.findIndex(l => /^1\s+CHIL\s/.test(l));
-    if (insertAt < 0) insertAt = out.length;
-    const marrLines = ['1 MARR'];
-    if (mdate) marrLines.push(`2 DATE ${mdate}`);
-    if (mplace) marrLines.push(`2 PLAC ${mplace}`);
-    out.splice(insertAt, 0, ...marrLines);
-  }
-  return out;
+
+  let finalLines = out;
+  if (!inserted.MARR) finalLines = insertFamilyFactLinesBeforeChildren(finalLines, replacements.MARR);
+  if (!inserted.DIV) finalLines = insertFamilyFactLinesBeforeChildren(finalLines, replacements.DIV);
+  return finalLines;
+}
+
+// Backward-compatible name for older callsites; now handles MARR and DIV.
+function appendOrReplaceFamilyMarriageBlock(lines, fam) {
+  return appendOrReplaceFamilyFactBlocks(lines, fam);
 }
 
 /* ───── SHARED: Convert person object → GEDCOM INDI lines ───── */
@@ -1957,23 +1987,12 @@ function exportTreeToGedcom(tree, personMap, familyMap) {
     const L = [`0 ${fam.id} FAM`];
     if (fam.husband_id) L.push(`1 HUSB ${fam.husband_id}`);
     if (fam.wife_id) L.push(`1 WIFE ${fam.wife_id}`);
-    const mdate = fam.marriage_date || fam.mdate || '';
-    const mplace = fam.marriage_place || fam.mplace || '';
-    if (mdate || mplace) {
-      L.push('1 MARR');
-      if (mdate) L.push(`2 DATE ${mdate}`);
-      if (mplace) L.push(`2 PLAC ${mplace}`);
-    }
+    buildFamilyMarriageLines(fam).forEach(line => L.push(line));
+    buildFamilyDivorceLines(fam).forEach(line => L.push(line));
     (fam.children || []).forEach(cid => L.push(`1 CHIL ${cid}`));
-    // Divorce — emit only if NOT already present in _extra_gedcom (avoid duplication)
-    const xg = fam._extra_gedcom || '';
-    const divInXg = /^1 DIV/m.test(xg);
-    if (fam.divorced && !divInXg) {
-      const dd = fam.divorce_date || fam.divdate || '';
-      L.push('1 DIV Y');
-      if (dd) { L.push(`2 DATE ${dd}`); }
-    }
-    // Preserved extra GEDCOM lines for family (includes original DIV if present)
+    // Preserved extra GEDCOM lines for family. MARR/DIV are FTLS-managed now,
+    // so strip stale preserved copies before appending passthrough data.
+    const xg = stripGedcomLevel1Block(fam._extra_gedcom || '', ['MARR', 'DIV']);
     if (xg) { xg.split('\n').forEach(xl => { if (xl.trim()) L.push(xl); }); }
     addStandaloneFamilyReconciliationNote(L, standaloneNotes, fam, personMap || {});
     return L;
@@ -3716,9 +3735,11 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, 
     if (wid) F.push(`1 WIFE ${wid}`);
     const md = fam.marriage_date || fam.mdate || '';
     const mp = fam.marriage_place || fam.mplace || '';
-    if (md || mp) { F.push('1 MARR'); if (md) F.push(`2 DATE ${md}`); if (mp) F.push(`2 PLAC ${mp}`); }
+    const dd = fam.divorce_date || fam.divdate || '';
+    buildFamilyMarriageLines(fam).forEach(line => F.push(line));
+    buildFamilyDivorceLines(fam).forEach(line => F.push(line));
     kids.forEach(c => F.push(`1 CHIL ${c}`));
-    addStandaloneFamilyReconciliationNote(F, diffStandaloneNotes, { ...fam, id: fid, husband_id: hid, wife_id: wid, marriage_date: md, marriage_place: mp }, allPersonMap || {});
+    addStandaloneFamilyReconciliationNote(F, diffStandaloneNotes, { ...fam, id: fid, husband_id: hid, wife_id: wid, marriage_date: md, marriage_place: mp, divorce_date: dd }, allPersonMap || {});
     lines.push(...F);
   }
 
@@ -3854,9 +3875,11 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
       if (wid) F.push(`1 WIFE ${wid}`);
       const md = fam.marriage_date || fam.mdate || '';
       const mp = fam.marriage_place || fam.mplace || '';
-      if (md || mp) { F.push('1 MARR'); if (md) F.push(`2 DATE ${md}`); if (mp) F.push(`2 PLAC ${mp}`); }
+      const dd = fam.divorce_date || fam.divdate || '';
+      buildFamilyMarriageLines(fam).forEach(line => F.push(line));
+      buildFamilyDivorceLines(fam).forEach(line => F.push(line));
       kids.forEach(c => F.push(`1 CHIL ${c}`));
-      addStandaloneFamilyReconciliationNote(F, mergedStandaloneNotes, { ...fam, id: fid, husband_id: hid, wife_id: wid, marriage_date: md, marriage_place: mp }, {});
+      addStandaloneFamilyReconciliationNote(F, mergedStandaloneNotes, { ...fam, id: fid, husband_id: hid, wife_id: wid, marriage_date: md, marriage_place: mp, divorce_date: dd }, {});
       newLines.push(...F);
     }
   }
@@ -4500,17 +4523,32 @@ function persistAuth() {
   } catch(e) {}
 }
 
+async function refreshAuthUserProfile() {
+  if (!authSession?.access_token || !authSession?.user?.id) return authUser;
+  try {
+    const users = await sbFetch(`users?id=eq.${authSession.user.id}&select=*`, {
+      headers: { 'Authorization': 'Bearer ' + authSession.access_token }
+    });
+    if (users && users.length > 0) {
+      authUser = users[0];
+      persistAuth();
+      return authUser;
+    }
+  } catch(e) {
+    console.warn('Could not refresh auth user profile:', e);
+  }
+  return authUser;
+}
+
 async function signIn(email, password) {
   const data = await sbAuthFetch('/token?grant_type=password', {
     method: 'POST',
     body: JSON.stringify({ email, password })
   });
   authSession = data;
-  // Fetch user profile from users table
-  const users = await sbFetch(`users?id=eq.${data.user.id}&select=*`, {
-    headers: { 'Authorization': 'Bearer ' + data.access_token }
-  });
-  authUser = users[0] || null;
+  // Fetch user profile from users table. Always refresh from DB so role changes
+  // made by a super_admin take effect after the next sign-in.
+  authUser = await refreshAuthUserProfile();
   persistAuth();
   return { session: data, user: authUser };
 }
@@ -5687,10 +5725,10 @@ function AdminPanel({onClose, onReloadTree, onShowMigrate, onShowDiff, onShowBac
       <div style={{display:'flex',gap:8,marginBottom:16,flexWrap:'wrap',alignItems:'center'}}>
         {tabBtn('updates','Update Requests',pendingUpdates)}
         {tabBtn('accounts','Account Requests',pendingAccess)}
-        {isSuperAdmin()&&tabBtn('users','Manage Users',0)}
+        {user?.role==='super_admin'&&tabBtn('users','Manage Users',0)}
         {tabBtn('log','Edit Log',0)}
         {tabBtn('tools','🛠 Tools',0)}
-        {isSuperAdmin()&&tabBtn('health','🩺 Tree Health',0)}
+        {user?.role==='super_admin'&&tabBtn('health','🩺 Tree Health',0)}
         {actionMsg&&<span style={{fontSize:12,color:actionMsg.startsWith('Error')?'#c05050':'#6b9e72',marginLeft:16}}>{actionMsg}</span>}
       </div>
 
@@ -5800,7 +5838,7 @@ function AdminPanel({onClose, onReloadTree, onShowMigrate, onShowDiff, onShowBac
         </div>)}
       </div>}
 
-      {!loading&&tab==='users'&&isSuperAdmin()&&<div>
+      {!loading&&tab==='users'&&user?.role==='super_admin'&&<div>
         {allUsers.map(u=><div key={u.id} style={{background:'#141410',border:'1px solid rgba(196,163,90,0.08)',borderRadius:8,padding:12,marginBottom:6,display:'flex',alignItems:'center',gap:12}}>
           <span style={{color:'#d4cfc0',fontSize:14,flex:1}}>{u.name||u.email}</span>
           <span style={{fontSize:11,color:'#7a7568'}}>{u.email}</span>
@@ -5826,7 +5864,7 @@ function AdminPanel({onClose, onReloadTree, onShowMigrate, onShowDiff, onShowBac
           const personName = e.changes?.person?.display_name || e.person_id || '—';
           const reason = e.changes?.reason || '';
           const isOpen = expandedLog === e.id;
-          const canRevert = isSnapshot && isAdmin(); // admin + super_admin can revert
+          const canRevert = isSnapshot && user && ['admin','super_admin'].includes(user.role); // admin + super_admin can revert
 
           return(<div key={e.id} style={{background:isOpen?'rgba(196,163,90,0.03)':'transparent',borderRadius:6,marginBottom:4}}>
             <div onClick={()=>setExpandedLog(isOpen?null:e.id)} style={{fontSize:12,color:'#7a7568',padding:'8px 10px',cursor:'pointer',display:'flex',alignItems:'center',gap:8,
@@ -5943,7 +5981,7 @@ function AdminPanel({onClose, onReloadTree, onShowMigrate, onShowDiff, onShowBac
       </div>}
 
       {/* ───── TREE HEALTH TAB ───── */}
-      {!loading&&tab==='health'&&isSuperAdmin()&&<TreeHealthTab personMap={personMap} familyMap={familyMap} flat={flat} tree={tree} user={user} onPlaceOrphan={onPlaceOrphan}/>}
+      {!loading&&tab==='health'&&user?.role==='super_admin'&&<TreeHealthTab personMap={personMap} familyMap={familyMap} flat={flat} tree={tree} user={user} onPlaceOrphan={onPlaceOrphan}/>}
     </div>
   );
 }
@@ -10115,6 +10153,32 @@ function App(){
   const [showPrune,setShowPrune]=useState(false);
   const [movingBranch,setMovingBranch]=useState(null); // person node to move
   const flat=useMemo(()=>tree?flattenAll(tree):[],[tree]);
+  const currentRole = user?.role || authUser?.role || null;
+  const userIsAdmin = ['admin','super_admin'].includes(currentRole);
+  const userIsEditor = currentRole === 'editor';
+  const userIsViewer = currentRole === 'viewer';
+
+  useEffect(()=>{
+    if (!authSession?.access_token) return;
+    let cancelled = false;
+    const refresh = async () => {
+      const fresh = await refreshAuthUserProfile();
+      if (!cancelled && fresh) {
+        setUser(fresh);
+        setViewerGate(false);
+      }
+    };
+    refresh();
+    const onFocus = () => refresh();
+    const onVisibility = () => { if (!document.hidden) refresh(); };
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  },[]);
 
   // Detect password recovery token in URL on load
   useEffect(()=>{
@@ -10327,13 +10391,14 @@ function App(){
   const [viewerSubmitData, setViewerSubmitData] = useState(null); // {personId, personName, changes, type}
   const [showViewerIdentity, setShowViewerIdentity] = useState(false);
 
-  const isViewer = () => user && user.role === 'viewer';
-  // Returns true if this edit should go to approval queue instead of direct DB
+  // Returns true if this edit should go to approval queue instead of direct DB.
+  // Use the refreshed React user role here, not only the module-level cached
+  // authUser, so a promoted admin does not keep behaving like an editor.
   const needsApproval = (targetPersonId) => {
-    if (isAdmin()) return false; // admins always direct
-    if (isViewer()) return true; // viewers always request
+    if (userIsAdmin) return false; // admins always direct
+    if (userIsViewer) return true; // viewers always request
     // Editors: check scope
-    if (isEditor() && !canEditorDirectEdit(targetPersonId, tree, personMap, familyMap)) return true;
+    if (userIsEditor && !canEditorDirectEdit(targetPersonId, tree, personMap, familyMap)) return true;
     return false;
   };
 
@@ -10747,12 +10812,12 @@ function App(){
             <span style={{fontSize:28,color:GC,fontWeight:300,letterSpacing:1,cursor:'pointer'}} onClick={()=>setActiveTab('tree')}>Chennamkara</span>
             <span style={{fontSize:11,color:DM,letterSpacing:3,textTransform:'uppercase'}}>Family Tree</span>
             <span style={{fontSize:9,color:DM,opacity:0.5,letterSpacing:1,marginLeft:4}} title={`Build: ${BUILD_DATE}`}>{APP_VERSION}</span>
-            {user&&isAdmin()&&<>
+            {user&&userIsAdmin&&<>
               <span onClick={()=>setActiveTab('tree')} style={{fontSize:12,color:activeTab==='tree'?GC:DM,cursor:'pointer',padding:'2px 8px',borderRadius:4,background:activeTab==='tree'?'rgba(196,163,90,0.1)':'transparent'}}>🌳 Tree</span>
               <span onClick={()=>setActiveTab('photos')} style={{fontSize:12,color:activeTab==='photos'?GC:DM,cursor:'pointer',padding:'2px 8px',borderRadius:4,background:activeTab==='photos'?'rgba(196,163,90,0.1)':'transparent'}}>📷 Photos</span>
               <span onClick={()=>setActiveTab('admin')} style={{fontSize:12,color:activeTab==='admin'?GC:DM,cursor:'pointer',padding:'2px 8px',borderRadius:4,background:activeTab==='admin'?'rgba(196,163,90,0.1)':'transparent'}}>👤 Admin</span>
             </>}
-            {user&&!isAdmin()&&<>
+            {user&&!userIsAdmin&&<>
               <span onClick={()=>setActiveTab('tree')} style={{fontSize:12,color:activeTab==='tree'?GC:DM,cursor:'pointer',padding:'2px 8px',borderRadius:4,background:activeTab==='tree'?'rgba(196,163,90,0.1)':'transparent'}}>🌳 Tree</span>
               <span onClick={()=>setActiveTab('photos')} style={{fontSize:12,color:activeTab==='photos'?GC:DM,cursor:'pointer',padding:'2px 8px',borderRadius:4,background:activeTab==='photos'?'rgba(196,163,90,0.1)':'transparent'}}>📷 Photos</span>
             </>}
@@ -10874,7 +10939,7 @@ function App(){
         </>;
       })()}
       </>}
-      {activeTab==='admin'&&user&&isAdmin()&&<AdminPanel onReloadTree={()=>reloadTree(true)} onShowMigrate={()=>setShowMigrate(true)} onShowDiff={()=>setShowDiff(true)} onShowBackfill={()=>setShowBackfill(true)} onShowPrune={()=>setShowPrune(true)} personMap={personMap} familyMap={familyMap} flat={flat} tree={tree} user={user} onPlaceOrphan={(person)=>setMovingBranch(person)}/>}
+      {activeTab==='admin'&&user&&userIsAdmin&&<AdminPanel onReloadTree={()=>reloadTree(true)} onShowMigrate={()=>setShowMigrate(true)} onShowDiff={()=>setShowDiff(true)} onShowBackfill={()=>setShowBackfill(true)} onShowPrune={()=>setShowPrune(true)} personMap={personMap} familyMap={familyMap} flat={flat} tree={tree} user={user} onPlaceOrphan={(person)=>setMovingBranch(person)}/>}
       
       {/* ───── PHOTOS GALLERY TAB ───── */}
       {activeTab==='photos'&&user&&<PhotoGallery flat={flat} user={user}/>}
@@ -10890,7 +10955,7 @@ function App(){
         <span style={{width:6,height:6,borderRadius:'50%',background:MC}}/>
         <span>Signed in as <strong style={{color:TX}}>{user.name||user.email}</strong></span>
         <span style={{color:GD}}>·</span>
-        <span>{isAdmin()?'Admin':'Editor'} — changes save to database</span>
+        <span>{userIsAdmin?'Admin':'Editor'} — changes save to database</span>
       </div>}
     </div>
   );
