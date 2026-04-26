@@ -34,7 +34,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.7.25';
+    const APP_VERSION = 'v4.7.26';
     const BUILD_DATE = '2026-04-25';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
@@ -1754,11 +1754,15 @@ function appendOrReplaceFamilyFactBlocks(lines, fam) {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const m = line.match(/^1\s+(MARR|DIV)(?:\s|$)/);
-    if (m && replacements[m[1]].length > 0) {
-      if (!inserted[m[1]]) {
+    if (m) {
+      // Always consume any existing MARR/DIV block. If we have replacement
+      // lines, emit them (once). If `replacements[m[1]]` is empty (e.g., a
+      // family was un-divorced in FTLS), the existing block is dropped —
+      // this prevents stale facts from surviving in merged exports.
+      if (!inserted[m[1]] && replacements[m[1]].length > 0) {
         out.push(...replacements[m[1]]);
-        inserted[m[1]] = true;
       }
+      inserted[m[1]] = true;
       i++;
       while (i < lines.length && !/^1\s+/.test(lines[i])) i++;
       i--;
