@@ -35,8 +35,8 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.7.29';
-    const BUILD_DATE = '2026-04-26';
+    const APP_VERSION = 'v4.7.30';
+    const BUILD_DATE = '2026-04-27';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
 
@@ -146,6 +146,17 @@ function tokenizeGedcom(text) {
 */
 function normalizedValue(v) {
   return (v == null ? '' : String(v)).trim();
+}
+
+function normalizeMarriagePlaceText(value) {
+  const raw = (value == null ? '' : String(value)).trim();
+  if (!raw) return '';
+  // MacFamilyTree and repeated round-trips can leave empty place levels like
+  // "Dallas,TX,,". Keep only meaningful components for FTLS marriage_place.
+  if (raw.includes(',')) {
+    return raw.split(',').map(part => part.trim()).filter(Boolean).join(', ');
+  }
+  return raw.replace(/,+$/g, '').replace(/\s+/g, ' ').trim();
 }
 
 function normalizedPerson(p) {
@@ -699,7 +710,7 @@ function applyFtlsFamilyReconciliationSnapshotDefaults(family, snapshot) {
   fill('husb', ['Husband ID', 'HUSB']);
   fill('wife', ['Wife ID', 'WIFE']);
   fill('mdate', ['Marriage Date']);
-  fill('mplace', ['Marriage Place', 'Marriage Location']);
+  fill('mplace', ['Marriage Place', 'Marriage Location'], normalizeMarriagePlaceText);
   const divVal = getFtlsReconciliationValue(snapshot, ['Divorced Flag', 'Divorced']);
   if (divVal && !out.divorced) {
     if (/^(true|yes|y|1)$/i.test(divVal)) { out.divorced = true; applied.push('divorced'); }
@@ -729,7 +740,7 @@ function applyFtlsFamilyReconciliationSnapshotDefaultsToDbRow(row, snapshot) {
   row.wife_id = row.wife_id || fam.wife || null;
   row.children = (row.children && row.children.length) ? row.children : (fam.children || []);
   row.marriage_date = row.marriage_date || fam.mdate || '';
-  row.marriage_place = row.marriage_place || fam.mplace || '';
+  row.marriage_place = normalizeMarriagePlaceText(row.marriage_place || fam.mplace || '');
   row.divorced = !!fam.divorced;
   row.divorce_date = row.divorce_date || fam.divdate || '';
   return row;
@@ -1139,7 +1150,7 @@ function buildTreeFromDB(persons, families) {
       let sp=null;
       if(spId&&pMap[spId]&&!visited.has(spId)){
         visited.add(spId);
-        sp={...pMap[spId], mdate:fam.marriage_date||'', mplace:fam.marriage_place||''};
+        sp={...pMap[spId], mdate:fam.marriage_date||'', mplace:normalizeMarriagePlaceText(fam.marriage_place||'')};
         delete sp._fams; delete sp._famc;
       }
       const famCh=[];
@@ -1150,7 +1161,7 @@ function buildTreeFromDB(persons, families) {
       famCh.sort((a,b)=>(a.bo||999)-(b.bo||999));
       node.spouses.push({
         famId:fid, sp,
-        mdate:fam.marriage_date||fam.mdate||'', mplace:fam.marriage_place||fam.mplace||'',
+        mdate:fam.marriage_date||fam.mdate||'', mplace:normalizeMarriagePlaceText(fam.marriage_place||fam.mplace||''),
         divorced:fam.divorced||false, divdate:fam.divorce_date||fam.divdate||'',
         ch:famCh,
       });
@@ -1243,7 +1254,7 @@ async function savePerson(person, editUser) {
       if (fams.length > 0) {
         await sbFetch(`families?id=eq.${fams[0].id}`, {
           method: 'PATCH',
-          body: JSON.stringify({ marriage_date: person.mdate||'', marriage_place: person.mplace||'' }),
+          body: JSON.stringify({ marriage_date: person.mdate||'', marriage_place: normalizeMarriagePlaceText(person.mplace||'') }),
           headers: { 'Prefer': 'return=minimal' }
         });
       }
@@ -1286,7 +1297,7 @@ async function saveFamily(familyId, husbandId, wifeId, children, mdate, mplace) 
     id: familyId,
     husband_id: husbandId||null, wife_id: wifeId||null,
     children: children||[],
-    marriage_date: mdate||'', marriage_place: mplace||'',
+    marriage_date: mdate||'', marriage_place: normalizeMarriagePlaceText(mplace||''),
   };
   await sbFetch('families', {
     method: 'POST',
@@ -1635,7 +1646,7 @@ async function migrateGedcomToSupabase(gedcomText, onProgress) {
         wife_id: gv(el,'WIFE') || null,
         children: [...new Set(el.children.filter(c => c.tag === 'CHIL').map(c => c.value))],
         marriage_date: gnv(el,'MARR','DATE'),
-        marriage_place: gnv(el,'MARR','PLAC'),
+        marriage_place: normalizeMarriagePlaceText(gnv(el,'MARR','PLAC')),
         divorced: divorced2,
         divorce_date: divdate2,
         _extra_gedcom: collectUnknownGedcomLevel1Blocks(el, KNOWN_FAM_L1, { skipObjeRefs: ftlsMediaObjeIds }),
@@ -1927,7 +1938,7 @@ function buildFtlsFamilyReconciliationSnapshot(fam, personMap = {}) {
     '',
     '--- Marriage facts ---',
     show('Marriage Date', fam.marriage_date || fam.mdate || ''),
-    show('Marriage Place', fam.marriage_place || fam.mplace || ''),
+    show('Marriage Place', normalizeMarriagePlaceText(fam.marriage_place || fam.mplace || '')),
     'MFT edit location: Family/Couple > Marriage event/fact. MFT exports this as FAM > MARR > DATE/PLAC.',
     '',
     '--- Divorce facts ---',
@@ -1949,7 +1960,7 @@ function addStandaloneFamilyReconciliationNote(famLines, standaloneNotes, fam, p
 
 function buildFamilyMarriageLines(fam) {
   const mdate = fam.marriage_date || fam.mdate || '';
-  const mplace = fam.marriage_place || fam.mplace || '';
+  const mplace = normalizeMarriagePlaceText(fam.marriage_place || fam.mplace || '');
   if (!mdate && !mplace) return [];
   const lines = ['1 MARR'];
   if (mdate) lines.push(`2 DATE ${mdate}`);
@@ -2421,8 +2432,8 @@ function exportTreeToGedcom(tree, personMap, familyMap, mediaBundle = null) {
           husbId ? `1 HUSB ${husbId}` : null,
           wifeId ? `1 WIFE ${wifeId}` : null,
           ...(node.mdate ? ['1 MARR', `2 DATE ${node.mdate}`] : []),
-          ...(node.mplace && !node.mdate ? ['1 MARR'] : []),
-          ...(node.mplace ? [`2 PLAC ${node.mplace}`] : []),
+          ...(normalizeMarriagePlaceText(node.mplace) && !node.mdate ? ['1 MARR'] : []),
+          ...(normalizeMarriagePlaceText(node.mplace) ? [`2 PLAC ${normalizeMarriagePlaceText(node.mplace)}`] : []),
           ...childIds.map(cid => `1 CHIL ${cid}`)
         ].filter(Boolean));
         if (spouse && spouse.id && !exportedPersons.has(spouse.id)) {
@@ -3347,8 +3358,8 @@ function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap)
       const extMdate = normalizedValue(extFam.mdate || extFam.marriage_date || '');
       const ftlsMdate = normalizedValue(ftlsFam.marriage_date || ftlsFam.mdate || '');
       if (extMdate !== ftlsMdate && (extMdate || ftlsMdate)) diffs.push({ field:'mdate', label:'Marriage Date', ext:extMdate, ftls:ftlsMdate });
-      const extMplace = normalizedValue(extFam.mplace || extFam.marriage_place || '');
-      const ftlsMplace = normalizedValue(ftlsFam.marriage_place || ftlsFam.mplace || '');
+      const extMplace = normalizeMarriagePlaceText(extFam.mplace || extFam.marriage_place || '');
+      const ftlsMplace = normalizeMarriagePlaceText(ftlsFam.marriage_place || ftlsFam.mplace || '');
       if (extMplace !== ftlsMplace && (extMplace || ftlsMplace)) diffs.push({ field:'mplace', label:'Marriage Place', ext:extMplace, ftls:ftlsMplace });
       const extDiv = normalizedValue(extFam.divdate || extFam.divorce_date || '');
       const ftlsDiv = normalizedValue(ftlsFam.divorce_date || ftlsFam.divdate || '');
@@ -3454,7 +3465,7 @@ async function mergeFamilyToDb(extFam) {
       // Fill empty marriage facts from the incoming GEDCOM family. Do not clear
       // existing FTLS values here; explicit conflict resolution stays in the diff/review UI.
       if (!existing[0].marriage_date && extFam.mdate) patch.marriage_date = extFam.mdate;
-      if (!existing[0].marriage_place && extFam.mplace) patch.marriage_place = extFam.mplace;
+      if (!existing[0].marriage_place && normalizeMarriagePlaceText(extFam.mplace)) patch.marriage_place = normalizeMarriagePlaceText(extFam.mplace);
       if (!existing[0].divorce_date && extFam.divdate) patch.divorce_date = extFam.divdate;
       if (!existing[0].divorced && extFam.divorced) patch.divorced = true;
       if (!existing[0]._extra_gedcom && extFam._extra_gedcom) patch._extra_gedcom = extFam._extra_gedcom;
@@ -3490,7 +3501,7 @@ async function mergeFamilyToDb(extFam) {
     wife_id: safeWife,
     children: extFam.children || [],
     marriage_date: extFam.mdate || '',
-    marriage_place: extFam.mplace || '',
+    marriage_place: normalizeMarriagePlaceText(extFam.mplace || ''),
     divorced: !!extFam.divorced,
     divorce_date: extFam.divdate || '',
     _extra_gedcom: extFam._extra_gedcom || '',
@@ -4186,7 +4197,7 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, 
     if (hid) F.push(`1 HUSB ${hid}`);
     if (wid) F.push(`1 WIFE ${wid}`);
     const md = fam.marriage_date || fam.mdate || '';
-    const mp = fam.marriage_place || fam.mplace || '';
+    const mp = normalizeMarriagePlaceText(fam.marriage_place || fam.mplace || '');
     const dd = fam.divorce_date || fam.divdate || '';
     buildFamilyMarriageLines(fam).forEach(line => F.push(line));
     buildFamilyDivorceLines(fam).forEach(line => F.push(line));
@@ -4337,7 +4348,7 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
       if (hid) F.push(`1 HUSB ${hid}`);
       if (wid) F.push(`1 WIFE ${wid}`);
       const md = fam.marriage_date || fam.mdate || '';
-      const mp = fam.marriage_place || fam.mplace || '';
+      const mp = normalizeMarriagePlaceText(fam.marriage_place || fam.mplace || '');
       const dd = fam.divorce_date || fam.divdate || '';
       buildFamilyMarriageLines(fam).forEach(line => F.push(line));
       buildFamilyDivorceLines(fam).forEach(line => F.push(line));
@@ -4741,7 +4752,7 @@ function parseFam(el, noteMap = {}, ftlsMediaObjeIds = new Set()) {
     wife: getChildValue(el, 'WIFE'),
     children: [...new Set(el.children.filter(c => c.tag === 'CHIL').map(c => c.value))],
     mdate: getNestedValue(el, 'MARR', 'DATE'),
-    mplace: getNestedValue(el, 'MARR', 'PLAC'),
+    mplace: normalizeMarriagePlaceText(getNestedValue(el, 'MARR', 'PLAC')),
     divorced,
     divdate: divdate === 'Y' ? '' : divdate,
     _extra_gedcom: collectUnknownGedcomLevel1Blocks(el, KNOWN_FAM_L1, { skipObjeRefs: ftlsMediaObjeIds }),
@@ -4863,7 +4874,7 @@ function buildTreeFromFlat(people, families) {
       let sp = null;
       if (spId && people[spId] && !visitedNodes.has(spId)) {
         visitedNodes.add(spId);
-        sp = { ...people[spId], mdate: fam.mdate || '', mplace: fam.mplace || '' };
+        sp = { ...people[spId], mdate: fam.mdate || '', mplace: normalizeMarriagePlaceText(fam.mplace || '') };
         delete sp.fams;
         delete sp.famc;
       }
@@ -4877,7 +4888,7 @@ function buildTreeFromFlat(people, families) {
         famId,
         sp,
         mdate: fam.mdate || '',
-        mplace: fam.mplace || '',
+        mplace: normalizeMarriagePlaceText(fam.mplace || ''),
         divorced: fam.divorced || false,
         divdate: fam.divdate || '',
         ch: famCh,
@@ -6091,14 +6102,14 @@ function AdminPanel({onClose, onReloadTree, onShowMigrate, onShowDiff, onShowBac
 
       // Save marriage date/place to families table if present in changes
       const mdate = req.changes.mdate || req.changes.marriage_date;
-      const mplace = req.changes.mplace || req.changes.marriage_place;
+      const mplace = normalizeMarriagePlaceText(req.changes.mplace || req.changes.marriage_place || '');
       if (mdate || mplace) {
         try {
           const fams = await sbFetch(`families?select=*&or=(husband_id.eq.${req.person_id},wife_id.eq.${req.person_id})`, {headers:h});
           if (fams.length > 0) {
             await sbFetch(`families?id=eq.${fams[0].id}`, {
               method: 'PATCH', headers: {...h, 'Prefer':'return=minimal'},
-              body: JSON.stringify({ marriage_date: mdate||fams[0].marriage_date||'', marriage_place: mplace||fams[0].marriage_place||'' })
+              body: JSON.stringify({ marriage_date: mdate||fams[0].marriage_date||'', marriage_place: normalizeMarriagePlaceText(mplace||fams[0].marriage_place||'') })
             });
           }
         } catch(e) { console.warn('Marriage approve save failed:', e); }
@@ -7458,7 +7469,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
       wife: resolveDbPersonId(fam.wife),
       children: resolvedKids,
       mdate: fam.mdate || fam.marriage_date || '',
-      mplace: fam.mplace || fam.marriage_place || ''
+      mplace: normalizeMarriagePlaceText(fam.mplace || fam.marriage_place || '')
     };
   }, [resolveDbPersonId]);
 
@@ -7681,7 +7692,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
     };
 
     const nextMdate = pickFamilyFact('mdate', current.marriage_date || '', normalizedFam.mdate || '');
-    const nextMplace = pickFamilyFact('mplace', current.marriage_place || '', normalizedFam.mplace || '');
+    const nextMplace = normalizeMarriagePlaceText(pickFamilyFact('mplace', current.marriage_place || '', normalizedFam.mplace || ''));
     const nextDivdate = pickFamilyFact('divdate', current.divorce_date || '', normalizedFam.divdate || '');
     if (nextMdate !== (current.marriage_date || '')) patch.marriage_date = nextMdate;
     if (nextMplace !== (current.marriage_place || '')) patch.marriage_place = nextMplace;
@@ -8014,7 +8025,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
         for (const d of item.fields || []) {
           const key = d.field || d.key;
           if (key === 'mdate') patch.marriage_date = item.ext.mdate || item.ext.marriage_date || '';
-          if (key === 'mplace') patch.marriage_place = item.ext.mplace || item.ext.marriage_place || '';
+          if (key === 'mplace') patch.marriage_place = normalizeMarriagePlaceText(item.ext.mplace || item.ext.marriage_place || '');
           if (key === 'divdate') patch.divorce_date = item.ext.divdate || item.ext.divorce_date || '';
         }
         if (item.ext.divorced && !item.ftls?.divorced) patch.divorced = true;
@@ -9663,7 +9674,7 @@ function FamilyDuplicateReviewModal({ extFam, ftlsFam, extPeopleMap, personMap, 
   const ftlsKids = ftlsFam.children || [];
   const familyDiffs = [
     { key: 'mdate', label: 'Marriage Date', ftls: normalizedValue(ftlsFam.marriage_date || ftlsFam.mdate || ''), ext: normalizedValue(extFam.mdate || extFam.marriage_date || '') },
-    { key: 'mplace', label: 'Marriage Place', ftls: normalizedValue(ftlsFam.marriage_place || ftlsFam.mplace || ''), ext: normalizedValue(extFam.mplace || extFam.marriage_place || '') },
+    { key: 'mplace', label: 'Marriage Place', ftls: normalizeMarriagePlaceText(ftlsFam.marriage_place || ftlsFam.mplace || ''), ext: normalizeMarriagePlaceText(extFam.mplace || extFam.marriage_place || '') },
     { key: 'divdate', label: 'Divorce Date', ftls: normalizedValue(ftlsFam.divorce_date || ftlsFam.divdate || ''), ext: normalizedValue(extFam.divdate || extFam.divorce_date || '') },
   ].filter(d => (d.ftls || '') !== (d.ext || '') && (d.ftls || d.ext));
 
