@@ -7,6 +7,7 @@
   <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
   <style>
     html, body, #root {
       margin: 0;
@@ -34,8 +35,8 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.7.24';
-    const BUILD_DATE = '2026-04-25';
+    const APP_VERSION = 'v4.7.29';
+    const BUILD_DATE = '2026-04-26';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
 
@@ -95,7 +96,7 @@ const KNOWN_INDI_L1 = new Set([
 ]);
 
 // L1 tags that FTLS manages on FAM records. Same principle as above.
-const KNOWN_FAM_L1 = new Set(['HUSB', 'WIFE', 'CHIL', 'MARR']);
+const KNOWN_FAM_L1 = new Set(['HUSB', 'WIFE', 'CHIL', 'MARR', 'DIV']);
 
 /* ───── CANONICAL GEDCOM TOKENIZER ─────
    The ONLY tokenizer in this app. Previously duplicated inline at three
@@ -192,6 +193,217 @@ function stripGedcomLevel1Block(raw, tags) {
   return kept.filter(x => x.trim()).join('\n');
 }
 
+
+/* ───── GEDCOM PASSTHROUGH + FTLS MEDIA EXPORT HELPERS ─────
+   MFT media import is preservation-only. FTLS-owned media exports as normal
+   GEDCOM OBJE records with _FTLS_* identity markers so a later import can
+   recognize the same Cloudinary-backed media and avoid duplicate passthrough.
+*/
+function gedcomElementOwnLine(el) {
+  if (!el) return '';
+  const parts = [String(el.level ?? 0)];
+  if (el.pointer) parts.push(el.pointer);
+  parts.push(el.tag || '');
+  const value = el.value == null ? '' : String(el.value);
+  return parts.join(' ') + (value ? ' ' + value : '');
+}
+
+function serializeGedcomElement(el) {
+  const out = [gedcomElementOwnLine(el)];
+  for (const ch of (el?.children || [])) out.push(...serializeGedcomElement(ch));
+  return out;
+}
+
+function collectUnknownGedcomLevel1Blocks(el, knownL1, opts = {}) {
+  const skipObjeRefs = opts.skipObjeRefs || new Set();
+  const out = [];
+  for (const ch of (el?.children || [])) {
+    if (ch.level !== 1 || knownL1.has(ch.tag)) continue;
+    if (ch.tag === 'OBJE' && skipObjeRefs.has(String(ch.value || '').trim())) continue;
+    out.push(...serializeGedcomElement(ch));
+  }
+  return out.filter(x => x && x.trim()).join('\n');
+}
+
+function isFtlsGeneratedObjeElement(el) {
+  if (!el || el.tag !== 'OBJE') return false;
+  for (const ch of (el.children || [])) {
+    if (/^_FTLS_/i.test(ch.tag || '')) return true;
+    if (ch.tag === 'FILE' && /res\.cloudinary\.com|cloudinary\.com/i.test(ch.value || '')) return true;
+  }
+  return false;
+}
+
+function buildFtlsMediaObjeIdSet(elements) {
+  const ids = new Set();
+  for (const el of (elements || [])) {
+    if (el.pointer && el.tag === 'OBJE' && isFtlsGeneratedObjeElement(el)) ids.add(el.pointer);
+  }
+  return ids;
+}
+
+function stripObjeRefBlocksFromExtra(extra, refsToStrip) {
+  if (!extra || !refsToStrip || refsToStrip.size === 0) return extra || '';
+  const lines = String(extra).split('\n');
+  const kept = [];
+  let skipping = false;
+  for (const line of lines) {
+    const m = line.match(/^(\d+)\s+(\S+)\s*(.*)?$/);
+    if (m && m[1] === '1') {
+      const tag = m[2];
+      const val = (m[3] || '').trim();
+      skipping = tag === 'OBJE' && refsToStrip.has(val);
+    }
+    if (!skipping) kept.push(line);
+  }
+  return kept.filter(x => x.trim()).join('\n');
+}
+
+function collectReferencedGedcomMetaIds(personMap = {}, familyMap = {}) {
+  const referencedIds = new Set();
+  const collect = (text) => {
+    if (!text || typeof text !== 'string') return;
+    const refs = text.match(/@[^@\s]+@/g);
+    if (refs) refs.forEach(r => referencedIds.add(r));
+  };
+  for (const p of Object.values(personMap || {})) {
+    collect(p?._xg || p?._extra_gedcom || '');
+    if (p?.notes && /^@[^@]+@$/.test(String(p.notes).trim())) referencedIds.add(String(p.notes).trim());
+  }
+  for (const f of Object.values(familyMap || {})) collect(f?._extra_gedcom || f?._xg || '');
+  return referencedIds;
+}
+
+function normalizeGedcomArray(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) return value.filter(Boolean);
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return [];
+    try { const parsed = JSON.parse(trimmed); if (Array.isArray(parsed)) return parsed.filter(Boolean); } catch(e) {}
+    return trimmed.split(',').map(x => x.trim()).filter(Boolean);
+  }
+  return [];
+}
+
+function ftlsMediaUrl(media) { return media?.cloudinary_url || media?.secure_url || media?.url || media?.profile_photo || ''; }
+function ftlsMediaStableKey(media) { return String(media?.id || media?.cloudinary_id || media?.public_id || ftlsMediaUrl(media) || Math.random()); }
+function makeFtlsMediaObjeId(media) { return `@FTLSM_${safeGedcomIdFragment(ftlsMediaStableKey(media)).slice(0, 48)}@`; }
+function ftlsMediaLocalFileName(media) { return `${makeFtlsMediaObjeId(media).replace(/@/g, '')}.jpg`; }
+function cloudinaryJpgExportUrl(url) {
+  const raw = String(url || '').trim();
+  if (!raw) return '';
+  if (/res\.cloudinary\.com|cloudinary\.com/i.test(raw) && raw.includes('/upload/')) {
+    // Fetch a normalized JPG rendition for MFT ZIP export. The GEDCOM keeps the
+    // original Cloudinary URL in _FTLS_URL for dedupe; FILE points to the local
+    // ZIP filename that MFT expects.
+    return raw.replace('/upload/', '/upload/f_jpg,q_auto/');
+  }
+  return raw;
+}
+
+function ftlsMediaForm(media) {
+  // FTLS ZIP export normalizes images to JPG regardless of the original
+  // Cloudinary format. That keeps GEDCOM FILE, FORM, and ZIP filename aligned.
+  return 'JPG';
+}
+
+function getMediaPersonIds(media) {
+  const ids = new Set();
+  normalizeGedcomArray(media?.tagged_persons).forEach(x => ids.add(x));
+  normalizeGedcomArray(media?.person_ids).forEach(x => ids.add(x));
+  if ((media?.owner_type || '').toUpperCase() === 'INDI' && media?.owner_id) ids.add(media.owner_id);
+  if (media?.person_id) ids.add(media.person_id);
+  return [...ids];
+}
+
+function getMediaFamilyIds(media) {
+  const ids = new Set();
+  normalizeGedcomArray(media?.tagged_families).forEach(x => ids.add(x));
+  normalizeGedcomArray(media?.family_ids).forEach(x => ids.add(x));
+  if ((media?.owner_type || '').toUpperCase() === 'FAM' && media?.owner_id) ids.add(media.owner_id);
+  if (media?.family_id) ids.add(media.family_id);
+  return [...ids];
+}
+
+function buildFtlsMediaGedcomBundle(mediaRecords = [], personMap = {}, familyMap = {}) {
+  const mediaByKey = new Map();
+  const add = (media) => {
+    const url = ftlsMediaUrl(media);
+    if (!url || (media.media_type && media.media_type !== 'photo')) return;
+    const key = url || ftlsMediaStableKey(media);
+    const existing = mediaByKey.get(key);
+    if (existing) {
+      existing.tagged_persons = [...new Set([...normalizeGedcomArray(existing.tagged_persons), ...getMediaPersonIds(media)])];
+      existing.tagged_families = [...new Set([...normalizeGedcomArray(existing.tagged_families), ...getMediaFamilyIds(media)])];
+      existing._ftlsPrimary = existing._ftlsPrimary || media._ftlsPrimary;
+      if (!existing.caption && media.caption) existing.caption = media.caption;
+      return;
+    }
+    mediaByKey.set(key, { ...media, tagged_persons: getMediaPersonIds(media), tagged_families: getMediaFamilyIds(media) });
+  };
+  (mediaRecords || []).forEach(add);
+  for (const person of Object.values(personMap || {})) {
+    if (!person?.pp) continue;
+    add({ id: `profile_${safeGedcomIdFragment(person.id)}`, cloudinary_url: person.pp, cloudinary_id: `profile_${safeGedcomIdFragment(person.id)}`, media_type: 'photo', caption: `Profile photo - ${person.dn || person.fn || person.id}`, tagged_persons: [person.id], _ftlsPrimary: true });
+  }
+  for (const fam of Object.values(familyMap || {})) {
+    const url = fam?.profile_photo || fam?.photo || fam?.media_url || fam?.image_url || '';
+    if (!url) continue;
+    add({ id: `family_${safeGedcomIdFragment(fam.id)}`, cloudinary_url: url, cloudinary_id: `family_${safeGedcomIdFragment(fam.id)}`, media_type: 'photo', caption: `Family photo - ${fam.id}`, tagged_families: [fam.id], _ftlsPrimary: true });
+  }
+
+  const personRefs = new Map(), familyRefs = new Map(), metaById = new Map(), filesById = new Map();
+  const generatedIds = new Set(), usedIds = new Set();
+  for (const media of mediaByKey.values()) {
+    const url = ftlsMediaUrl(media);
+    if (!url) continue;
+    const objeId = makeFtlsMediaObjeId(media);
+    const fileName = ftlsMediaLocalFileName(media);
+    const exportUrl = cloudinaryJpgExportUrl(url);
+    const personIds = getMediaPersonIds(media).filter(pid => personMap && personMap[pid]);
+    const familyIds = getMediaFamilyIds(media).filter(fid => familyMap && familyMap[fid]);
+    if (!personIds.length && !familyIds.length) continue;
+    generatedIds.add(objeId);
+    const title = (media.caption || media.file_name || 'FTLS media').toString().replace(/\r?\n/g, ' ').trim();
+    const lines = [`0 ${objeId} OBJE`, `1 FILE ${fileName}`, `2 FORM ${ftlsMediaForm(media)}`];
+    if (title) lines.push(`1 TITL ${title}`);
+    lines.push('1 _SIF 0');
+    lines.push(`1 _SMC ${media._ftlsPrimary ? '1' : '0'}`);
+    if (media.id) lines.push(`1 _FTLS_MEDIA_ID ${media.id}`);
+    if (media.cloudinary_id || media.public_id) lines.push(`1 _FTLS_PUBLIC_ID ${media.cloudinary_id || media.public_id}`);
+    lines.push(`1 _FTLS_URL ${url}`);
+    lines.push(`1 _FTLS_EXPORT_URL ${exportUrl}`);
+    if (personIds.length) lines.push(`1 _FTLS_OWNER_TYPE INDI`);
+    if (personIds.length) lines.push(`1 _FTLS_OWNER_ID ${personIds.join(',')}`);
+    if (familyIds.length) lines.push(`1 _FTLS_FAMILY_IDS ${familyIds.join(',')}`);
+    metaById.set(objeId, lines.join('\n'));
+    filesById.set(objeId, { objeId, fileName, url: exportUrl, originalUrl: url, media, personIds, familyIds, title });
+    personIds.forEach(pid => { if (!personRefs.has(pid)) personRefs.set(pid, []); personRefs.get(pid).push(objeId); });
+    familyIds.forEach(fid => { if (!familyRefs.has(fid)) familyRefs.set(fid, []); familyRefs.get(fid).push(objeId); });
+  }
+  return { personRefs, familyRefs, metaById, filesById, generatedIds, usedIds };
+}
+
+function appendFtlsMediaRefs(lines, ownerType, ownerId, mediaBundle, existingExtra = '') {
+  if (!mediaBundle || !ownerId) return;
+  const refs = ownerType === 'FAM' ? (mediaBundle.familyRefs.get(ownerId) || []) : (mediaBundle.personRefs.get(ownerId) || []);
+  if (!refs.length) return;
+  // Only inspect lines already built in this export. Prior FTLS-generated OBJE
+  // refs in passthrough are stripped below, so they must not suppress re-emit.
+  const existingText = lines.join('\n');
+  for (const ref of refs) {
+    const escaped = ref.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (new RegExp('^1\\s+OBJE\\s+' + escaped + '\\s*$', 'm').test(existingText)) { mediaBundle.usedIds.add(ref); continue; }
+    lines.push(`1 OBJE ${ref}`);
+    mediaBundle.usedIds.add(ref);
+  }
+}
+
+function ftlsMediaMetaLines(mediaBundle) {
+  if (!mediaBundle) return [];
+  return [...mediaBundle.usedIds].map(id => mediaBundle.metaById.get(id)).filter(Boolean);
+}
 
 /* ───── GEDCOM NOTE / ADDRESS HELPERS ─────
    MacFamilyTree 11 commonly writes person/event notes as pointers:
@@ -549,6 +761,23 @@ function stripGeneratedFtlsNoteRecordsFromGedcomLines(lines, generatedNoteIds) {
     const directRef = line.match(/^1\s+NOTE\s+(@[^@]+@)\s*$/);
     if (directRef && generatedNoteIds.has(directRef[1])) continue;
     out.push(line);
+  }
+  return out;
+}
+
+
+function stripTopLevelGedcomRecordsByIdFromLines(lines, idsToStrip) {
+  if (!idsToStrip || idsToStrip.size === 0) return lines;
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    const top = String(lines[i] || '').match(/^0\s+(@[^@]+@)\s+(\S+)/);
+    if (top && idsToStrip.has(top[1])) {
+      i++;
+      while (i < lines.length && !/^0\s+/.test(lines[i])) i++;
+      i--;
+      continue;
+    }
+    out.push(lines[i]);
   }
   return out;
 }
@@ -1295,6 +1524,7 @@ async function migrateGedcomToSupabase(gedcomText, onProgress) {
   // Use the canonical shared tokenizer (faithful — preserves whitespace).
   const elements = tokenizeGedcom(gedcomText);
   const noteMap = buildGedcomNoteMap(elements);
+  const ftlsMediaObjeIds = buildFtlsMediaObjeIdSet(elements);
 
   function gv(el, tag) { const ch = el.children.find(c => c.tag === tag); return ch ? ch.value : ''; }
   function gnv(el, pt, ct) { const p = el.children.find(c => c.tag === pt); if (!p) return ''; const c = p.children.find(x => x.tag === ct); return c ? c.value : ''; }
@@ -1372,6 +1602,7 @@ async function migrateGedcomToSupabase(gedcomText, onProgress) {
         profession: gv(el,'OCCU'), employer: gv(el,'_EMPLOYER'),
         title_prefix: tp, burial_date: burd,
         photo_gallery_link: gv(el,'_PHOTOGALLERY'), documents_link: gv(el,'_DOCUMENTS'),
+        _extra_gedcom: collectUnknownGedcomLevel1Blocks(el, KNOWN_INDI_L1, { skipObjeRefs: ftlsMediaObjeIds }),
         updated_by: 'GEDCOM migration',
       });
       // Parse notes, bio, stories from multiple NOTE tags (after push so we can update).
@@ -1407,6 +1638,7 @@ async function migrateGedcomToSupabase(gedcomText, onProgress) {
         marriage_place: gnv(el,'MARR','PLAC'),
         divorced: divorced2,
         divorce_date: divdate2,
+        _extra_gedcom: collectUnknownGedcomLevel1Blocks(el, KNOWN_FAM_L1, { skipObjeRefs: ftlsMediaObjeIds }),
       };
       applyFtlsFamilyReconciliationSnapshotDefaultsToDbRow(
         famRow,
@@ -1715,21 +1947,53 @@ function addStandaloneFamilyReconciliationNote(famLines, standaloneNotes, fam, p
   standaloneNotes.push(...noteLines);
 }
 
-function appendOrReplaceFamilyMarriageBlock(lines, fam) {
+function buildFamilyMarriageLines(fam) {
   const mdate = fam.marriage_date || fam.mdate || '';
   const mplace = fam.marriage_place || fam.mplace || '';
-  if (!mdate && !mplace) return lines;
+  if (!mdate && !mplace) return [];
+  const lines = ['1 MARR'];
+  if (mdate) lines.push(`2 DATE ${mdate}`);
+  if (mplace) lines.push(`2 PLAC ${mplace}`);
+  return lines;
+}
+
+function buildFamilyDivorceLines(fam) {
+  const ddate = fam.divorce_date || fam.divdate || '';
+  const divorced = !!fam.divorced || !!ddate;
+  if (!divorced) return [];
+  const lines = ['1 DIV Y'];
+  if (ddate) lines.push(`2 DATE ${ddate}`);
+  return lines;
+}
+
+function insertFamilyFactLinesBeforeChildren(lines, factLines) {
+  if (!factLines || factLines.length === 0) return lines;
+  const out = lines.slice();
+  let insertAt = out.findIndex(l => /^1\s+CHIL\s/.test(l));
+  if (insertAt < 0) insertAt = out.length;
+  out.splice(insertAt, 0, ...factLines);
+  return out;
+}
+
+function appendOrReplaceFamilyFactBlocks(lines, fam) {
+  const replacements = {
+    MARR: buildFamilyMarriageLines(fam),
+    DIV: buildFamilyDivorceLines(fam),
+  };
+  const inserted = { MARR: false, DIV: false };
   const out = [];
-  let inserted = false;
+
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    if (/^1\s+MARR(?:\s|$)/.test(line)) {
-      if (!inserted) {
-        out.push('1 MARR');
-        if (mdate) out.push(`2 DATE ${mdate}`);
-        if (mplace) out.push(`2 PLAC ${mplace}`);
-        inserted = true;
+    const m = line.match(/^1\s+(MARR|DIV)(?:\s|$)/);
+    if (m) {
+      // Always consume existing MARR/DIV blocks. If replacements[m[1]] is empty
+      // (for example, FTLS has un-divorced this family), the old external block
+      // is deliberately dropped instead of being preserved as stale data.
+      if (!inserted[m[1]] && replacements[m[1]].length > 0) {
+        out.push(...replacements[m[1]]);
       }
+      inserted[m[1]] = true;
       i++;
       while (i < lines.length && !/^1\s+/.test(lines[i])) i++;
       i--;
@@ -1737,14 +2001,167 @@ function appendOrReplaceFamilyMarriageBlock(lines, fam) {
     }
     out.push(line);
   }
-  if (!inserted) {
-    let insertAt = out.findIndex(l => /^1\s+CHIL\s/.test(l));
-    if (insertAt < 0) insertAt = out.length;
-    const marrLines = ['1 MARR'];
-    if (mdate) marrLines.push(`2 DATE ${mdate}`);
-    if (mplace) marrLines.push(`2 PLAC ${mplace}`);
-    out.splice(insertAt, 0, ...marrLines);
+
+  let finalLines = out;
+  if (!inserted.MARR) finalLines = insertFamilyFactLinesBeforeChildren(finalLines, replacements.MARR);
+  if (!inserted.DIV) finalLines = insertFamilyFactLinesBeforeChildren(finalLines, replacements.DIV);
+  return finalLines;
+}
+
+// Backward-compatible name for older callsites; now handles MARR and DIV.
+function appendOrReplaceFamilyMarriageBlock(lines, fam) {
+  return appendOrReplaceFamilyFactBlocks(lines, fam);
+}
+
+/* ───── MACFAMILYTREE NATIVE STORY (_STO/_STS) HELPERS ─────
+   FTLS Stories and MacFamilyTree native stories must stay separate to avoid
+   duplicate/drift loops:
+     - person.stories remains FTLS-owned and exports as a STORY: NOTE.
+     - MFT _STO records remain MFT-owned and export back as _STO.
+   The edit form can edit _STO records directly, and can intentionally MOVE
+   FTLS story text into the first MFT story entry, clearing person.stories.
+*/
+function safeGedcomIdFragment(value) {
+  return String(value || 'UNKNOWN').replace(/@/g, '').replace(/[^A-Za-z0-9_\-]/g, '_') || 'UNKNOWN';
+}
+
+function extractMftStoryRefs(person) {
+  const refs = new Set();
+  const raw = String(person?._xg || '');
+  const re = /^1\s+_STO\s+(@[^@]+@)\s*$/gm;
+  let m;
+  while ((m = re.exec(raw)) !== null) refs.add(m[1]);
+  return [...refs];
+}
+
+function appendMftStoryRefToExtraGedcom(extra, storyId) {
+  const refLine = `1 _STO ${storyId}`;
+  const raw = String(extra || '').trim();
+  if (raw.split('\n').some(line => line.trim() === refLine)) return raw;
+  return raw ? `${raw}\n${refLine}` : refLine;
+}
+
+function parseMftStoryRecord(raw, fallbackId = '') {
+  const text = String(raw || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const lines = text.split('\n').filter(l => l.trim());
+  const top = lines[0]?.match(/^0\s+(@[^@]+@)\s+_STO(?:\s|$)/);
+  const record = { id: top ? top[1] : fallbackId, record_type: '_STO', entries: [], raw_gedcom: text };
+  let cur = null;
+  let curTextField = null;
+  for (const line of lines.slice(1)) {
+    const entry = line.match(/^1\s+(@[^@]+@)?\s*_STS(?:\s|$)/);
+    if (entry) {
+      cur = { entryId: entry[1] || `@STS_${safeGedcomIdFragment(record.id)}_${record.entries.length + 1}@`, title: '', text: '' };
+      record.entries.push(cur);
+      curTextField = null;
+      continue;
+    }
+    if (!cur) continue;
+    const titl = line.match(/^2\s+TITL(?:\s+(.*))?$/);
+    if (titl) { cur.title = titl[1] || ''; curTextField = 'title'; continue; }
+    const txt = line.match(/^2\s+TEXT(?:\s+(.*))?$/);
+    if (txt) { cur.text = txt[1] || ''; curTextField = 'text'; continue; }
+    const cont = line.match(/^3\s+(CONT|CONC)(?:\s+(.*))?$/);
+    if (cont && curTextField) {
+      const v = cont[2] || '';
+      if (cont[1] === 'CONT') cur[curTextField] += '\n' + v;
+      else cur[curTextField] += v;
+    }
   }
+  return record;
+}
+
+function pushGedcomMultiline(lines, level, tag, value) {
+  const vals = String(value || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  lines.push(`${level} ${tag}${vals[0] ? ' ' + vals[0] : ''}`);
+  for (const v of vals.slice(1)) lines.push(`${level + 1} CONT ${v}`);
+}
+
+function buildMftStoryRecordRaw(record) {
+  const id = record?.id || `@STO_FTLS_${Date.now()}@`;
+  const entries = (record?.entries || []).length ? record.entries : [{ entryId:`@STS_${safeGedcomIdFragment(id)}_1@`, title:'Story', text:'' }];
+  const lines = [`0 ${id} _STO`];
+  entries.forEach((entry, idx) => {
+    const entryId = entry.entryId || `@STS_${safeGedcomIdFragment(id)}_${idx + 1}@`;
+    lines.push(`1 ${entryId} _STS`);
+    pushGedcomMultiline(lines, 2, 'TITL', entry.title || 'Story');
+    pushGedcomMultiline(lines, 2, 'TEXT', entry.text || '');
+  });
+  return lines.join('\n');
+}
+
+function mergeGedcomMetaCache(existing, updates) {
+  const map = new Map((existing || []).map(r => [r.id, r]));
+  for (const r of (updates || [])) map.set(r.id, r);
+  return [...map.values()];
+}
+
+async function loadMftStoryRecordsForPerson(person) {
+  const refs = extractMftStoryRefs(person);
+  if (refs.length === 0) return [];
+  let records = [];
+  const cached = Array.isArray(window.gedcomMetaRecords) ? window.gedcomMetaRecords : [];
+  records = cached.filter(m => refs.includes(m.id) && m.record_type === '_STO');
+  const missing = refs.filter(id => !records.some(r => r.id === id));
+  if (missing.length > 0) {
+    try {
+      const fetched = await sbFetch('gedcom_meta?record_type=eq._STO&select=*');
+      window.gedcomMetaRecords = mergeGedcomMetaCache(window.gedcomMetaRecords || [], fetched || []);
+      records = (fetched || []).filter(m => refs.includes(m.id)).concat(records.filter(r => !fetched.some(f => f.id === r.id)));
+    } catch(e) {
+      console.warn('Could not load MFT story records:', e);
+    }
+  }
+  return refs.map(id => records.find(r => r.id === id)).filter(Boolean)
+    .map(r => parseMftStoryRecord(r.raw_gedcom || '', r.id));
+}
+
+function createEmptyMftStoryRecordForPerson(person) {
+  const storyId = `@STO_FTLS_${safeGedcomIdFragment(person?.id)}_${Date.now()}@`;
+  const entryId = `@STS_FTLS_${safeGedcomIdFragment(person?.id)}_${Date.now()}@`;
+  return {
+    id: storyId,
+    record_type: '_STO',
+    entries: [{ entryId, title: 'FTLS Story', text: '' }],
+    raw_gedcom: ''
+  };
+}
+
+function appendTextToFirstMftStoryRecord(records, text) {
+  const clean = String(text || '').trim();
+  if (!clean) return records;
+  const out = (records || []).map(r => ({ ...r, entries: (r.entries || []).map(e => ({...e})) }));
+  if (out.length === 0) return out;
+  if (!out[0].entries.length) out[0].entries.push({ entryId:`@STS_${safeGedcomIdFragment(out[0].id)}_1@`, title:'FTLS Story', text:'' });
+  const first = out[0].entries[0];
+  const existing = String(first.text || '').trim();
+  const label = '[Moved from FTLS Stories]';
+  if (existing.toLowerCase().includes(clean.toLowerCase())) return out;
+  first.text = existing ? `${existing}\n\n${label}\n${clean}` : `${label}\n${clean}`;
+  if (!first.title) first.title = 'FTLS Story';
+  return out;
+}
+
+async function saveMftStoryRecords(records) {
+  const rows = [];
+  for (const r of (records || [])) {
+    if (!r?.id) continue;
+    const raw = buildMftStoryRecordRaw(r);
+    rows.push({ id: r.id, record_type: '_STO', raw_gedcom: raw });
+  }
+  if (!rows.length) return;
+  await sbFetch('gedcom_meta?on_conflict=id', {
+    method: 'POST',
+    headers: { 'Prefer': 'return=minimal,resolution=merge-duplicates' },
+    body: JSON.stringify(rows)
+  });
+  window.gedcomMetaRecords = mergeGedcomMetaCache(window.gedcomMetaRecords || [], rows);
+}
+
+function stripInternalEditFields(person) {
+  const out = { ...(person || {}) };
+  delete out._mftStoryRecords;
+  delete out._mftStoryDirty;
   return out;
 }
 
@@ -1901,7 +2318,7 @@ function personToGedcomLines(person, context = {}) {
 }
 
 /* ───── GEDCOM 5.5.1 EXPORTER ───── */
-function exportTreeToGedcom(tree, personMap, familyMap) {
+function exportTreeToGedcom(tree, personMap, familyMap, mediaBundle = null) {
   const lines = [];
   const indis = [];
   const fams = [];
@@ -1945,8 +2362,12 @@ function exportTreeToGedcom(tree, personMap, familyMap) {
     // Add FAMS/FAMC refs
     (famsLookup[person.id] || []).forEach(ref => L.push(`1 FAMS ${ref}`));
     (famcLookup[person.id] || []).forEach(ref => L.push(`1 FAMC ${ref}`));
-    // Preserved extra GEDCOM lines (OBJE, RESI, BURI, _CRE, CHAN, etc.)
-    if (person._xg) { person._xg.split('\n').forEach(xl => { if (xl.trim()) L.push(xl); }); }
+    // FTLS-owned Cloudinary media exports as GEDCOM OBJE, but old FTLS-generated
+    // OBJE passthrough from a prior round trip is stripped to prevent duplicates.
+    appendFtlsMediaRefs(L, 'INDI', person.id, mediaBundle, person._xg || '');
+    const personXg = stripObjeRefBlocksFromExtra(person._xg || '', mediaBundle?.generatedIds);
+    // Preserved extra GEDCOM lines (MFT OBJE/RECT, RESI, BURI, _CRE, CHAN, etc.)
+    if (personXg) { personXg.split('\n').forEach(xl => { if (xl.trim()) L.push(xl); }); }
     else { L.push('1 CHAN'); L.push(`2 DATE ${gedcomDate()}`); L.push(`3 TIME ${gedcomTime()}`); }
     return L;
   }
@@ -1957,23 +2378,13 @@ function exportTreeToGedcom(tree, personMap, familyMap) {
     const L = [`0 ${fam.id} FAM`];
     if (fam.husband_id) L.push(`1 HUSB ${fam.husband_id}`);
     if (fam.wife_id) L.push(`1 WIFE ${fam.wife_id}`);
-    const mdate = fam.marriage_date || fam.mdate || '';
-    const mplace = fam.marriage_place || fam.mplace || '';
-    if (mdate || mplace) {
-      L.push('1 MARR');
-      if (mdate) L.push(`2 DATE ${mdate}`);
-      if (mplace) L.push(`2 PLAC ${mplace}`);
-    }
+    buildFamilyMarriageLines(fam).forEach(line => L.push(line));
+    buildFamilyDivorceLines(fam).forEach(line => L.push(line));
     (fam.children || []).forEach(cid => L.push(`1 CHIL ${cid}`));
-    // Divorce — emit only if NOT already present in _extra_gedcom (avoid duplication)
-    const xg = fam._extra_gedcom || '';
-    const divInXg = /^1 DIV/m.test(xg);
-    if (fam.divorced && !divInXg) {
-      const dd = fam.divorce_date || fam.divdate || '';
-      L.push('1 DIV Y');
-      if (dd) { L.push(`2 DATE ${dd}`); }
-    }
-    // Preserved extra GEDCOM lines for family (includes original DIV if present)
+    // Preserved extra GEDCOM lines for family. MARR/DIV are FTLS-managed now,
+    // so strip stale preserved copies before appending passthrough data.
+    appendFtlsMediaRefs(L, 'FAM', fam.id, mediaBundle, fam._extra_gedcom || '');
+    const xg = stripObjeRefBlocksFromExtra(stripGedcomLevel1Block(fam._extra_gedcom || '', ['MARR', 'DIV']), mediaBundle?.generatedIds);
     if (xg) { xg.split('\n').forEach(xl => { if (xl.trim()) L.push(xl); }); }
     addStandaloneFamilyReconciliationNote(L, standaloneNotes, fam, personMap || {});
     return L;
@@ -2053,10 +2464,78 @@ function exportTreeToGedcom(tree, personMap, familyMap) {
 
   indis.forEach(indi => lines.push(...indi));
   fams.forEach(fam => lines.push(...fam));
+  const mediaMetaLines = ftlsMediaMetaLines(mediaBundle);
+  if (mediaMetaLines.length > 0) lines.push(...mediaMetaLines);
   if (standaloneNotes.length > 0) lines.push(...standaloneNotes);
   lines.push('0 TRLR');
 
   return lines.join('\n') + '\n';
+}
+
+function downloadBlobAsFile(blob, fileName) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+async function fetchFtlsMediaBlobForZip(fileInfo) {
+  const resp = await fetch(fileInfo.url, { mode: 'cors', credentials: 'omit' });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  return await resp.blob();
+}
+
+async function downloadGedcomZip(content, mediaBundle, baseFileName = 'FTLS_MFT_Export') {
+  const safeBase = String(baseFileName || 'FTLS_MFT_Export').replace(/\.(ged|zip)$/i, '').replace(/[^A-Za-z0-9_\-]+/g, '_') || 'FTLS_MFT_Export';
+  const gedName = 'gedcom.ged';
+
+  if (!window.JSZip) {
+    console.warn('JSZip not loaded; falling back to GEDCOM-only download');
+    downloadBlobAsFile(new Blob([content], { type: 'text/plain;charset=utf-8' }), safeBase + '.ged');
+    return { zip: false, images: 0, failed: [] };
+  }
+
+  const zip = new JSZip();
+  zip.file(gedName, content);
+
+  const usedFiles = [...(mediaBundle?.usedIds || [])]
+    .map(id => mediaBundle?.filesById?.get(id))
+    .filter(Boolean);
+
+  const csv = (values) => values.map(v => '"' + String(v || '').replace(/"/g, '""') + '"').join(',');
+  const manifest = ['obje_id,file_name,owner_type,owner_ids,source_url,status,message'];
+  const failures = [];
+  let imagesAdded = 0;
+
+  for (const f of usedFiles) {
+    const owners = [];
+    if (f.personIds?.length) owners.push('INDI:' + f.personIds.join('|'));
+    if (f.familyIds?.length) owners.push('FAM:' + f.familyIds.join('|'));
+    const ownerType = f.familyIds?.length && f.personIds?.length ? 'MIXED' : (f.familyIds?.length ? 'FAM' : 'INDI');
+    try {
+      const blob = await fetchFtlsMediaBlobForZip(f);
+      zip.file(f.fileName, blob);
+      imagesAdded++;
+      manifest.push(csv([f.objeId, f.fileName, ownerType, owners.join(';'), f.originalUrl, 'added', '']));
+    } catch (err) {
+      failures.push({ fileName: f.fileName, url: f.url, message: err?.message || String(err) });
+      manifest.push(csv([f.objeId, f.fileName, ownerType, owners.join(';'), f.originalUrl, 'failed', err?.message || String(err)]));
+    }
+  }
+
+  zip.file('FTLS_image_manifest.csv', manifest.join('\n') + '\n');
+  if (failures.length) {
+    zip.file('FTLS_missing_images.txt', failures.map(f => `${f.fileName}\t${f.url}\t${f.message}`).join('\n') + '\n');
+  }
+
+  const zipBlob = await zip.generateAsync({ type: 'blob' });
+  downloadBlobAsFile(zipBlob, safeBase + '.zip');
+  if (failures.length) alert(`Exported ZIP, but ${failures.length} image(s) could not be downloaded. See FTLS_missing_images.txt inside the ZIP.`);
+  return { zip: true, images: imagesAdded, failed: failures };
 }
 
 async function downloadGedcom(tree, personMap, familyMap) {
@@ -2065,42 +2544,28 @@ async function downloadGedcom(tree, personMap, familyMap) {
   // App config (_STE, _STF, _PTF, _PTE, LABL, REPO): always included
   // Uses module-level PERSON_SPECIFIC_META const defined near the top of file.
   let metaLines = [];
+  let mediaRecords = [];
+  try { mediaRecords = await sbFetch('media?select=*'); } catch(e) { console.warn('Could not load media for GEDCOM export:', e); }
+  const mediaBundle = buildFtlsMediaGedcomBundle(mediaRecords || [], personMap || {}, familyMap || {});
   try {
     const meta = await sbFetch('gedcom_meta?select=*');
     if (meta && meta.length > 0) {
-      // Collect all @pointer@ references from persons' _xg fields AND notes field
-      const referencedIds = new Set();
-      for (const p of Object.values(personMap)) {
-        if (p._xg) {
-          const refs = p._xg.match(/@[^@]+@/g);
-          if (refs) refs.forEach(r => referencedIds.add(r));
-        }
-        // Notes field may contain a pointer to a standalone NOTE record
-        if (p.notes && /^@[^@]+@$/.test(p.notes.trim())) {
-          referencedIds.add(p.notes.trim());
-        }
-      }
+      // Collect all @pointer@ references from person AND family passthrough.
+      const referencedIds = collectReferencedGedcomMetaIds(personMap, familyMap);
       for (const m of meta) {
+        if (mediaBundle.generatedIds.has(m.id)) continue; // FTLS media is regenerated from the media table
         if (PERSON_SPECIFIC_META.has(m.record_type) && !referencedIds.has(m.id)) continue;
         metaLines.push(m.raw_gedcom);
       }
     }
   } catch(e) { console.warn('Could not load gedcom_meta:', e); }
 
-  let content = exportTreeToGedcom(tree, personMap, familyMap);
+  let content = exportTreeToGedcom(tree, personMap, familyMap, mediaBundle);
   // Insert meta records before TRLR
   if (metaLines.length > 0) {
     content = content.replace('0 TRLR', metaLines.join('\n') + '\n0 TRLR');
   }
-  const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = 'Chennamkara_Family_Tree_Export.ged';
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  await downloadGedcomZip(content, mediaBundle, 'Chennamkara_Family_Tree_Export');
 }
 
 /* ───── GEDCOM DIFF & MERGE ENGINE ───── */
@@ -2992,6 +3457,7 @@ async function mergeFamilyToDb(extFam) {
       if (!existing[0].marriage_place && extFam.mplace) patch.marriage_place = extFam.mplace;
       if (!existing[0].divorce_date && extFam.divdate) patch.divorce_date = extFam.divdate;
       if (!existing[0].divorced && extFam.divorced) patch.divorced = true;
+      if (!existing[0]._extra_gedcom && extFam._extra_gedcom) patch._extra_gedcom = extFam._extra_gedcom;
       // Add new children
       const existingKids = new Set(existing[0].children || []);
       const newKids = (extFam.children || []).filter(cid => !existingKids.has(cid));
@@ -3025,6 +3491,9 @@ async function mergeFamilyToDb(extFam) {
     children: extFam.children || [],
     marriage_date: extFam.mdate || '',
     marriage_place: extFam.mplace || '',
+    divorced: !!extFam.divorced,
+    divorce_date: extFam.divdate || '',
+    _extra_gedcom: extFam._extra_gedcom || '',
   };
   await sbFetch('families?on_conflict=id', {
     method: 'POST',
@@ -3619,7 +4088,7 @@ async function restorePrunedMeta(archiveId) {
 }
 
 
-function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, allPersonMap, forcedFamilyIds) {
+function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, allPersonMap, forcedFamilyIds, mediaBundle = null) {
   const extIds = extFamilyIds || new Set();
   const forcedFamIds = forcedFamilyIds instanceof Set ? forcedFamilyIds : new Set(forcedFamilyIds || []);
   const extFams = extFamiliesMap || {};
@@ -3674,8 +4143,10 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, 
     // FAMS/FAMC from FULL family map
     (famsLookup[pid] || []).forEach(ref => L.push(`1 FAMS ${ref}`));
     (famcLookup[pid] || []).forEach(ref => L.push(`1 FAMC ${ref}`));
+    appendFtlsMediaRefs(L, 'INDI', pid, mediaBundle, person._xg || '');
+    const personXg = stripObjeRefBlocksFromExtra(person._xg || '', mediaBundle?.generatedIds);
     // Preserved extra GEDCOM lines
-    if (person._xg) { person._xg.split('\n').forEach(xl => { if (xl.trim()) L.push(xl); }); }
+    if (personXg) { personXg.split('\n').forEach(xl => { if (xl.trim()) L.push(xl); }); }
     else { L.push('1 CHAN'); L.push(`2 DATE ${gedcomDate()}`); L.push(`3 TIME ${gedcomTime()}`); }
     lines.push(...L);
   }
@@ -3716,9 +4187,14 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, 
     if (wid) F.push(`1 WIFE ${wid}`);
     const md = fam.marriage_date || fam.mdate || '';
     const mp = fam.marriage_place || fam.mplace || '';
-    if (md || mp) { F.push('1 MARR'); if (md) F.push(`2 DATE ${md}`); if (mp) F.push(`2 PLAC ${mp}`); }
+    const dd = fam.divorce_date || fam.divdate || '';
+    buildFamilyMarriageLines(fam).forEach(line => F.push(line));
+    buildFamilyDivorceLines(fam).forEach(line => F.push(line));
     kids.forEach(c => F.push(`1 CHIL ${c}`));
-    addStandaloneFamilyReconciliationNote(F, diffStandaloneNotes, { ...fam, id: fid, husband_id: hid, wife_id: wid, marriage_date: md, marriage_place: mp }, allPersonMap || {});
+    appendFtlsMediaRefs(F, 'FAM', fid, mediaBundle, fam._extra_gedcom || '');
+    const famXg = stripObjeRefBlocksFromExtra(stripGedcomLevel1Block(fam._extra_gedcom || '', ['MARR', 'DIV']), mediaBundle?.generatedIds);
+    if (famXg) famXg.split('\n').forEach(xl => { if (xl.trim()) F.push(xl); });
+    addStandaloneFamilyReconciliationNote(F, diffStandaloneNotes, { ...fam, id: fid, husband_id: hid, wife_id: wid, marriage_date: md, marriage_place: mp, divorce_date: dd }, allPersonMap || {});
     lines.push(...F);
   }
 
@@ -3755,7 +4231,9 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, 
       if (standalone.length > 0) diffStandaloneNotes.push(...standalone);
       (famsLookup[refId] || []).forEach(ref => L.push(`1 FAMS ${ref}`));
       (famcLookup[refId] || []).forEach(ref => L.push(`1 FAMC ${ref}`));
-      if (anchor._xg) { anchor._xg.split('\n').forEach(xl => { if (xl.trim()) L.push(xl); }); }
+      appendFtlsMediaRefs(L, 'INDI', refId, mediaBundle, anchor._xg || '');
+      const anchorXg = stripObjeRefBlocksFromExtra(anchor._xg || '', mediaBundle?.generatedIds);
+      if (anchorXg) { anchorXg.split('\n').forEach(xl => { if (xl.trim()) L.push(xl); }); }
       else { L.push('1 CHAN'); L.push(`2 DATE ${gedcomDate()}`); L.push(`3 TIME ${gedcomTime()}`); }
       lines.push(...L);
     } else {
@@ -3769,24 +4247,23 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, 
   // App config (_STE, _STF, _PTF, _PTE, LABL, REPO): always included — MacFT needs them to parse the file
   // Uses module-level PERSON_SPECIFIC_META const defined near the top of file.
   if (window.gedcomMetaRecords && window.gedcomMetaRecords.length > 0) {
-    // Collect all @pointer@ references from exported persons' _xg AND notes fields
-    const referencedIds = new Set();
+    const exportedPersonMap = {};
     for (const pid of exportedPersons) {
       const person = pMap[pid] || anchorMap[pid];
-      if (person && person._xg) {
-        const refs = person._xg.match(/@[^@]+@/g);
-        if (refs) refs.forEach(r => referencedIds.add(r));
-      }
-      // Notes field may contain a pointer to a standalone NOTE record
-      if (person && person.notes && /^@[^@]+@$/.test((person.notes||'').trim())) {
-        referencedIds.add(person.notes.trim());
-      }
+      if (person) exportedPersonMap[pid] = person;
     }
+    const exportedFamilyMap = {};
+    for (const fid of emittedFamIds) { if (ftlsFamilyMap[fid]) exportedFamilyMap[fid] = ftlsFamilyMap[fid]; }
+    const referencedIds = collectReferencedGedcomMetaIds(exportedPersonMap, exportedFamilyMap);
     for (const meta of window.gedcomMetaRecords) {
+      if (mediaBundle?.generatedIds?.has(meta.id)) continue;
       if (PERSON_SPECIFIC_META.has(meta.record_type) && !referencedIds.has(meta.id)) continue;
       lines.push(meta.raw_gedcom);
     }
   }
+
+  const mediaMetaLines = ftlsMediaMetaLines(mediaBundle);
+  if (mediaMetaLines.length > 0) lines.push(...mediaMetaLines);
 
   // Include standalone NOTE records generated by personToGedcomLines
   if (diffStandaloneNotes.length > 0) lines.push(...diffStandaloneNotes);
@@ -3796,14 +4273,19 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, 
 }
 
 // Merge FTLS additions into the original external GEDCOM text
-function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamilyMap, extFamilyIds, forcedFamilyIds) {
+function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamilyMap, extFamilyIds, forcedFamilyIds, mediaBundle = null) {
   const forcedFamIds = forcedFamilyIds instanceof Set ? forcedFamilyIds : new Set(forcedFamilyIds || []);
   const originalElements = tokenizeGedcom(originalText);
   const originalNoteMap = buildGedcomNoteMap(originalElements);
   const generatedNoteIds = findGeneratedFtlsNoteIds(originalElements, originalNoteMap);
-  const lines = stripGeneratedFtlsNoteRecordsFromGedcomLines(
-    originalText.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n'),
-    generatedNoteIds
+  const generatedMediaIds = buildFtlsMediaObjeIdSet(originalElements);
+  if (mediaBundle) generatedMediaIds.forEach(id => mediaBundle.generatedIds.add(id));
+  const lines = stripTopLevelGedcomRecordsByIdFromLines(
+    stripGeneratedFtlsNoteRecordsFromGedcomLines(
+      originalText.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n'),
+      generatedNoteIds
+    ),
+    generatedMediaIds
   );
   let trlrIdx = lines.length - 1;
   for (let i = lines.length - 1; i >= 0; i--) { if (lines[i].trim() === '0 TRLR') { trlrIdx = i; break; } }
@@ -3837,8 +4319,10 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
     // Add FAMS/FAMC refs
     pFams.forEach(fid => L.push(`1 FAMS ${fid}`));
     pFamc.forEach(fid => L.push(`1 FAMC ${fid}`));
+    appendFtlsMediaRefs(L, 'INDI', p.id, mediaBundle, p._xg || '');
+    const personXg = stripObjeRefBlocksFromExtra(p._xg || '', mediaBundle?.generatedIds);
     // Preserved extra GEDCOM lines
-    if (p._xg) { p._xg.split('\n').forEach(xl => { if (xl.trim()) L.push(xl); }); }
+    if (personXg) { personXg.split('\n').forEach(xl => { if (xl.trim()) L.push(xl); }); }
     newLines.push(...L);
   }
 
@@ -3854,9 +4338,14 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
       if (wid) F.push(`1 WIFE ${wid}`);
       const md = fam.marriage_date || fam.mdate || '';
       const mp = fam.marriage_place || fam.mplace || '';
-      if (md || mp) { F.push('1 MARR'); if (md) F.push(`2 DATE ${md}`); if (mp) F.push(`2 PLAC ${mp}`); }
+      const dd = fam.divorce_date || fam.divdate || '';
+      buildFamilyMarriageLines(fam).forEach(line => F.push(line));
+      buildFamilyDivorceLines(fam).forEach(line => F.push(line));
       kids.forEach(c => F.push(`1 CHIL ${c}`));
-      addStandaloneFamilyReconciliationNote(F, mergedStandaloneNotes, { ...fam, id: fid, husband_id: hid, wife_id: wid, marriage_date: md, marriage_place: mp }, {});
+      appendFtlsMediaRefs(F, 'FAM', fid, mediaBundle, fam._extra_gedcom || '');
+      const famXg = stripObjeRefBlocksFromExtra(stripGedcomLevel1Block(fam._extra_gedcom || '', ['MARR', 'DIV']), mediaBundle?.generatedIds);
+      if (famXg) famXg.split('\n').forEach(xl => { if (xl.trim()) F.push(xl); });
+      addStandaloneFamilyReconciliationNote(F, mergedStandaloneNotes, { ...fam, id: fid, husband_id: hid, wife_id: wid, marriage_date: md, marriage_place: mp, divorce_date: dd }, {});
       newLines.push(...F);
     }
   }
@@ -3906,6 +4395,9 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
     const header = before[i];
     let body = before.slice(i + 1, j);
     body = appendOrReplaceFamilyMarriageBlock(body, fam);
+    appendFtlsMediaRefs(body, 'FAM', m[1], mediaBundle, fam._extra_gedcom || '');
+    const bodyXg = stripObjeRefBlocksFromExtra(stripGedcomLevel1Block(fam._extra_gedcom || '', ['MARR', 'DIV']), mediaBundle?.generatedIds);
+    if (bodyXg) bodyXg.split('\n').forEach(xl => { if (xl.trim() && !body.includes(xl)) body.push(xl); });
     // Existing generated FTLS notes were already stripped at the whole-file level.
     addStandaloneFamilyReconciliationNote(body, mergedStandaloneNotes, { ...fam, id: m[1] }, exportPersonNameMapForFamilies);
     before.splice(i, j - i, header, ...body);
@@ -3931,8 +4423,10 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
     // Add FAMS/FAMC refs from the family map
     (famsLookup2[p.id] || []).forEach(ref => L.push(`1 FAMS ${ref}`));
     (famcLookup2[p.id] || []).forEach(ref => L.push(`1 FAMC ${ref}`));
-    // Preserved extra GEDCOM lines (OBJE, RESI, BURI, _CRE, CHAN, etc.)
-    if (p._xg) { p._xg.split('\n').forEach(xl => { if (xl.trim()) L.push(xl); }); }
+    appendFtlsMediaRefs(L, 'INDI', p.id, mediaBundle, p._xg || '');
+    const personXg = stripObjeRefBlocksFromExtra(p._xg || '', mediaBundle?.generatedIds);
+    // Preserved extra GEDCOM lines (MFT OBJE/RECT, RESI, BURI, _CRE, CHAN, etc.)
+    if (personXg) { personXg.split('\n').forEach(xl => { if (xl.trim()) L.push(xl); }); }
     return L;
   }
 
@@ -3975,7 +4469,8 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
   }
 
 
-  return [...before, ...newLines, ...mergedStandaloneNotes, '0 TRLR'].join('\n') + '\n';
+  const mediaMetaLines = ftlsMediaMetaLines(mediaBundle);
+  return [...before, ...newLines, ...mediaMetaLines, ...mergedStandaloneNotes, '0 TRLR'].join('\n') + '\n';
 }
 
 
@@ -4023,6 +4518,7 @@ function parseGedcomFile(text) {
   // Use the canonical shared tokenizer (faithful — preserves whitespace).
   const elements = tokenizeGedcom(text);
   const noteMap = buildGedcomNoteMap(elements);
+  const ftlsMediaObjeIds = buildFtlsMediaObjeIdSet(elements);
 
   // Check character encoding (#13)
   const headEl = elements.find(e => e.tag === 'HEAD');
@@ -4047,10 +4543,10 @@ function parseGedcomFile(text) {
 
   for (const el of elements) {
     if (el.tag === 'INDI' && el.pointer) {
-      const p = parseIndi(el, noteMap);
+      const p = parseIndi(el, noteMap, ftlsMediaObjeIds);
       people[p.id] = p;
     } else if (el.tag === 'FAM' && el.pointer) {
-      const f = parseFam(el, noteMap);
+      const f = parseFam(el, noteMap, ftlsMediaObjeIds);
       families[f.id] = f;
     }
   }
@@ -4074,7 +4570,7 @@ function getNestedValue(el, parentTag, childTag) {
   return child ? child.value : '';
 }
 
-function parseIndi(el, noteMap = {}) {
+function parseIndi(el, noteMap = {}, ftlsMediaObjeIds = new Set()) {
   const id = el.pointer;
 
   // Primary name
@@ -4224,6 +4720,7 @@ function parseIndi(el, noteMap = {}) {
     fb, ig, li, ws, pp, bio, loc,
     prof, emp, stories, notes, pgl, dl,
     fams, famc,
+    _xg: collectUnknownGedcomLevel1Blocks(el, KNOWN_INDI_L1, { skipObjeRefs: ftlsMediaObjeIds }),
     _ftlsSnapshot: ftlsSnapshots[0] || null,
   };
 
@@ -4233,7 +4730,7 @@ function parseIndi(el, noteMap = {}) {
   return applyFtlsReconciliationSnapshotDefaults(parsedPerson, ftlsSnapshots[0] || null);
 }
 
-function parseFam(el, noteMap = {}) {
+function parseFam(el, noteMap = {}, ftlsMediaObjeIds = new Set()) {
   // Detect divorce: DIV tag present with value 'Y', or DIVF tag present
   const divEl = el.children.find(c => c.tag === 'DIV');
   const divorced = divEl ? (divEl.value === 'Y' || divEl.children.length > 0 || divEl.value === '') : false;
@@ -4247,6 +4744,7 @@ function parseFam(el, noteMap = {}) {
     mplace: getNestedValue(el, 'MARR', 'PLAC'),
     divorced,
     divdate: divdate === 'Y' ? '' : divdate,
+    _extra_gedcom: collectUnknownGedcomLevel1Blocks(el, KNOWN_FAM_L1, { skipObjeRefs: ftlsMediaObjeIds }),
   };
   return applyFtlsFamilyReconciliationSnapshotDefaults(
     parsedFamily,
@@ -4500,17 +4998,32 @@ function persistAuth() {
   } catch(e) {}
 }
 
+async function refreshAuthUserProfile() {
+  if (!authSession?.access_token || !authSession?.user?.id) return authUser;
+  try {
+    const users = await sbFetch(`users?id=eq.${authSession.user.id}&select=*`, {
+      headers: { 'Authorization': 'Bearer ' + authSession.access_token }
+    });
+    if (users && users.length > 0) {
+      authUser = users[0];
+      persistAuth();
+      return authUser;
+    }
+  } catch(e) {
+    console.warn('Could not refresh auth user profile:', e);
+  }
+  return authUser;
+}
+
 async function signIn(email, password) {
   const data = await sbAuthFetch('/token?grant_type=password', {
     method: 'POST',
     body: JSON.stringify({ email, password })
   });
   authSession = data;
-  // Fetch user profile from users table
-  const users = await sbFetch(`users?id=eq.${data.user.id}&select=*`, {
-    headers: { 'Authorization': 'Bearer ' + data.access_token }
-  });
-  authUser = users[0] || null;
+  // Fetch user profile from users table. Always refresh from DB so role changes
+  // made by a super_admin take effect after the next sign-in.
+  authUser = await refreshAuthUserProfile();
   persistAuth();
   return { session: data, user: authUser };
 }
@@ -5687,10 +6200,10 @@ function AdminPanel({onClose, onReloadTree, onShowMigrate, onShowDiff, onShowBac
       <div style={{display:'flex',gap:8,marginBottom:16,flexWrap:'wrap',alignItems:'center'}}>
         {tabBtn('updates','Update Requests',pendingUpdates)}
         {tabBtn('accounts','Account Requests',pendingAccess)}
-        {isSuperAdmin()&&tabBtn('users','Manage Users',0)}
+        {user?.role==='super_admin'&&tabBtn('users','Manage Users',0)}
         {tabBtn('log','Edit Log',0)}
         {tabBtn('tools','🛠 Tools',0)}
-        {isSuperAdmin()&&tabBtn('health','🩺 Tree Health',0)}
+        {user?.role==='super_admin'&&tabBtn('health','🩺 Tree Health',0)}
         {actionMsg&&<span style={{fontSize:12,color:actionMsg.startsWith('Error')?'#c05050':'#6b9e72',marginLeft:16}}>{actionMsg}</span>}
       </div>
 
@@ -5800,7 +6313,7 @@ function AdminPanel({onClose, onReloadTree, onShowMigrate, onShowDiff, onShowBac
         </div>)}
       </div>}
 
-      {!loading&&tab==='users'&&isSuperAdmin()&&<div>
+      {!loading&&tab==='users'&&user?.role==='super_admin'&&<div>
         {allUsers.map(u=><div key={u.id} style={{background:'#141410',border:'1px solid rgba(196,163,90,0.08)',borderRadius:8,padding:12,marginBottom:6,display:'flex',alignItems:'center',gap:12}}>
           <span style={{color:'#d4cfc0',fontSize:14,flex:1}}>{u.name||u.email}</span>
           <span style={{fontSize:11,color:'#7a7568'}}>{u.email}</span>
@@ -5826,7 +6339,7 @@ function AdminPanel({onClose, onReloadTree, onShowMigrate, onShowDiff, onShowBac
           const personName = e.changes?.person?.display_name || e.person_id || '—';
           const reason = e.changes?.reason || '';
           const isOpen = expandedLog === e.id;
-          const canRevert = isSnapshot && isAdmin(); // admin + super_admin can revert
+          const canRevert = isSnapshot && user && ['admin','super_admin'].includes(user.role); // admin + super_admin can revert
 
           return(<div key={e.id} style={{background:isOpen?'rgba(196,163,90,0.03)':'transparent',borderRadius:6,marginBottom:4}}>
             <div onClick={()=>setExpandedLog(isOpen?null:e.id)} style={{fontSize:12,color:'#7a7568',padding:'8px 10px',cursor:'pointer',display:'flex',alignItems:'center',gap:8,
@@ -5943,7 +6456,7 @@ function AdminPanel({onClose, onReloadTree, onShowMigrate, onShowDiff, onShowBac
       </div>}
 
       {/* ───── TREE HEALTH TAB ───── */}
-      {!loading&&tab==='health'&&isSuperAdmin()&&<TreeHealthTab personMap={personMap} familyMap={familyMap} flat={flat} tree={tree} user={user} onPlaceOrphan={onPlaceOrphan}/>}
+      {!loading&&tab==='health'&&user?.role==='super_admin'&&<TreeHealthTab personMap={personMap} familyMap={familyMap} flat={flat} tree={tree} user={user} onPlaceOrphan={onPlaceOrphan}/>}
     </div>
   );
 }
@@ -5979,10 +6492,10 @@ const SECTIONS=[
 
 const empty=()=>({id:'@I'+Date.now()+'@',fn:'',mn:'',ln:'',dn:'',nk:'',md:'',g:'M',dob:'',dod:'',dec:false,bo:0,
   em:'',ph:'',a1:'',a2:'',ci:'',st:'',zp:'',co:'',fb:'',ig:'',li:'',ws:'',pp:'',bio:'',loc:'',prof:'',emp:'',
-  stories:'',notes:'',pgl:'',dl:'',mdate:'',mplace:''});
+  stories:'',notes:'',pgl:'',dl:'',mdate:'',mplace:'',_xg:''});
 
 /* ───── FORM ───── */
-function EditForm({node,onSave,onCancel,isNew,parentId,parentName}){
+function EditForm({node,onSave,onCancel,isNew,parentId,parentName,canEditMftStories=false}){
   const [f,setF]=useState(()=>({...empty(),...node}));
   const [uploading,setUploading]=useState(false);
   const [dnManuallyEdited,setDnManuallyEdited]=useState(()=>{
@@ -5991,6 +6504,22 @@ function EditForm({node,onSave,onCancel,isNew,parentId,parentName}){
     const auto = buildDisplayName(n.fn||'', n.mn||'', n.ln||'');
     return n.dn && n.dn !== auto && n.dn !== ((n.fn||'')+(n.mn?' '+n.mn:'')+(n.ln?' '+n.ln:'')).trim();
   });
+    const [mftStoryRecords,setMftStoryRecords]=useState([]);
+  const [mftStoryLoading,setMftStoryLoading]=useState(false);
+  const [mftStoryDirty,setMftStoryDirty]=useState(false);
+
+  useEffect(()=>{
+    let cancelled=false;
+    setMftStoryRecords([]);
+    setMftStoryDirty(false);
+    if(!node?.id || isNew) return;
+    setMftStoryLoading(true);
+    loadMftStoryRecordsForPerson(node)
+      .then(records=>{ if(!cancelled) setMftStoryRecords(records || []); })
+      .catch(e=>{ console.warn('MFT story load failed:', e); })
+      .finally(()=>{ if(!cancelled) setMftStoryLoading(false); });
+    return ()=>{ cancelled=true; };
+  },[node?.id,node?._xg,isNew]);
   
   function buildDisplayName(fn, mn, ln) {
     const mi = mn ? mn.charAt(0).toUpperCase() + '.' : '';
@@ -6029,6 +6558,47 @@ function EditForm({node,onSave,onCancel,isNew,parentId,parentName}){
     setUploading(false);
   };
   
+  const updateMftStoryEntry=(recordIndex,entryIndex,key,value)=>{
+    setMftStoryRecords(prev=>prev.map((rec,ri)=>ri!==recordIndex?rec:{
+      ...rec,
+      entries:(rec.entries||[]).map((entry,ei)=>ei!==entryIndex?entry:{...entry,[key]:value})
+    }));
+    setMftStoryDirty(true);
+  };
+
+  const addMftStoryEntry=(recordIndex)=>{
+    setMftStoryRecords(prev=>prev.map((rec,ri)=>ri!==recordIndex?rec:{
+      ...rec,
+      entries:[...(rec.entries||[]),{entryId:`@STS_FTLS_${safeGedcomIdFragment(f.id)}_${Date.now()}@`,title:'Story',text:''}]
+    }));
+    setMftStoryDirty(true);
+  };
+
+  const createMftStoryRecord=()=>{
+    const rec=createEmptyMftStoryRecordForPerson(f);
+    setMftStoryRecords(prev=>[...prev,rec]);
+    set(' _xg'.trim(), appendMftStoryRefToExtraGedcom(f._xg||'', rec.id));
+    setMftStoryDirty(true);
+    return rec;
+  };
+
+  const moveFtlsStoryIntoMft=()=>{
+    const text=(f.stories||'').trim();
+    if(!text) return;
+    let records=mftStoryRecords;
+    let extra=f._xg||'';
+    if(records.length===0){
+      const rec=createEmptyMftStoryRecordForPerson(f);
+      records=[rec];
+      extra=appendMftStoryRefToExtraGedcom(extra, rec.id);
+    }
+    const nextRecords=appendTextToFirstMftStoryRecord(records,text);
+    setMftStoryRecords(nextRecords);
+    set('stories','');
+    set('_xg',extra);
+    setMftStoryDirty(true);
+  };
+
   const photoUrl = f.pp;
   const thumbUrl = photoUrl ? cldImg(photoUrl, 'c_fill,w_120,h_120,g_face') : null;
   
@@ -6086,9 +6656,49 @@ function EditForm({node,onSave,onCancel,isNew,parentId,parentName}){
             </div>
           </div>
         ))}
+
+        {!isNew&&canEditMftStories&&<div style={{marginBottom:16}}>
+          <div style={{fontSize:11,color:'#7eb8d0',textTransform:'uppercase',letterSpacing:2,marginBottom:8,borderBottom:`1px solid ${BR}`,paddingBottom:4}}>
+            MacFamilyTree Native Stories
+          </div>
+          <div style={{fontSize:11,color:DM,lineHeight:1.5,marginBottom:8}}>
+            These are MFT-native <code style={{color:TX}}>_STO</code> story records. They stay separate from FTLS Stories to prevent duplicate STORY notes.
+          </div>
+          {mftStoryLoading&&<div style={{fontSize:12,color:DM,marginBottom:8}}>Loading MacFamilyTree stories…</div>}
+          {!mftStoryLoading&&mftStoryRecords.length===0&&<div style={{fontSize:12,color:DM,marginBottom:8}}>No MFT-native story record is linked to this person yet.</div>}
+          {mftStoryRecords.map((rec,ri)=>(
+            <div key={rec.id||ri} style={{border:`1px solid ${BR}`,borderRadius:8,padding:10,marginBottom:10,background:'rgba(126,184,208,0.04)'}}>
+              <div style={{fontSize:10,color:DM,marginBottom:8}}>MFT Story Record: {rec.id}</div>
+              {(rec.entries||[]).map((entry,ei)=>(
+                <div key={entry.entryId||ei} style={{marginBottom:10,paddingBottom:10,borderBottom:ei<(rec.entries||[]).length-1?`1px solid ${BR}`:'none'}}>
+                  <label style={{fontSize:11,color:DM,display:'block',marginBottom:2}}>Story Title</label>
+                  <input value={entry.title||''} onChange={e=>updateMftStoryEntry(ri,ei,'title',e.target.value)} style={{...inp,marginBottom:6}}/>
+                  <label style={{fontSize:11,color:DM,display:'block',marginBottom:2}}>Story Text</label>
+                  <textarea value={entry.text||''} onChange={e=>updateMftStoryEntry(ri,ei,'text',e.target.value)} rows={4} style={{...inp,resize:'vertical'}}/>
+                </div>
+              ))}
+              <button type="button" onClick={()=>addMftStoryEntry(ri)}
+                style={{background:'transparent',border:`1px solid ${BR}`,color:'#7eb8d0',padding:'5px 12px',borderRadius:5,cursor:'pointer',fontSize:12}}>
+                + Add MFT story item
+              </button>
+            </div>
+          ))}
+          <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+            <button type="button" onClick={createMftStoryRecord}
+              style={{background:'rgba(126,184,208,0.08)',border:'1px solid rgba(126,184,208,0.35)',color:'#7eb8d0',padding:'6px 14px',borderRadius:5,cursor:'pointer',fontSize:12}}>
+              + Create MFT Story Record
+            </button>
+            <button type="button" onClick={moveFtlsStoryIntoMft} disabled={!(f.stories||'').trim()}
+              style={{background:'rgba(196,163,90,0.10)',border:`1px solid ${GD}`,color:GC,padding:'6px 14px',borderRadius:5,cursor:(f.stories||'').trim()?'pointer':'not-allowed',fontSize:12,opacity:(f.stories||'').trim()?1:0.45}}>
+              Move FTLS Stories into MFT Story
+            </button>
+          </div>
+          {mftStoryDirty&&<div style={{fontSize:11,color:'#7eb8d0',marginTop:6}}>MFT story changes will be saved with this person.</div>}
+        </div>}
+
         <div style={{display:'flex',gap:8,justifyContent:'flex-end',marginTop:16}}>
           <button onClick={onCancel} style={{background:'transparent',border:`1px solid ${BR}`,color:DM,padding:'8px 20px',borderRadius:6,cursor:'pointer',fontSize:13}}>Cancel</button>
-          <button onClick={()=>{const dn=f.dn||buildDisplayName(f.fn||'',f.mn||'',f.ln||'');onSave({...f,dn})}}
+          <button onClick={()=>{const dn=f.dn||buildDisplayName(f.fn||'',f.mn||'',f.ln||'');onSave({...f,dn,_mftStoryRecords:mftStoryRecords,_mftStoryDirty:mftStoryDirty})}}
             style={{background:'rgba(196,163,90,0.15)',border:`1px solid ${GD}`,color:GC,padding:'8px 20px',borderRadius:6,cursor:'pointer',fontSize:13}}>
             {isNew?'Add Member':'Save Changes'}
           </button>
@@ -6791,10 +7401,11 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
           // Use the canonical shared tokenizer (faithful — preserves whitespace).
           const elements = tokenizeGedcom(text);
           const noteMap = buildGedcomNoteMap(elements);
+          const ftlsMediaObjeIds = buildFtlsMediaObjeIdSet(elements);
           const extPeople = {}, extFamilies = {};
           for (const el of elements) {
-            if (el.tag === 'INDI' && el.pointer) { const p = parseIndi(el, noteMap); extPeople[p.id] = p; }
-            else if (el.tag === 'FAM' && el.pointer) { const f = parseFam(el, noteMap); extFamilies[f.id] = f; }
+            if (el.tag === 'INDI' && el.pointer) { const p = parseIndi(el, noteMap, ftlsMediaObjeIds); extPeople[p.id] = p; }
+            else if (el.tag === 'FAM' && el.pointer) { const f = parseFam(el, noteMap, ftlsMediaObjeIds); extFamilies[f.id] = f; }
           }
           repairGedcomLinks(extPeople, extFamilies);
           setExtFamilyIds(new Set(Object.keys(extFamilies)));
@@ -7465,18 +8076,18 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
     });
     const forcedFamilyIds = new Set(basket.exports.filter(e => e.type === 'family_facts').map(e => e.familyId));
     if (persons.length === 0 && forcedFamilyIds.size === 0) { alert('No items to export.'); return; }
-    // Load ALL gedcom_meta records for lossless MacFamilyTree round-trip export
+    // Load ALL gedcom_meta + FTLS media records for lossless MacFamilyTree/FTLS round-trip export
     try { window.gedcomMetaRecords = await sbFetch('gedcom_meta?select=*'); } catch(e) { window.gedcomMetaRecords = []; }
-    const content = exportDiffGedcom(persons, familyMap, extFamilyIds, extFamiliesMap, personMap, forcedFamilyIds);
-    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob); const a = document.createElement('a');
-    a.href = url; a.download = 'FTLS_Export_For_Merge.ged';
-    document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
-    setMergeLog(prev => [...prev, '⬆ Exported ' + persons.length + ' persons and ' + forcedFamilyIds.size + ' family fact record(s) as new GEDCOM']);
+    let mediaRecords = [];
+    try { mediaRecords = await sbFetch('media?select=*'); } catch(e) { console.warn('Could not load media for GEDCOM export:', e); }
+    const mediaBundle = buildFtlsMediaGedcomBundle(mediaRecords || [], personMap || {}, familyMap || {});
+    const content = exportDiffGedcom(persons, familyMap, extFamilyIds, extFamiliesMap, personMap, forcedFamilyIds, mediaBundle);
+    const zipResult = await downloadGedcomZip(content, mediaBundle, 'FTLS_Export_For_Merge');
+    setMergeLog(prev => [...prev, '⬆ Exported ' + persons.length + ' persons and ' + forcedFamilyIds.size + ' family fact record(s) as ZIP (' + (zipResult.images || 0) + ' image file(s))']);
   };
 
   // ── MERGE INTO LOADED GEDCOM ──
-  const batchMergeIntoGedcom = () => {
+  const batchMergeIntoGedcom = async () => {
     if (!extGedcomText) { alert('No external GEDCOM loaded.'); return; }
     const persons = basket.exports.filter(e => e.type === 'ftls_person').map(e => e.person);
     basket.exports.filter(e => e.type === 'changed_fields').forEach(e => {
@@ -7488,12 +8099,12 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
       personId: e.person.id,
       fields: e.fields.map(f => ({ key: f.key, value: f.ftls }))
     }));
-    const content = buildMergedGedcom(extGedcomText, persons, expFields, familyMap, extFamilyIds, forcedFamilyIds);
-    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob); const a = document.createElement('a');
-    a.href = url; a.download = fileName.replace('.ged', '') + '_merged.ged';
-    document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
-    setMergeLog(prev => [...prev, '⬆ Merged into ' + fileName + ' (' + persons.length + ' persons, ' + expFields.length + ' field updates, ' + forcedFamilyIds.size + ' family fact record(s))']);
+    let mediaRecords = [];
+    try { mediaRecords = await sbFetch('media?select=*'); } catch(e) { console.warn('Could not load media for GEDCOM merge export:', e); }
+    const mediaBundle = buildFtlsMediaGedcomBundle(mediaRecords || [], personMap || {}, familyMap || {});
+    const content = buildMergedGedcom(extGedcomText, persons, expFields, familyMap, extFamilyIds, forcedFamilyIds, mediaBundle);
+    const zipResult = await downloadGedcomZip(content, mediaBundle, fileName.replace(/\.ged$/i, '') + '_merged');
+    setMergeLog(prev => [...prev, '⬆ Merged into ' + fileName + ' as ZIP (' + persons.length + ' persons, ' + expFields.length + ' field updates, ' + forcedFamilyIds.size + ' family fact record(s), ' + (zipResult.images || 0) + ' image file(s))']);
   };
 
   const S = diffResult?.stats;
@@ -8607,13 +9218,13 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
                   })}
                   <div style={{ marginTop:12, display:'flex', gap:10, flexWrap:'wrap' }}>
                     <button onClick={batchExportGedcom} style={{ background:'rgba(196,163,90,0.1)', border:'1px solid '+GD, color:GC, padding:'8px 20px', borderRadius:6, cursor:'pointer', fontSize:13 }}>
-                      📄 Download as New GEDCOM
+                      🗜️ Download GEDCOM + Images ZIP
                     </button>
                     {extGedcomText && <button onClick={batchMergeIntoGedcom} style={{ background:'rgba(155,130,196,0.1)', border:'1px solid '+FC, color:FC, padding:'8px 20px', borderRadius:6, cursor:'pointer', fontSize:13 }}>
-                      📄 Download Merged into {fileName}
+                      🗜️ Download ZIP merged into {fileName}
                     </button>}
                   </div>
-                  <div style={{ fontSize:10, color:DM, marginTop:6 }}>These buttons download GEDCOM files — they do not modify your database.</div>
+                  <div style={{ fontSize:10, color:DM, marginTop:6 }}>These buttons download GEDCOM+image ZIP files — they do not modify your database.</div>
                 </>)}
               </>)}
             </div>)}
@@ -10115,6 +10726,32 @@ function App(){
   const [showPrune,setShowPrune]=useState(false);
   const [movingBranch,setMovingBranch]=useState(null); // person node to move
   const flat=useMemo(()=>tree?flattenAll(tree):[],[tree]);
+  const currentRole = user?.role || authUser?.role || null;
+  const userIsAdmin = ['admin','super_admin'].includes(currentRole);
+  const userIsEditor = currentRole === 'editor';
+  const userIsViewer = currentRole === 'viewer';
+
+  useEffect(()=>{
+    if (!authSession?.access_token) return;
+    let cancelled = false;
+    const refresh = async () => {
+      const fresh = await refreshAuthUserProfile();
+      if (!cancelled && fresh) {
+        setUser(fresh);
+        setViewerGate(false);
+      }
+    };
+    refresh();
+    const onFocus = () => refresh();
+    const onVisibility = () => { if (!document.hidden) refresh(); };
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  },[]);
 
   // Detect password recovery token in URL on load
   useEffect(()=>{
@@ -10327,13 +10964,14 @@ function App(){
   const [viewerSubmitData, setViewerSubmitData] = useState(null); // {personId, personName, changes, type}
   const [showViewerIdentity, setShowViewerIdentity] = useState(false);
 
-  const isViewer = () => user && user.role === 'viewer';
-  // Returns true if this edit should go to approval queue instead of direct DB
+  // Returns true if this edit should go to approval queue instead of direct DB.
+  // Use the refreshed React user role here, not only the module-level cached
+  // authUser, so a promoted admin does not keep behaving like an editor.
   const needsApproval = (targetPersonId) => {
-    if (isAdmin()) return false; // admins always direct
-    if (isViewer()) return true; // viewers always request
+    if (userIsAdmin) return false; // admins always direct
+    if (userIsViewer) return true; // viewers always request
     // Editors: check scope
-    if (isEditor() && !canEditorDirectEdit(targetPersonId, tree, personMap, familyMap)) return true;
+    if (userIsEditor && !canEditorDirectEdit(targetPersonId, tree, personMap, familyMap)) return true;
     return false;
   };
 
@@ -10343,10 +10981,11 @@ function App(){
   };
 
   const handleSaveEdit=(data)=>{
+    const dataToSave = stripInternalEditFields(data);
     if (needsApproval(data.id)) {
       const node = findNodeById(tree, data.id);
       // Compute diff: only fields that actually changed
-      const skipKeys = new Set(['id','ch','sp','gen','_fams','_famc','_p','_n','_matchType','_spouseOf','_isSpouse','_spouseOfId','_spouseOfName','_mt','_spOf','dn']);
+      const skipKeys = new Set(['id','ch','sp','gen','_fams','_famc','_p','_n','_matchType','_spouseOf','_isSpouse','_spouseOfId','_spouseOfName','_mt','_spOf','dn','_mftStoryRecords','_mftStoryDirty']);
       const changedFields = {};
       const prevFields = {};
       for (const [k, v] of Object.entries(data)) {
@@ -10372,13 +11011,13 @@ function App(){
       setEditing(null);
       return;
     }
-    let updatedNodeId=data.id;
+    let updatedNodeId=dataToSave.id;
     setTree(prev=>{
-      const next=updateNode(prev,data.id,(existing)=>({...existing,...data,ch:existing.ch||[],sp:existing.sp}));
+      const next=updateNode(prev,dataToSave.id,(existing)=>({...existing,...dataToSave,ch:existing.ch||[],sp:existing.sp}));
       return next;
     });
     // Keep personMap in sync
-    setPersonMap(prev=>({...prev, [data.id]: {...(prev[data.id]||{}), ...data}}));
+    setPersonMap(prev=>({...prev, [dataToSave.id]: {...(prev[dataToSave.id]||{}), ...dataToSave}}));
     setEditing(null);
     // Snapshot before save (for undo), then save
     (async()=>{
@@ -10387,16 +11026,18 @@ function App(){
           await sbFetch('rpc/snapshot_person', {
             method:'POST',
             headers:{'Authorization':'Bearer '+authSession.access_token},
-            body:JSON.stringify({p_person_id:data.id, p_reason:'before_direct_edit'})
+            body:JSON.stringify({p_person_id:dataToSave.id, p_reason:'before_direct_edit'})
           });
         }
       } catch(e) { console.warn('Snapshot failed:', e); }
-      savePerson(data, user?.name||user?.email||"").then(()=>{
-        setMsg('Saved to database!');
-      }).catch(e=>{
+      try {
+        if (data._mftStoryDirty) await saveMftStoryRecords(data._mftStoryRecords || []);
+        await savePerson(dataToSave, user?.name||user?.email||"");
+        setMsg(data._mftStoryDirty ? 'Saved person and MacFamilyTree stories!' : 'Saved to database!');
+      } catch(e) {
         console.error('Save error:', e, e?.message);
         setMsg('DB save failed: ' + (e?.message || 'unknown error'));
-      });
+      }
     })();
     setTimeout(()=>{revealNode(updatedNodeId,{select:false})},0);
     setTimeout(()=>setMsg(''),2000);
@@ -10537,7 +11178,7 @@ function App(){
       const spouseId = (spouseEditing.spouse&&spouseEditing.spouse.id) || data.id || ('@I'+Date.now()+'@');
       const spouseName = data.dn || 'Spouse';
       const existingSp = spouseEditing.spouse || {};
-      const skipKeys = new Set(['id','ch','sp','spouses','gen','_fams','_famc','_p','_n','_matchType','_spouseOf','_isSpouse','_spouseOfId','_spouseOfName','_mt','_spOf','dn']);
+      const skipKeys = new Set(['id','ch','sp','spouses','gen','_fams','_famc','_p','_n','_matchType','_spouseOf','_isSpouse','_spouseOfId','_spouseOfName','_mt','_spOf','dn','_mftStoryRecords','_mftStoryDirty']);
       const changedFields = { _action: 'edit_spouse' };
       const prevFields = {};
       for (const [k, v] of Object.entries(data)) {
@@ -10747,12 +11388,12 @@ function App(){
             <span style={{fontSize:28,color:GC,fontWeight:300,letterSpacing:1,cursor:'pointer'}} onClick={()=>setActiveTab('tree')}>Chennamkara</span>
             <span style={{fontSize:11,color:DM,letterSpacing:3,textTransform:'uppercase'}}>Family Tree</span>
             <span style={{fontSize:9,color:DM,opacity:0.5,letterSpacing:1,marginLeft:4}} title={`Build: ${BUILD_DATE}`}>{APP_VERSION}</span>
-            {user&&isAdmin()&&<>
+            {user&&userIsAdmin&&<>
               <span onClick={()=>setActiveTab('tree')} style={{fontSize:12,color:activeTab==='tree'?GC:DM,cursor:'pointer',padding:'2px 8px',borderRadius:4,background:activeTab==='tree'?'rgba(196,163,90,0.1)':'transparent'}}>🌳 Tree</span>
               <span onClick={()=>setActiveTab('photos')} style={{fontSize:12,color:activeTab==='photos'?GC:DM,cursor:'pointer',padding:'2px 8px',borderRadius:4,background:activeTab==='photos'?'rgba(196,163,90,0.1)':'transparent'}}>📷 Photos</span>
               <span onClick={()=>setActiveTab('admin')} style={{fontSize:12,color:activeTab==='admin'?GC:DM,cursor:'pointer',padding:'2px 8px',borderRadius:4,background:activeTab==='admin'?'rgba(196,163,90,0.1)':'transparent'}}>👤 Admin</span>
             </>}
-            {user&&!isAdmin()&&<>
+            {user&&!userIsAdmin&&<>
               <span onClick={()=>setActiveTab('tree')} style={{fontSize:12,color:activeTab==='tree'?GC:DM,cursor:'pointer',padding:'2px 8px',borderRadius:4,background:activeTab==='tree'?'rgba(196,163,90,0.1)':'transparent'}}>🌳 Tree</span>
               <span onClick={()=>setActiveTab('photos')} style={{fontSize:12,color:activeTab==='photos'?GC:DM,cursor:'pointer',padding:'2px 8px',borderRadius:4,background:activeTab==='photos'?'rgba(196,163,90,0.1)':'transparent'}}>📷 Photos</span>
             </>}
@@ -10799,7 +11440,7 @@ function App(){
             </div>
             {[['Expand All',expandAll],['Collapse',collapseAll],['2 Lvls',()=>expandTo(2)],['3 Lvls',()=>expandTo(3)]].map(([l,f])=>
               <button key={l} onClick={f} style={btnS}>{l}</button>)}
-            <button onClick={()=>{downloadGedcom(tree,personMap,familyMap);setMsg('GEDCOM exported!')}} title="Download the family tree as a GEDCOM file" style={{...btnS,background:'rgba(196,163,90,0.1)',borderColor:GD,color:GC}}>⬇ Export GEDCOM</button>
+            <button onClick={async()=>{await downloadGedcom(tree,personMap,familyMap);setMsg('GEDCOM+images ZIP exported!')}} title="Download the family tree as a GEDCOM + images ZIP" style={{...btnS,background:'rgba(196,163,90,0.1)',borderColor:GD,color:GC}}>⬇ Export ZIP</button>
             <button onClick={()=>triggerImportGedcom((result,fileName)=>{setTree(result.tree||result);setPersonMap(result.personMap||{});setFamilyMap(result.familyMap||{});setMsg('Imported: '+fileName);expandTo(2)})} title="Import a GEDCOM file to view (does not save to database)" style={{...btnS,background:'rgba(107,158,114,0.1)',borderColor:MC,color:MC}}>⬆ Import GEDCOM</button>
           </div>
         </div>
@@ -10829,7 +11470,7 @@ function App(){
           onAddMarriage={(node)=>handleAddMarriage(node)}
           onSetPrimary={(personId,famId)=>handleSetPrimary(personId,famId)}
         />}
-      {editing&&<EditForm node={findNodeById(tree,editing.id)||editing} onSave={handleSaveEdit} onCancel={()=>setEditing(null)} isNew={false}/>}
+      {editing&&<EditForm node={findNodeById(tree,editing.id)||editing} onSave={handleSaveEdit} onCancel={()=>setEditing(null)} isNew={false} canEditMftStories={userIsAdmin}/>}
       {spouseEditing&&<EditForm node={spouseEditing.spouse||empty()} onSave={handleSaveSpouse} onCancel={()=>setSpouseEditing(null)} isNew={false}/>}
       {adding&&<EditForm node={empty()} onSave={handleAdd} onCancel={()=>{setAdding(null);setAddingToFam(null);}} isNew={true} parentId={adding} parentName={flat.find(n=>n.id===adding)?._n}/>}
       {choosingFamFor&&(()=>{
@@ -10874,7 +11515,7 @@ function App(){
         </>;
       })()}
       </>}
-      {activeTab==='admin'&&user&&isAdmin()&&<AdminPanel onReloadTree={()=>reloadTree(true)} onShowMigrate={()=>setShowMigrate(true)} onShowDiff={()=>setShowDiff(true)} onShowBackfill={()=>setShowBackfill(true)} onShowPrune={()=>setShowPrune(true)} personMap={personMap} familyMap={familyMap} flat={flat} tree={tree} user={user} onPlaceOrphan={(person)=>setMovingBranch(person)}/>}
+      {activeTab==='admin'&&user&&userIsAdmin&&<AdminPanel onReloadTree={()=>reloadTree(true)} onShowMigrate={()=>setShowMigrate(true)} onShowDiff={()=>setShowDiff(true)} onShowBackfill={()=>setShowBackfill(true)} onShowPrune={()=>setShowPrune(true)} personMap={personMap} familyMap={familyMap} flat={flat} tree={tree} user={user} onPlaceOrphan={(person)=>setMovingBranch(person)}/>}
       
       {/* ───── PHOTOS GALLERY TAB ───── */}
       {activeTab==='photos'&&user&&<PhotoGallery flat={flat} user={user}/>}
@@ -10890,7 +11531,7 @@ function App(){
         <span style={{width:6,height:6,borderRadius:'50%',background:MC}}/>
         <span>Signed in as <strong style={{color:TX}}>{user.name||user.email}</strong></span>
         <span style={{color:GD}}>·</span>
-        <span>{isAdmin()?'Admin':'Editor'} — changes save to database</span>
+        <span>{userIsAdmin?'Admin':'Editor'} — changes save to database</span>
       </div>}
     </div>
   );
