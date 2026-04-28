@@ -35,7 +35,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.7.31';
+    const APP_VERSION = 'v4.7.32';
     const BUILD_DATE = '2026-04-27';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
@@ -1418,6 +1418,29 @@ async function saveFamily(familyId, husbandId, wifeId, children, mdate, mplace) 
   });
 }
 
+async function addFamilyPassthroughNote(familyId, noteText, editUser) {
+  const text = cleanGedcomNoteText(noteText || '');
+  if (!familyId || !text) throw new Error('Family note is blank');
+  const rows = await sbFetch(`families?id=eq.${encodeURIComponent(familyId)}&select=id,_extra_gedcom`);
+  if (!rows || rows.length === 0) throw new Error('Family not found: ' + familyId);
+  const current = rows[0]._extra_gedcom || '';
+  const next = appendGedcomInlineNoteBlock(current, text);
+  await sbFetch(`families?id=eq.${encodeURIComponent(familyId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ _extra_gedcom: next }),
+    headers: { 'Prefer': 'return=minimal' }
+  });
+  try {
+    await logEditAction({
+      familyId,
+      action: 'add_family_note',
+      editedBy: editUser || '',
+      changes: { note_preview: text.slice(0, 160) }
+    });
+  } catch(e) { console.warn('Family note log failed:', e); }
+  return next;
+}
+
 async function deletePersonFromDB(personId, editUser) {
   // Remove from family children arrays
   const fams = await sbFetch(`families?select=*&children=cs.{${personId}}`);
@@ -1944,6 +1967,82 @@ function humanFtlsValue(value) {
   return String(value);
 }
 
+function normalizeReconciliationText(value) {
+  if (value === null || value === undefined) return '';
+  return String(value)
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+function simpleStableHash(value) {
+  const text = normalizeReconciliationText(value);
+  let h = 2166136261;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(16).padStart(8, '0');
+}
+
+function buildReconciliationTaskId(scopeType, scopeId, fieldKey, value) {
+  const cleanScope = String(scopeId || '').replace(/\s+/g, '');
+  return `${scopeType}:${cleanScope}|field:${fieldKey}|hash:${simpleStableHash(value)}`;
+}
+
+function buildReconciliationMarker(scopeType, scopeId, fieldKey, value) {
+  return `[FTLS-REC ${buildReconciliationTaskId(scopeType, scopeId, fieldKey, value)}]`;
+}
+
+function buildReconciliationTaskFingerprintLines(scopeType, scopeId, fields) {
+  const out = [];
+  for (const f of fields || []) {
+    const value = f.value;
+    if (value === null || value === undefined) continue;
+    if (Array.isArray(value) && value.length === 0) continue;
+    if (!Array.isArray(value) && String(value).trim() === '') continue;
+    out.push(`Task: ${f.label}`);
+    out.push(`Task ID: ${buildReconciliationTaskId(scopeType, scopeId, f.key, value)}`);
+    out.push(`Native MFT target: ${f.target || 'Use the closest native MacFamilyTree field/fact/note.'}`);
+    out.push(`Optional marker to keep with native MFT entry: ${buildReconciliationMarker(scopeType, scopeId, f.key, value)}`);
+    out.push('');
+  }
+  return out;
+}
+
+function extractGedcomNotePreview(raw) {
+  if (!raw) return '';
+  const lines = String(raw).replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  const notes = [];
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(/^1\s+NOTE(?:\s+(.*))?$/);
+    if (!m) continue;
+    let text = (m[1] || '').trim();
+    const parts = [];
+    if (text && !/^@[^@]+@$/.test(text)) parts.push(text);
+    let j = i + 1;
+    while (j < lines.length && !/^1\s+/.test(lines[j])) {
+      const cm = lines[j].match(/^2\s+(?:CONT|CONC)\s*(.*)$/);
+      if (cm) parts.push(cm[1] || '');
+      j++;
+    }
+    const joined = parts.join('\n').trim();
+    if (joined && !isFtlsGeneratedNoteText(joined)) notes.push(joined);
+  }
+  return dedupeNoteTextLines(notes.join('\n'));
+}
+
+function appendGedcomInlineNoteBlock(raw, noteText) {
+  const text = cleanGedcomNoteText(noteText || '');
+  if (!text) return raw || '';
+  const parts = text.split('\n');
+  const block = [`1 NOTE ${parts[0] || ''}`];
+  for (const line of parts.slice(1)) block.push(`2 CONT ${line}`);
+  return [raw || '', block.join('\n')].filter(x => String(x).trim()).join('\n');
+}
+
 function buildFtlsReconciliationSnapshot(person, context = {}) {
   const fams = context.fams || person.fams || [];
   const famc = context.famc || person.famc || [];
@@ -2020,6 +2119,34 @@ function buildFtlsReconciliationSnapshot(person, context = {}) {
     '--- Technical passthrough ---',
     show('Extra GEDCOM preserved line count', extraLines ? String(extraLines) : '0'),
     'Technical note: OBJE, RESI, CHAN, _CRE, and other MFT-specific lines may be preserved separately by FTLS.',
+    '',
+    '--- Reconciliation task fingerprints ---',
+    'These fingerprints let FTLS recognize content that was moved into a native MacFamilyTree field/note/story even if the visible worksheet text is later deleted.',
+    ...buildReconciliationTaskFingerprintLines('person', person.id, [
+      { key:'display_name', label:'Display Name', value:person.dn, target:'Person > Names' },
+      { key:'first_name', label:'First/Given Name', value:person.fn, target:'Person > Names > Given' },
+      { key:'middle_name', label:'Middle/Second Name', value:person.mn, target:'Person > Names > Second/Middle' },
+      { key:'last_name', label:'Last/Surname', value:person.ln, target:'Person > Names > Surname' },
+      { key:'nickname', label:'Nickname', value:person.nk, target:'Person > Names > Nickname / alternate name' },
+      { key:'maiden_name', label:'Maiden Name', value:person.md, target:'Person > Names > Maiden/Birth name' },
+      { key:'birth_date', label:'Birth Date', value:person.dob, target:'Person > Facts > Birth date' },
+      { key:'birth_place', label:'Birth Place', value:person.loc, target:'Person > Facts > Birth place' },
+      { key:'death_date', label:'Death Date', value:person.dod, target:'Person > Facts > Death date' },
+      { key:'burial_date', label:'Burial Date', value:person.burd, target:'Person > Facts > Burial date' },
+      { key:'address', label:'Residence / Address', value:[person.a1,person.a2,person.ci,person.st,person.zp,person.co].filter(Boolean).join(', '), target:'Person > Facts > Residence or Address' },
+      { key:'phone', label:'Phone', value:person.ph, target:'Person > Contact' },
+      { key:'email', label:'Email', value:person.em, target:'Person > Contact' },
+      { key:'website', label:'Website', value:person.ws, target:'Person > Internet / Website' },
+      { key:'social_links', label:'Social Links', value:[person.fb,person.ig,person.li].filter(Boolean).join(' | '), target:'Person > Internet / Notes' },
+      { key:'occupation', label:'Profession / Occupation', value:person.prof, target:'Person > Facts > Occupation' },
+      { key:'employer', label:'Employer', value:person.emp, target:'Occupation note, employer field, or person note' },
+      { key:'profile_photo', label:'Profile Photo', value:person.pp, target:'Person > Media / Entry image' },
+      { key:'photo_gallery', label:'Photo Gallery Link', value:person.pgl, target:'Person note or website/media reference' },
+      { key:'documents', label:'Documents Link', value:person.dl, target:'Person note or media/document reference' },
+      { key:'notes', label:'FTLS Notes', value:person.notes, target:'Person > Notes' },
+      { key:'bio', label:'FTLS Bio', value:person.bio, target:'Person > Notes or Stories' },
+      { key:'stories', label:'FTLS Stories / Memories', value:person.stories, target:'Person > Stories or Notes' },
+    ]),
     FTLS_RECON_NOTE_END
   ].join('\n');
 }
@@ -2057,6 +2184,15 @@ function buildFtlsFamilyReconciliationSnapshot(fam, personMap = {}) {
     show('Divorced Flag', fam.divorced === true ? 'true' : ''),
     show('Divorce Date', fam.divorce_date || fam.divdate || ''),
     'MFT edit location: Family/Couple > Divorce event/fact.',
+    '',
+    '--- Reconciliation task fingerprints ---',
+    'These fingerprints let FTLS recognize content moved into native MacFamilyTree family/marriage fields.',
+    ...buildReconciliationTaskFingerprintLines('family', fam.id, [
+      { key:'marriage_date', label:'Marriage Date', value:fam.marriage_date || fam.mdate || '', target:'Family/Couple > Marriage date' },
+      { key:'marriage_place', label:'Marriage Place', value:normalizeMarriagePlaceText(fam.marriage_place || fam.mplace || ''), target:'Family/Couple > Marriage place' },
+      { key:'divorce_date', label:'Divorce Date', value:fam.divorce_date || fam.divdate || '', target:'Family/Couple > Divorce date' },
+      { key:'family_note', label:'Family / Marriage Note', value:extractGedcomNotePreview(fam._extra_gedcom || ''), target:'Family/Couple > Notes' },
+    ]),
     FTLS_FAM_RECON_NOTE_END
   ].join('\n');
 }
@@ -6756,6 +6892,15 @@ function EditForm({node,onSave,onCancel,isNew,parentId,parentName,canEditMftStor
           </div>
         </div>
         
+        {!isNew&&((f.notes||'').trim()||(f.bio||'').trim()||(f.stories||'').trim()||extractGedcomNotePreview(f._xg||''))&&<div style={{marginBottom:16,padding:12,background:'rgba(126,184,208,0.035)',border:`1px solid rgba(126,184,208,0.16)`,borderRadius:8}}>
+          <div style={{fontSize:11,color:'#7eb8d0',textTransform:'uppercase',letterSpacing:2,marginBottom:8}}>Read-only narrative reference</div>
+          <div style={{fontSize:11,color:DM,lineHeight:1.5,marginBottom:8}}>Reference view only. Edit the actual fields below, or move content into MacFamilyTree-native notes/stories during reconciliation.</div>
+          {f.notes&&<div style={{marginTop:8}}><div style={{fontSize:10,color:GD,textTransform:'uppercase',letterSpacing:1.5,marginBottom:3}}>FTLS Notes</div><textarea readOnly value={f.notes||''} rows={3} style={{...inp,resize:'vertical',opacity:0.86}}/></div>}
+          {f.bio&&<div style={{marginTop:8}}><div style={{fontSize:10,color:GD,textTransform:'uppercase',letterSpacing:1.5,marginBottom:3}}>FTLS Bio</div><textarea readOnly value={f.bio||''} rows={3} style={{...inp,resize:'vertical',opacity:0.86}}/></div>}
+          {f.stories&&<div style={{marginTop:8}}><div style={{fontSize:10,color:GD,textTransform:'uppercase',letterSpacing:1.5,marginBottom:3}}>FTLS Stories / Memories</div><textarea readOnly value={f.stories||''} rows={3} style={{...inp,resize:'vertical',opacity:0.86}}/></div>}
+          {extractGedcomNotePreview(f._xg||'')&&<div style={{marginTop:8}}><div style={{fontSize:10,color:'#7eb8d0',textTransform:'uppercase',letterSpacing:1.5,marginBottom:3}}>MFT native/passthrough notes</div><textarea readOnly value={extractGedcomNotePreview(f._xg||'')} rows={3} style={{...inp,resize:'vertical',opacity:0.86}}/></div>}
+        </div>}
+
         {SECTIONS.map(sec=>(
           <div key={sec.title} style={{marginBottom:16}}>
             <div style={{fontSize:11,color:GD,textTransform:'uppercase',letterSpacing:2,marginBottom:8,borderBottom:`1px solid ${BR}`,paddingBottom:4}}>{sec.title}</div>
@@ -6859,7 +7004,7 @@ function currentMarriage(spouses, primaryFamId) {
   return sorted.find(m => !m.divorced) || sorted[0];
 }
 
-function MarriagePopover({node, onEditSpouse, onDelSpouse, onAddMarriage, onAddChild, onSetPrimary}) {
+function MarriagePopover({node, onEditSpouse, onDelSpouse, onAddMarriage, onAddChild, onSetPrimary, onSelectPerson, onViewFamily}) {
   const [open, setOpen] = React.useState(false);
   const ref = React.useRef(null);
   const marriages = node.spouses || (node.sp ? [{famId:null,sp:node.sp,mdate:node.mdate||'',divorced:false}] : []);
@@ -6915,6 +7060,16 @@ function MarriagePopover({node, onEditSpouse, onDelSpouse, onAddMarriage, onAddC
                   style={{background:'none',border:`1px solid rgba(168,201,173,0.3)`,color:MC,cursor:'pointer',fontSize:11,padding:'2px 8px',borderRadius:4}}>
                   + child
                 </button>}
+                {onViewFamily&&m.famId&&<button onClick={e=>{e.stopPropagation();setOpen(false);onViewFamily(m.famId);}}
+                  title="View marriage/family notes and passthrough data"
+                  style={{background:'none',border:`1px solid rgba(126,184,208,0.25)`,color:'#7eb8d0',cursor:'pointer',fontSize:11,padding:'2px 8px',borderRadius:4}}>
+                  Notes
+                </button>}
+                {m.sp&&onSelectPerson&&<button onClick={e=>{e.stopPropagation();setOpen(false);onSelectPerson(m.sp);}}
+                  title="Open spouse profile"
+                  style={{background:'none',border:`1px solid ${BR}`,color:TX,cursor:'pointer',fontSize:11,padding:'2px 8px',borderRadius:4}}>
+                  Open spouse
+                </button>}
                 {onSetPrimary&&marriages.length>1&&!isCurrent&&m.sp&&<button onClick={e=>{e.stopPropagation();setOpen(false);onSetPrimary(node.id,m.famId);}}
                   title="Show this marriage as the person's current — changes the tree label and card ordering, does not alter any dates"
                   style={{background:'none',border:`1px solid ${BR}`,color:DM,cursor:'pointer',fontSize:11,padding:'2px 8px',borderRadius:4}}>
@@ -6938,7 +7093,7 @@ function MarriagePopover({node, onEditSpouse, onDelSpouse, onAddMarriage, onAddC
   );
 }
 
-function TreeNode({node,exp,onTog,onSel,onEdit,onAdd,onDel,onEditSpouse,onDelSpouse,onAddMarriage,onAddChild,onSetPrimary,hl}){
+function TreeNode({node,exp,onTog,onSel,onEdit,onAdd,onDel,onEditSpouse,onDelSpouse,onAddMarriage,onAddChild,onSetPrimary,onViewFamily,hl}){
   const has=node.ch&&node.ch.length>0;
   const open=exp.has(node.id);
   const isHL=hl===node.id;
@@ -6967,7 +7122,7 @@ function TreeNode({node,exp,onTog,onSel,onEdit,onAdd,onDel,onEditSpouse,onDelSpo
         <span onClick={()=>onSel(node)} title="View details" style={{fontSize:14,color:node.dec?'#6b6560':'#f0ebe0',cursor:'pointer',
           whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{node.dn}</span>
         {node.nk&&node.nk!==node.dn&&<span style={{fontSize:11,color:DM,fontStyle:'italic'}}>"{node.nk}"</span>}
-        <MarriagePopover node={node} onEditSpouse={onEditSpouse} onDelSpouse={onDelSpouse} onAddMarriage={onAddMarriage} onAddChild={onAddChild} onSetPrimary={onSetPrimary}/>
+        <MarriagePopover node={node} onEditSpouse={onEditSpouse} onDelSpouse={onDelSpouse} onAddMarriage={onAddMarriage} onAddChild={onAddChild} onSetPrimary={onSetPrimary} onSelectPerson={onSel} onViewFamily={onViewFamily}/>
         {node.dob&&<span style={{fontSize:11,color:DM,marginLeft:'auto',opacity:0.6}}>b.{node.dob}</span>}
         {has&&<span title={node.ch.length+' children'} style={{fontSize:10,color:GD,background:'rgba(196,163,90,0.08)',padding:'1px 6px',borderRadius:8,flexShrink:0}}>{node.ch.length}</span>}
         <span style={{display:'flex',gap:2,marginLeft:has?0:'auto',opacity:0.4,transition:'opacity 0.2s'}}
@@ -6982,7 +7137,7 @@ function TreeNode({node,exp,onTog,onSel,onEdit,onAdd,onDel,onEditSpouse,onDelSpo
           const isPrior = hasMultipleMarriages && !primaryChildIds.has(c.id);
           return <div key={c.id} style={{position:'relative'}}>
             {isPrior&&<span title="Child from a previous marriage" style={{position:'absolute',left:-14,top:8,fontSize:9,color:GD,fontWeight:600,opacity:0.8}}>*</span>}
-            <TreeNode node={c} exp={exp} onTog={onTog} onSel={onSel} onEdit={onEdit} onAdd={onAdd} onDel={onDel} onEditSpouse={onEditSpouse} onDelSpouse={onDelSpouse} onAddMarriage={onAddMarriage} onAddChild={onAddChild} onSetPrimary={onSetPrimary} hl={hl}/>
+            <TreeNode node={c} exp={exp} onTog={onTog} onSel={onSel} onEdit={onEdit} onAdd={onAdd} onDel={onDel} onEditSpouse={onEditSpouse} onDelSpouse={onDelSpouse} onAddMarriage={onAddMarriage} onAddChild={onAddChild} onSetPrimary={onSetPrimary} onViewFamily={onViewFamily} hl={hl}/>
           </div>;
         })}
       </div>}
@@ -6991,7 +7146,7 @@ function TreeNode({node,exp,onTog,onSel,onEdit,onAdd,onDel,onEditSpouse,onDelSpo
 }
 
 /* ───── DETAIL ───── */
-function Detail({node,onClose,onEdit,onEditSpouse,onDelSpouse,onMove,onAddChild,onAddMarriage,onSetPrimary,root}){
+function Detail({node,onClose,onEdit,onEditSpouse,onDelSpouse,onMove,onAddChild,onAddMarriage,onSetPrimary,onSelectPerson,onViewFamily,root}){
   const [personMedia,setPersonMedia]=useState([]);
   const [mediaLoaded,setMediaLoaded]=useState(false);
   const [lightbox,setLightbox]=useState(null);
@@ -7042,6 +7197,7 @@ function Detail({node,onClose,onEdit,onEditSpouse,onDelSpouse,onMove,onAddChild,
       {node.bio&&<div style={{marginTop:12}}><div style={{fontSize:11,color:GD,textTransform:'uppercase',letterSpacing:2,marginBottom:4}}>Bio</div><div style={{fontSize:13,color:TX,lineHeight:1.6,whiteSpace:'pre-wrap'}}>{node.bio}</div></div>}
       {node.notes&&<div style={{marginTop:12}}><div style={{fontSize:11,color:GD,textTransform:'uppercase',letterSpacing:2,marginBottom:4}}>Notes</div><div style={{fontSize:13,color:TX,lineHeight:1.6,whiteSpace:'pre-wrap'}}>{node.notes}</div></div>}
       {node.stories&&<div style={{marginTop:12}}><div style={{fontSize:11,color:GD,textTransform:'uppercase',letterSpacing:2,marginBottom:4}}>Stories / Memories</div><div style={{fontSize:13,color:TX,lineHeight:1.6,whiteSpace:'pre-wrap'}}>{node.stories}</div></div>}
+      {extractGedcomNotePreview(node._xg||'')&&<div style={{marginTop:12}}><div style={{fontSize:11,color:'#7eb8d0',textTransform:'uppercase',letterSpacing:2,marginBottom:4}}>MFT Native / Passthrough Notes</div><div style={{fontSize:13,color:TX,lineHeight:1.6,whiteSpace:'pre-wrap'}}>{extractGedcomNotePreview(node._xg||'')}</div></div>}
 
       {/* ── Marriages section — loops spouses[], falls back to legacy sp for GEDCOM-only nodes ── */}
       {(()=>{
@@ -7072,6 +7228,10 @@ function Detail({node,onClose,onEdit,onEditSpouse,onDelSpouse,onMove,onAddChild,
                     {m.divorced&&m.divdate&&<span style={{fontSize:11,color:DM,marginLeft:8}}>· Ended {marriageYear(m.divdate)||m.divdate}</span>}
                   </div>
                   <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
+                    {onViewFamily&&m.famId&&<button onClick={()=>onViewFamily(m.famId)}
+                      style={{background:'none',border:`1px solid rgba(126,184,208,0.25)`,color:'#7eb8d0',padding:'2px 9px',borderRadius:5,cursor:'pointer',fontSize:11}}>
+                      Notes
+                    </button>}
                     <button onClick={()=>onEditSpouse(node,m.famId,m.sp)}
                       style={{background:'none',border:`1px solid ${BR}`,color:GD,padding:'2px 9px',borderRadius:5,cursor:'pointer',fontSize:11}}>
                       {sp ? 'Edit' : 'Add partner'}
@@ -7091,8 +7251,8 @@ function Detail({node,onClose,onEdit,onEditSpouse,onDelSpouse,onMove,onAddChild,
                 <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:sp?8:0}}>
                   {spPp ? <img src={spPp} style={{width:32,height:32,borderRadius:'50%',objectFit:'cover'}} alt=""/>
                     : <span style={{width:32,height:32,borderRadius:'50%',background:'#1a1a14',border:`1px solid ${BR}`,display:'flex',alignItems:'center',justifyContent:'center',fontSize:16,color:'#3a3a30',flexShrink:0}}>{sp?.g==='F'?'👩':'👨'}</span>}
-                  <div>
-                    <div style={{fontSize:13,color:sp?TX:DM,fontStyle:sp?'normal':'italic'}}>
+                  <div onClick={()=>{ if(sp&&onSelectPerson) onSelectPerson(sp); }} title={sp?'Open spouse profile':''} style={{cursor:sp&&onSelectPerson?'pointer':'default'}}>
+                    <div style={{fontSize:13,color:sp?TX:DM,fontStyle:sp?'normal':'italic',textDecoration:sp&&onSelectPerson?'underline':'none',textDecorationColor:'rgba(196,163,90,0.35)'}}>
                       {sp?.dn || 'Unknown partner'}
                     </div>
                     {sp?.dob&&<div style={{fontSize:11,color:DM}}>b. {sp.dob}</div>}
@@ -7183,6 +7343,70 @@ function Detail({node,onClose,onEdit,onEditSpouse,onDelSpouse,onMove,onAddChild,
       }} style={{background:'rgba(192,80,80,0.12)',border:'1px solid rgba(192,80,80,0.45)',color:'#d98585',padding:'8px 18px',borderRadius:6,cursor:'pointer',fontSize:13}}>Delete media + associations</button>}
       <button onClick={()=>setLightbox(null)} style={{position:'absolute',top:20,right:20,background:'none',border:'none',color:'#fff',fontSize:24,cursor:'pointer'}}>✕</button>
     </div>}
+  </>);
+}
+
+
+/* ───── FAMILY / MARRIAGE DETAIL ───── */
+function FamilyDetail({familyId, familyMap, personMap, onClose, onSaved, user}) {
+  const [note,setNote]=useState('');
+  const [saving,setSaving]=useState(false);
+  const fam = familyId && familyMap ? familyMap[familyId] : null;
+  if (!fam) return null;
+  const hid = fam.husband_id || fam.husb || '';
+  const wid = fam.wife_id || fam.wife || '';
+  const husband = hid && personMap ? personMap[hid] : null;
+  const wife = wid && personMap ? personMap[wid] : null;
+  const kids = (fam.children || []).map(id => personMap?.[id]).filter(Boolean);
+  const familyNotes = extractGedcomNotePreview(fam._extra_gedcom || fam._xg || '');
+  const mediaRefs = ((fam._extra_gedcom || fam._xg || '').match(/^1\s+OBJE\s+@[^@]+@(?:\n[2-9]\s+.*)*/gm) || []).join('\n\n');
+  const R=({l,v})=>v?<div style={{display:'flex',justifyContent:'space-between',padding:'3px 0',fontSize:13}}><span style={{color:DM}}>{l}</span><span style={{color:TX,textAlign:'right',marginLeft:12}}>{v}</span></div>:null;
+  return(<>
+    <div onClick={onClose} style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.55)',zIndex:190}}/>
+    <div style={{position:'fixed',left:'50%',top:'50%',transform:'translate(-50%,-50%)',width:Math.min(560,window.innerWidth-32),maxHeight:'88vh',overflowY:'auto',background:CD,border:`1px solid ${BR}`,borderRadius:12,zIndex:191,padding:22,boxShadow:'0 12px 48px rgba(0,0,0,0.55)'}}>
+      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:12}}>
+        <div>
+          <div style={{fontSize:11,color:'#7eb8d0',textTransform:'uppercase',letterSpacing:2}}>Marriage / Family Record</div>
+          <div style={{fontSize:18,color:GC,fontWeight:300}}>{[husband?.dn||hid,wife?.dn||wid].filter(Boolean).join(' ⚭ ') || fam.id}</div>
+          <div style={{fontSize:10,color:DM,marginTop:2}}>{fam.id}</div>
+        </div>
+        <button onClick={onClose} style={{background:'none',border:'none',color:DM,fontSize:20,cursor:'pointer'}}>✕</button>
+      </div>
+      <div style={{border:`1px solid ${BR}`,borderRadius:8,padding:10,background:'rgba(255,255,255,0.025)',marginBottom:12}}>
+        <R l="Marriage date" v={fam.marriage_date || fam.mdate}/>
+        <R l="Marriage place" v={normalizeMarriagePlaceText(fam.marriage_place || fam.mplace || '')}/>
+        <R l="Divorced" v={fam.divorced ? 'Yes' : ''}/>
+        <R l="Divorce date" v={fam.divorce_date || fam.divdate}/>
+        {kids.length>0&&<div style={{fontSize:12,color:DM,marginTop:8}}>Children: <span style={{color:TX}}>{kids.map(k=>k.dn||k.id).join(', ')}</span></div>}
+      </div>
+      <div style={{marginBottom:12}}>
+        <div style={{fontSize:11,color:GD,textTransform:'uppercase',letterSpacing:2,marginBottom:5}}>MFT / family notes passthrough</div>
+        {familyNotes?<textarea readOnly value={familyNotes} rows={5} style={{width:'100%',background:'#1a1a14',border:`1px solid ${BR}`,color:TX,padding:'8px 10px',borderRadius:6,fontSize:12,resize:'vertical',fontFamily:'inherit'}}/>:<div style={{fontSize:12,color:DM}}>No family-level notes preserved yet.</div>}
+      </div>
+      {mediaRefs&&<div style={{marginBottom:12}}>
+        <div style={{fontSize:11,color:'#7eb8d0',textTransform:'uppercase',letterSpacing:2,marginBottom:5}}>Family media / OBJE passthrough</div>
+        <pre style={{whiteSpace:'pre-wrap',background:'#0a0a08',border:`1px solid ${BR}`,borderRadius:6,padding:8,color:DM,fontSize:10,maxHeight:120,overflow:'auto'}}>{mediaRefs}</pre>
+      </div>}
+      {isAdmin()&&<div style={{borderTop:`1px solid ${BR}`,paddingTop:12,marginTop:12}}>
+        <div style={{fontSize:11,color:GC,textTransform:'uppercase',letterSpacing:2,marginBottom:6}}>Add family / marriage note</div>
+        <div style={{fontSize:11,color:DM,lineHeight:1.5,marginBottom:6}}>For now this is stored as FAM-level GEDCOM NOTE passthrough, so it round-trips to MFT without adding a new database column.</div>
+        <textarea value={note} onChange={e=>setNote(e.target.value)} rows={4} placeholder="Add a note about this marriage/family…" style={{width:'100%',background:'#1a1a14',border:`1px solid ${BR}`,color:TX,padding:'8px 10px',borderRadius:6,fontSize:13,resize:'vertical',fontFamily:'inherit'}}/>
+        <div style={{display:'flex',justifyContent:'flex-end',gap:8,marginTop:8}}>
+          <button onClick={onClose} style={{background:'transparent',border:`1px solid ${BR}`,color:DM,padding:'7px 16px',borderRadius:6,cursor:'pointer',fontSize:12}}>Close</button>
+          <button disabled={saving||!note.trim()} onClick={async()=>{
+            setSaving(true);
+            try {
+              await addFamilyPassthroughNote(fam.id, note, user?.name || user?.email || '');
+              setNote('');
+              if(onSaved) await onSaved();
+            } catch(e) { alert('Could not save family note: '+(e?.message||e)); }
+            setSaving(false);
+          }} style={{background:'rgba(196,163,90,0.15)',border:`1px solid ${GD}`,color:GC,padding:'7px 16px',borderRadius:6,cursor:note.trim()?'pointer':'not-allowed',fontSize:12,opacity:note.trim()?1:0.5}}>
+            {saving?'Saving…':'Save note'}
+          </button>
+        </div>
+      </div>}
+    </div>
   </>);
 }
 
@@ -10906,6 +11130,7 @@ function App(){
   const [showBackfill,setShowBackfill]=useState(false);
   const [showPrune,setShowPrune]=useState(false);
   const [movingBranch,setMovingBranch]=useState(null); // person node to move
+  const [viewingFamilyId,setViewingFamilyId]=useState(null); // marriage/family detail modal
   const flat=useMemo(()=>tree?flattenAll(tree):[],[tree]);
   const currentRole = user?.role || authUser?.role || null;
   const userIsAdmin = ['admin','super_admin'].includes(currentRole);
@@ -11638,6 +11863,7 @@ function App(){
           onAddMarriage={(node)=>handleAddMarriage(node)}
           onAddChild={(parentId,famId)=>requireAuth(()=>{setAdding(parentId);setAddingToFam(famId||null);})}
           onSetPrimary={(personId,famId)=>handleSetPrimary(personId,famId)}
+          onViewFamily={(famId)=>setViewingFamilyId(famId)}
           hl={hl}/>
       </div>
       {sel&&!editing&&<Detail
@@ -11650,7 +11876,10 @@ function App(){
           onAddChild={(parentId,famId)=>requireAuth(()=>{setAdding(parentId);setAddingToFam(famId||null);})}
           onAddMarriage={(node)=>handleAddMarriage(node)}
           onSetPrimary={(personId,famId)=>handleSetPrimary(personId,famId)}
+          onSelectPerson={(p)=>setSel(findNodeById(tree,p.id)||p)}
+          onViewFamily={(famId)=>setViewingFamilyId(famId)}
         />}
+      {viewingFamilyId&&<FamilyDetail familyId={viewingFamilyId} familyMap={familyMap} personMap={personMap} user={user} onClose={()=>setViewingFamilyId(null)} onSaved={async()=>{await reloadTree(true);}}/>}
       {editing&&<EditForm node={findNodeById(tree,editing.id)||editing} onSave={handleSaveEdit} onCancel={()=>setEditing(null)} isNew={false} canEditMftStories={userIsAdmin}/>}
       {spouseEditing&&<EditForm node={spouseEditing.spouse||empty()} onSave={handleSaveSpouse} onCancel={()=>setSpouseEditing(null)} isNew={false}/>}
       {adding&&<EditForm node={empty()} onSave={handleAdd} onCancel={()=>{setAdding(null);setAddingToFam(null);}} isNew={true} parentId={adding} parentName={flat.find(n=>n.id===adding)?._n}/>}
