@@ -35,7 +35,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.7.30';
+    const APP_VERSION = 'v4.7.31';
     const BUILD_DATE = '2026-04-27';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
@@ -238,8 +238,13 @@ function collectUnknownGedcomLevel1Blocks(el, knownL1, opts = {}) {
 
 function isFtlsGeneratedObjeElement(el) {
   if (!el || el.tag !== 'OBJE') return false;
+  // FTLS-origin media may become MFT-managed after a round trip. MFT may move
+  // custom _FTLS_* tags into NOTE records, but it preserved the FTLSM_ OBJE id
+  // and FILE name in testing. Treat those as the durable identity signal.
+  if (String(el.pointer || '').startsWith('@FTLSM_')) return true;
   for (const ch of (el.children || [])) {
     if (/^_FTLS_/i.test(ch.tag || '')) return true;
+    if (ch.tag === 'FILE' && /^FTLSM_/i.test(String(ch.value || '').trim())) return true;
     if (ch.tag === 'FILE' && /res\.cloudinary\.com|cloudinary\.com/i.test(ch.value || '')) return true;
   }
   return false;
@@ -251,6 +256,12 @@ function buildFtlsMediaObjeIdSet(elements) {
     if (el.pointer && el.tag === 'OBJE' && isFtlsGeneratedObjeElement(el)) ids.add(el.pointer);
   }
   return ids;
+}
+
+function existingExtraHasObjeRef(extra, ref) {
+  if (!extra || !ref) return false;
+  const escaped = String(ref).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp('^1\\s+OBJE\\s+' + escaped + '\\s*$', 'm').test(String(extra));
 }
 
 function stripObjeRefBlocksFromExtra(extra, refsToStrip) {
@@ -365,7 +376,7 @@ function buildFtlsMediaGedcomBundle(mediaRecords = [], personMap = {}, familyMap
   }
 
   const personRefs = new Map(), familyRefs = new Map(), metaById = new Map(), filesById = new Map();
-  const generatedIds = new Set(), usedIds = new Set();
+  const generatedIds = new Set(), usedIds = new Set(), adoptedIds = new Set();
   for (const media of mediaByKey.values()) {
     const url = ftlsMediaUrl(media);
     if (!url) continue;
@@ -393,18 +404,24 @@ function buildFtlsMediaGedcomBundle(mediaRecords = [], personMap = {}, familyMap
     personIds.forEach(pid => { if (!personRefs.has(pid)) personRefs.set(pid, []); personRefs.get(pid).push(objeId); });
     familyIds.forEach(fid => { if (!familyRefs.has(fid)) familyRefs.set(fid, []); familyRefs.get(fid).push(objeId); });
   }
-  return { personRefs, familyRefs, metaById, filesById, generatedIds, usedIds };
+  return { personRefs, familyRefs, metaById, filesById, generatedIds, usedIds, adoptedIds };
 }
 
 function appendFtlsMediaRefs(lines, ownerType, ownerId, mediaBundle, existingExtra = '') {
   if (!mediaBundle || !ownerId) return;
   const refs = ownerType === 'FAM' ? (mediaBundle.familyRefs.get(ownerId) || []) : (mediaBundle.personRefs.get(ownerId) || []);
   if (!refs.length) return;
-  // Only inspect lines already built in this export. Prior FTLS-generated OBJE
-  // refs in passthrough are stripped below, so they must not suppress re-emit.
   const existingText = lines.join('\n');
   for (const ref of refs) {
     const escaped = ref.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // If MFT returned/adopted this media assignment, preserve the full MFT block
+    // from _extra_gedcom, including RECT face boundaries and _SMC changes. Mark
+    // it used for ZIP file inclusion, but do not add a duplicate OBJE ref.
+    if (existingExtraHasObjeRef(existingExtra, ref)) {
+      mediaBundle.usedIds.add(ref);
+      mediaBundle.adoptedIds.add(ref);
+      continue;
+    }
     if (new RegExp('^1\\s+OBJE\\s+' + escaped + '\\s*$', 'm').test(existingText)) { mediaBundle.usedIds.add(ref); continue; }
     lines.push(`1 OBJE ${ref}`);
     mediaBundle.usedIds.add(ref);
@@ -413,7 +430,13 @@ function appendFtlsMediaRefs(lines, ownerType, ownerId, mediaBundle, existingExt
 
 function ftlsMediaMetaLines(mediaBundle) {
   if (!mediaBundle) return [];
-  return [...mediaBundle.usedIds].map(id => mediaBundle.metaById.get(id)).filter(Boolean);
+  // Adopted FTLSM_ media keeps the top-level OBJE from gedcom_meta so MFT edits
+  // such as TITL/_SMC/NOTE pointers survive. Only generate top-level OBJE for
+  // fresh FTLS media assignments not already represented by MFT passthrough.
+  return [...mediaBundle.usedIds]
+    .filter(id => !(mediaBundle.adoptedIds && mediaBundle.adoptedIds.has(id)))
+    .map(id => mediaBundle.metaById.get(id))
+    .filter(Boolean);
 }
 
 /* ───── GEDCOM NOTE / ADDRESS HELPERS ─────
@@ -1025,6 +1048,95 @@ async function loadMedia(personId) {
   return await sbFetch('media?order=created_at.desc&limit=100');
 }
 
+function ftlsMediaObjeIdsForDeletion(media) {
+  const ids = new Set();
+  try { ids.add(makeFtlsMediaObjeId(media)); } catch(e) {}
+  if (media?.id !== undefined && media?.id !== null && media?.id !== '') ids.add(`@FTLSM_${safeGedcomIdFragment(media.id)}@`);
+  if (media?.cloudinary_id || media?.public_id) ids.add(`@FTLSM_${safeGedcomIdFragment(media.cloudinary_id || media.public_id).slice(0, 48)}@`);
+  return [...ids].filter(Boolean);
+}
+
+function collectNoteRefsFromRawObje(raw) {
+  const refs = new Set();
+  String(raw || '').split('\n').forEach(line => {
+    const m = line.match(/^1\s+NOTE\s+(@[^@]+@)\s*$/);
+    if (m) refs.add(m[1]);
+  });
+  return [...refs];
+}
+
+async function deleteMediaEverywhere(media, editUser = '') {
+  if (!media || media.id === undefined || media.id === null) throw new Error('Media row is missing an id');
+  if (!isAdmin()) throw new Error('Only admins can delete media');
+  const objeIds = ftlsMediaObjeIdsForDeletion(media);
+  const refsToStrip = new Set(objeIds);
+  const url = ftlsMediaUrl(media);
+  let personsPatched = 0, familiesPatched = 0, metaDeleted = 0, notesDeleted = 0;
+
+  // Remove owner-level OBJE/RECT assignments from person passthrough and clear
+  // profile_photo if it points at this same Cloudinary asset.
+  try {
+    const persons = await sbFetch('persons?select=id,_extra_gedcom,profile_photo');
+    for (const p of persons || []) {
+      const patch = {};
+      const cleaned = stripObjeRefBlocksFromExtra(p._extra_gedcom || '', refsToStrip);
+      if ((p._extra_gedcom || '') !== cleaned) patch._extra_gedcom = cleaned;
+      if (url && p.profile_photo && String(p.profile_photo).trim() === String(url).trim()) patch.profile_photo = '';
+      if (Object.keys(patch).length) {
+        await sbFetch(`persons?id=eq.${encodeURIComponent(p.id)}`, { method:'PATCH', body:JSON.stringify(patch), headers:{'Prefer':'return=minimal'} });
+        personsPatched++;
+      }
+    }
+  } catch(e) { console.warn('Person media cleanup failed:', e); }
+
+  // Remove family-level OBJE/RECT assignments from family passthrough.
+  try {
+    const families = await sbFetch('families?select=id,_extra_gedcom');
+    for (const f of families || []) {
+      const cleaned = stripObjeRefBlocksFromExtra(f._extra_gedcom || '', refsToStrip);
+      if ((f._extra_gedcom || '') !== cleaned) {
+        await sbFetch(`families?id=eq.${encodeURIComponent(f.id)}`, { method:'PATCH', body:JSON.stringify({_extra_gedcom: cleaned}), headers:{'Prefer':'return=minimal'} });
+        familiesPatched++;
+      }
+    }
+  } catch(e) { console.warn('Family media cleanup failed:', e); }
+
+  // Remove top-level adopted/generated OBJE records and their FTLS marker NOTE rows.
+  const noteRefs = new Set();
+  for (const oid of objeIds) {
+    try {
+      const rows = await sbFetch(`gedcom_meta?id=eq.${encodeURIComponent(oid)}&select=*`);
+      for (const r of rows || []) collectNoteRefsFromRawObje(r.raw_gedcom).forEach(n => noteRefs.add(n));
+      await sbFetch(`gedcom_meta?id=eq.${encodeURIComponent(oid)}`, { method:'DELETE', headers:{'Prefer':'return=minimal'} });
+      if (rows && rows.length) metaDeleted += rows.length;
+    } catch(e) { console.warn('gedcom_meta OBJE cleanup failed for', oid, e); }
+  }
+  for (const nid of noteRefs) {
+    try {
+      const rows = await sbFetch(`gedcom_meta?id=eq.${encodeURIComponent(nid)}&select=id,raw_gedcom,record_type`);
+      const shouldDelete = (rows || []).some(r => r.record_type === 'NOTE' && /_FTLS_(MEDIA_ID|PUBLIC_ID|URL|EXPORT_URL)/.test(r.raw_gedcom || ''));
+      if (shouldDelete) {
+        await sbFetch(`gedcom_meta?id=eq.${encodeURIComponent(nid)}`, { method:'DELETE', headers:{'Prefer':'return=minimal'} });
+        notesDeleted++;
+      }
+    } catch(e) { console.warn('gedcom_meta NOTE cleanup failed for', nid, e); }
+  }
+
+  // Delete the media row itself. This removes tagged_persons associations stored
+  // on that row. Cloudinary asset deletion requires a signed server call and is
+  // intentionally not attempted from the browser.
+  await sbFetch(`media?id=eq.${encodeURIComponent(media.id)}`, { method:'DELETE', headers:{'Prefer':'return=minimal'} });
+
+  try {
+    await logEditAction({
+      action: 'delete_media',
+      editedBy: editUser || '',
+      changes: { media_id: media.id, file_name: media.file_name || '', caption: media.caption || '', obje_ids: objeIds, personsPatched, familiesPatched, metaDeleted, notesDeleted }
+    });
+  } catch(e) { console.warn('Media delete log failed:', e); }
+  return { personsPatched, familiesPatched, metaDeleted, notesDeleted, objeIds };
+}
+
 async function sbFetch(path, opts = {}) {
   const url = SUPABASE_URL + '/rest/v1/' + path;
   const headers = { ...SB_HEADERS, ...(opts.headers || {}) };
@@ -1613,7 +1725,7 @@ async function migrateGedcomToSupabase(gedcomText, onProgress) {
         profession: gv(el,'OCCU'), employer: gv(el,'_EMPLOYER'),
         title_prefix: tp, burial_date: burd,
         photo_gallery_link: gv(el,'_PHOTOGALLERY'), documents_link: gv(el,'_DOCUMENTS'),
-        _extra_gedcom: collectUnknownGedcomLevel1Blocks(el, KNOWN_INDI_L1, { skipObjeRefs: ftlsMediaObjeIds }),
+        _extra_gedcom: collectUnknownGedcomLevel1Blocks(el, KNOWN_INDI_L1),
         updated_by: 'GEDCOM migration',
       });
       // Parse notes, bio, stories from multiple NOTE tags (after push so we can update).
@@ -1649,7 +1761,7 @@ async function migrateGedcomToSupabase(gedcomText, onProgress) {
         marriage_place: normalizeMarriagePlaceText(gnv(el,'MARR','PLAC')),
         divorced: divorced2,
         divorce_date: divdate2,
-        _extra_gedcom: collectUnknownGedcomLevel1Blocks(el, KNOWN_FAM_L1, { skipObjeRefs: ftlsMediaObjeIds }),
+        _extra_gedcom: collectUnknownGedcomLevel1Blocks(el, KNOWN_FAM_L1),
       };
       applyFtlsFamilyReconciliationSnapshotDefaultsToDbRow(
         famRow,
@@ -2376,7 +2488,7 @@ function exportTreeToGedcom(tree, personMap, familyMap, mediaBundle = null) {
     // FTLS-owned Cloudinary media exports as GEDCOM OBJE, but old FTLS-generated
     // OBJE passthrough from a prior round trip is stripped to prevent duplicates.
     appendFtlsMediaRefs(L, 'INDI', person.id, mediaBundle, person._xg || '');
-    const personXg = stripObjeRefBlocksFromExtra(person._xg || '', mediaBundle?.generatedIds);
+    const personXg = person._xg || '';
     // Preserved extra GEDCOM lines (MFT OBJE/RECT, RESI, BURI, _CRE, CHAN, etc.)
     if (personXg) { personXg.split('\n').forEach(xl => { if (xl.trim()) L.push(xl); }); }
     else { L.push('1 CHAN'); L.push(`2 DATE ${gedcomDate()}`); L.push(`3 TIME ${gedcomTime()}`); }
@@ -2395,7 +2507,7 @@ function exportTreeToGedcom(tree, personMap, familyMap, mediaBundle = null) {
     // Preserved extra GEDCOM lines for family. MARR/DIV are FTLS-managed now,
     // so strip stale preserved copies before appending passthrough data.
     appendFtlsMediaRefs(L, 'FAM', fam.id, mediaBundle, fam._extra_gedcom || '');
-    const xg = stripObjeRefBlocksFromExtra(stripGedcomLevel1Block(fam._extra_gedcom || '', ['MARR', 'DIV']), mediaBundle?.generatedIds);
+    const xg = stripGedcomLevel1Block(fam._extra_gedcom || '', ['MARR', 'DIV']);
     if (xg) { xg.split('\n').forEach(xl => { if (xl.trim()) L.push(xl); }); }
     addStandaloneFamilyReconciliationNote(L, standaloneNotes, fam, personMap || {});
     return L;
@@ -2494,6 +2606,11 @@ function downloadBlobAsFile(blob, fileName) {
   URL.revokeObjectURL(url);
 }
 
+function downloadGedcomOnly(content, baseFileName = 'FTLS_Export') {
+  const safeBase = String(baseFileName || 'FTLS_Export').replace(/\.(ged|zip)$/i, '').replace(/[^A-Za-z0-9_\-]+/g, '_') || 'FTLS_Export';
+  downloadBlobAsFile(new Blob([content], { type: 'text/plain;charset=utf-8' }), safeBase + '.ged');
+}
+
 async function fetchFtlsMediaBlobForZip(fileInfo) {
   const resp = await fetch(fileInfo.url, { mode: 'cors', credentials: 'omit' });
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -2564,7 +2681,7 @@ async function downloadGedcom(tree, personMap, familyMap) {
       // Collect all @pointer@ references from person AND family passthrough.
       const referencedIds = collectReferencedGedcomMetaIds(personMap, familyMap);
       for (const m of meta) {
-        if (mediaBundle.generatedIds.has(m.id)) continue; // FTLS media is regenerated from the media table
+        if (mediaBundle.generatedIds.has(m.id) && !(mediaBundle.adoptedIds && mediaBundle.adoptedIds.has(m.id))) continue; // fresh FTLS media is regenerated; adopted MFT-managed FTLSM media is preserved
         if (PERSON_SPECIFIC_META.has(m.record_type) && !referencedIds.has(m.id)) continue;
         metaLines.push(m.raw_gedcom);
       }
@@ -4155,7 +4272,7 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, 
     (famsLookup[pid] || []).forEach(ref => L.push(`1 FAMS ${ref}`));
     (famcLookup[pid] || []).forEach(ref => L.push(`1 FAMC ${ref}`));
     appendFtlsMediaRefs(L, 'INDI', pid, mediaBundle, person._xg || '');
-    const personXg = stripObjeRefBlocksFromExtra(person._xg || '', mediaBundle?.generatedIds);
+    const personXg = person._xg || '';
     // Preserved extra GEDCOM lines
     if (personXg) { personXg.split('\n').forEach(xl => { if (xl.trim()) L.push(xl); }); }
     else { L.push('1 CHAN'); L.push(`2 DATE ${gedcomDate()}`); L.push(`3 TIME ${gedcomTime()}`); }
@@ -4203,7 +4320,7 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, 
     buildFamilyDivorceLines(fam).forEach(line => F.push(line));
     kids.forEach(c => F.push(`1 CHIL ${c}`));
     appendFtlsMediaRefs(F, 'FAM', fid, mediaBundle, fam._extra_gedcom || '');
-    const famXg = stripObjeRefBlocksFromExtra(stripGedcomLevel1Block(fam._extra_gedcom || '', ['MARR', 'DIV']), mediaBundle?.generatedIds);
+    const famXg = stripGedcomLevel1Block(fam._extra_gedcom || '', ['MARR', 'DIV']);
     if (famXg) famXg.split('\n').forEach(xl => { if (xl.trim()) F.push(xl); });
     addStandaloneFamilyReconciliationNote(F, diffStandaloneNotes, { ...fam, id: fid, husband_id: hid, wife_id: wid, marriage_date: md, marriage_place: mp, divorce_date: dd }, allPersonMap || {});
     lines.push(...F);
@@ -4243,7 +4360,7 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, 
       (famsLookup[refId] || []).forEach(ref => L.push(`1 FAMS ${ref}`));
       (famcLookup[refId] || []).forEach(ref => L.push(`1 FAMC ${ref}`));
       appendFtlsMediaRefs(L, 'INDI', refId, mediaBundle, anchor._xg || '');
-      const anchorXg = stripObjeRefBlocksFromExtra(anchor._xg || '', mediaBundle?.generatedIds);
+      const anchorXg = anchor._xg || '';
       if (anchorXg) { anchorXg.split('\n').forEach(xl => { if (xl.trim()) L.push(xl); }); }
       else { L.push('1 CHAN'); L.push(`2 DATE ${gedcomDate()}`); L.push(`3 TIME ${gedcomTime()}`); }
       lines.push(...L);
@@ -4267,7 +4384,7 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, 
     for (const fid of emittedFamIds) { if (ftlsFamilyMap[fid]) exportedFamilyMap[fid] = ftlsFamilyMap[fid]; }
     const referencedIds = collectReferencedGedcomMetaIds(exportedPersonMap, exportedFamilyMap);
     for (const meta of window.gedcomMetaRecords) {
-      if (mediaBundle?.generatedIds?.has(meta.id)) continue;
+      if (mediaBundle?.generatedIds?.has(meta.id) && !(mediaBundle?.adoptedIds?.has(meta.id))) continue;
       if (PERSON_SPECIFIC_META.has(meta.record_type) && !referencedIds.has(meta.id)) continue;
       lines.push(meta.raw_gedcom);
     }
@@ -4289,14 +4406,11 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
   const originalElements = tokenizeGedcom(originalText);
   const originalNoteMap = buildGedcomNoteMap(originalElements);
   const generatedNoteIds = findGeneratedFtlsNoteIds(originalElements, originalNoteMap);
-  const generatedMediaIds = buildFtlsMediaObjeIdSet(originalElements);
-  if (mediaBundle) generatedMediaIds.forEach(id => mediaBundle.generatedIds.add(id));
-  const lines = stripTopLevelGedcomRecordsByIdFromLines(
-    stripGeneratedFtlsNoteRecordsFromGedcomLines(
-      originalText.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n'),
-      generatedNoteIds
-    ),
-    generatedMediaIds
+  const adoptedMediaIds = buildFtlsMediaObjeIdSet(originalElements);
+  if (mediaBundle) adoptedMediaIds.forEach(id => { mediaBundle.generatedIds.add(id); mediaBundle.adoptedIds.add(id); });
+  const lines = stripGeneratedFtlsNoteRecordsFromGedcomLines(
+    originalText.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n'),
+    generatedNoteIds
   );
   let trlrIdx = lines.length - 1;
   for (let i = lines.length - 1; i >= 0; i--) { if (lines[i].trim() === '0 TRLR') { trlrIdx = i; break; } }
@@ -4331,7 +4445,7 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
     pFams.forEach(fid => L.push(`1 FAMS ${fid}`));
     pFamc.forEach(fid => L.push(`1 FAMC ${fid}`));
     appendFtlsMediaRefs(L, 'INDI', p.id, mediaBundle, p._xg || '');
-    const personXg = stripObjeRefBlocksFromExtra(p._xg || '', mediaBundle?.generatedIds);
+    const personXg = p._xg || '';
     // Preserved extra GEDCOM lines
     if (personXg) { personXg.split('\n').forEach(xl => { if (xl.trim()) L.push(xl); }); }
     newLines.push(...L);
@@ -4354,7 +4468,7 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
       buildFamilyDivorceLines(fam).forEach(line => F.push(line));
       kids.forEach(c => F.push(`1 CHIL ${c}`));
       appendFtlsMediaRefs(F, 'FAM', fid, mediaBundle, fam._extra_gedcom || '');
-      const famXg = stripObjeRefBlocksFromExtra(stripGedcomLevel1Block(fam._extra_gedcom || '', ['MARR', 'DIV']), mediaBundle?.generatedIds);
+      const famXg = stripGedcomLevel1Block(fam._extra_gedcom || '', ['MARR', 'DIV']);
       if (famXg) famXg.split('\n').forEach(xl => { if (xl.trim()) F.push(xl); });
       addStandaloneFamilyReconciliationNote(F, mergedStandaloneNotes, { ...fam, id: fid, husband_id: hid, wife_id: wid, marriage_date: md, marriage_place: mp, divorce_date: dd }, {});
       newLines.push(...F);
@@ -4407,7 +4521,7 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
     let body = before.slice(i + 1, j);
     body = appendOrReplaceFamilyMarriageBlock(body, fam);
     appendFtlsMediaRefs(body, 'FAM', m[1], mediaBundle, fam._extra_gedcom || '');
-    const bodyXg = stripObjeRefBlocksFromExtra(stripGedcomLevel1Block(fam._extra_gedcom || '', ['MARR', 'DIV']), mediaBundle?.generatedIds);
+    const bodyXg = stripGedcomLevel1Block(fam._extra_gedcom || '', ['MARR', 'DIV']);
     if (bodyXg) bodyXg.split('\n').forEach(xl => { if (xl.trim() && !body.includes(xl)) body.push(xl); });
     // Existing generated FTLS notes were already stripped at the whole-file level.
     addStandaloneFamilyReconciliationNote(body, mergedStandaloneNotes, { ...fam, id: m[1] }, exportPersonNameMapForFamilies);
@@ -4435,7 +4549,7 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
     (famsLookup2[p.id] || []).forEach(ref => L.push(`1 FAMS ${ref}`));
     (famcLookup2[p.id] || []).forEach(ref => L.push(`1 FAMC ${ref}`));
     appendFtlsMediaRefs(L, 'INDI', p.id, mediaBundle, p._xg || '');
-    const personXg = stripObjeRefBlocksFromExtra(p._xg || '', mediaBundle?.generatedIds);
+    const personXg = p._xg || '';
     // Preserved extra GEDCOM lines (MFT OBJE/RECT, RESI, BURI, _CRE, CHAN, etc.)
     if (personXg) { personXg.split('\n').forEach(xl => { if (xl.trim()) L.push(xl); }); }
     return L;
@@ -4731,7 +4845,7 @@ function parseIndi(el, noteMap = {}, ftlsMediaObjeIds = new Set()) {
     fb, ig, li, ws, pp, bio, loc,
     prof, emp, stories, notes, pgl, dl,
     fams, famc,
-    _xg: collectUnknownGedcomLevel1Blocks(el, KNOWN_INDI_L1, { skipObjeRefs: ftlsMediaObjeIds }),
+    _xg: collectUnknownGedcomLevel1Blocks(el, KNOWN_INDI_L1),
     _ftlsSnapshot: ftlsSnapshots[0] || null,
   };
 
@@ -4755,7 +4869,7 @@ function parseFam(el, noteMap = {}, ftlsMediaObjeIds = new Set()) {
     mplace: normalizeMarriagePlaceText(getNestedValue(el, 'MARR', 'PLAC')),
     divorced,
     divdate: divdate === 'Y' ? '' : divdate,
-    _extra_gedcom: collectUnknownGedcomLevel1Blocks(el, KNOWN_FAM_L1, { skipObjeRefs: ftlsMediaObjeIds }),
+    _extra_gedcom: collectUnknownGedcomLevel1Blocks(el, KNOWN_FAM_L1),
   };
   return applyFtlsFamilyReconciliationSnapshotDefaults(
     parsedFamily,
@@ -7058,6 +7172,15 @@ function Detail({node,onClose,onEdit,onEditSpouse,onDelSpouse,onMove,onAddChild,
       }
       {lightbox.caption&&lightbox.media_type!=='document'&&<div style={{color:TX,fontSize:14,maxWidth:'80vw',textAlign:'center'}}>{lightbox.caption}</div>}
       <div style={{color:DM,fontSize:11}}>{lightbox.uploaded_by&&`Uploaded by ${lightbox.uploaded_by}`}{lightbox.event_date&&` · ${lightbox.event_date}`}</div>
+      {isAdmin() && <button onClick={async(e)=>{
+        e.stopPropagation();
+        if (!confirm('Delete this media from FTLS and remove its GEDCOM media associations? Cloudinary storage itself is not deleted from the browser.')) return;
+        try {
+          await deleteMediaEverywhere(lightbox, user.name || user.email || '');
+          setPersonMedia(prev => prev.filter(m => m.id !== lightbox.id));
+          setLightbox(null);
+        } catch(err) { alert('Delete failed: ' + (err?.message || err)); }
+      }} style={{background:'rgba(192,80,80,0.12)',border:'1px solid rgba(192,80,80,0.45)',color:'#d98585',padding:'8px 18px',borderRadius:6,cursor:'pointer',fontSize:13}}>Delete media + associations</button>}
       <button onClick={()=>setLightbox(null)} style={{position:'absolute',top:20,right:20,background:'none',border:'none',color:'#fff',fontSize:24,cursor:'pointer'}}>✕</button>
     </div>}
   </>);
@@ -7202,6 +7325,16 @@ function PhotoGallery({flat, user}) {
           {(lightbox.tagged_persons || []).length > 0 && <div style={{ color: GD, fontSize: 12, marginTop: 4 }}>
             Tagged: {(lightbox.tagged_persons || []).map(pid => personById[pid]?.dn || pid).join(', ')}
           </div>}
+          {isAdmin() && <button onClick={async()=>{
+            if (!confirm('Delete this media from FTLS and remove its GEDCOM media associations? Cloudinary storage itself is not deleted from the browser.')) return;
+            try {
+              await deleteMediaEverywhere(lightbox, user.name || user.email || '');
+              setLightbox(null);
+              reload();
+            } catch(err) { alert('Delete failed: ' + (err?.message || err)); }
+          }} style={{ marginTop:12, background:'rgba(192,80,80,0.12)', border:'1px solid rgba(192,80,80,0.45)', color:'#d98585', padding:'8px 18px', borderRadius:6, cursor:'pointer', fontSize:13 }}>
+            Delete media + associations
+          </button>}
         </div>
         <button onClick={() => setLightbox(null)} style={{ position: 'absolute', top: 20, right: 20, background: 'none', border: 'none', color: '#fff', fontSize: 28, cursor: 'pointer' }}>✕</button>
       </div>}
@@ -8097,6 +8230,20 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
     setMergeLog(prev => [...prev, '⬆ Exported ' + persons.length + ' persons and ' + forcedFamilyIds.size + ' family fact record(s) as ZIP (' + (zipResult.images || 0) + ' image file(s))']);
   };
 
+  // ── BATCH EXPORT (GEDCOM only, no auto-generated image ZIP) ──
+  const batchExportGedcomOnly = async () => {
+    const persons = basket.exports.filter(e => e.type === 'ftls_person').map(e => e.person);
+    basket.exports.filter(e => e.type === 'changed_fields').forEach(e => {
+      if (!persons.find(p => p.id === e.person.id)) persons.push(e.person);
+    });
+    const forcedFamilyIds = new Set(basket.exports.filter(e => e.type === 'family_facts').map(e => e.familyId));
+    if (persons.length === 0 && forcedFamilyIds.size === 0) { alert('No items to export.'); return; }
+    try { window.gedcomMetaRecords = await sbFetch('gedcom_meta?select=*'); } catch(e) { window.gedcomMetaRecords = []; }
+    const content = exportDiffGedcom(persons, familyMap, extFamilyIds, extFamiliesMap, personMap, forcedFamilyIds, null);
+    downloadGedcomOnly(content, 'FTLS_Export_For_Merge');
+    setMergeLog(prev => [...prev, '⬆ Exported ' + persons.length + ' persons and ' + forcedFamilyIds.size + ' family fact record(s) as GEDCOM only (no image ZIP)']);
+  };
+
   // ── MERGE INTO LOADED GEDCOM ──
   const batchMergeIntoGedcom = async () => {
     if (!extGedcomText) { alert('No external GEDCOM loaded.'); return; }
@@ -8116,6 +8263,23 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
     const content = buildMergedGedcom(extGedcomText, persons, expFields, familyMap, extFamilyIds, forcedFamilyIds, mediaBundle);
     const zipResult = await downloadGedcomZip(content, mediaBundle, fileName.replace(/\.ged$/i, '') + '_merged');
     setMergeLog(prev => [...prev, '⬆ Merged into ' + fileName + ' as ZIP (' + persons.length + ' persons, ' + expFields.length + ' field updates, ' + forcedFamilyIds.size + ' family fact record(s), ' + (zipResult.images || 0) + ' image file(s))']);
+  };
+
+  const batchMergeIntoGedcomOnly = async () => {
+    if (!extGedcomText) { alert('No external GEDCOM loaded.'); return; }
+    const persons = basket.exports.filter(e => e.type === 'ftls_person').map(e => e.person);
+    basket.exports.filter(e => e.type === 'changed_fields').forEach(e => {
+      if (!persons.find(p => p.id === e.person.id)) persons.push(e.person);
+    });
+    const forcedFamilyIds = new Set(basket.exports.filter(e => e.type === 'family_facts').map(e => e.familyId));
+    if (persons.length === 0 && forcedFamilyIds.size === 0) { alert('No items to export.'); return; }
+    const expFields = basket.exports.filter(e => e.type === 'changed_fields').map(e => ({
+      personId: e.person.id,
+      fields: e.fields.map(f => ({ key: f.key, value: f.ftls }))
+    }));
+    const content = buildMergedGedcom(extGedcomText, persons, expFields, familyMap, extFamilyIds, forcedFamilyIds, null);
+    downloadGedcomOnly(content, fileName.replace(/\.ged$/i, '') + '_merged');
+    setMergeLog(prev => [...prev, '⬆ Merged into ' + fileName + ' as GEDCOM only (' + persons.length + ' persons, ' + expFields.length + ' field updates, ' + forcedFamilyIds.size + ' family fact record(s))']);
   };
 
   const S = diffResult?.stats;
@@ -9231,11 +9395,17 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
                     <button onClick={batchExportGedcom} style={{ background:'rgba(196,163,90,0.1)', border:'1px solid '+GD, color:GC, padding:'8px 20px', borderRadius:6, cursor:'pointer', fontSize:13 }}>
                       🗜️ Download GEDCOM + Images ZIP
                     </button>
+                    <button onClick={batchExportGedcomOnly} style={{ background:'transparent', border:'1px solid '+BR, color:TX, padding:'8px 20px', borderRadius:6, cursor:'pointer', fontSize:13 }}>
+                      ⬇ Download GEDCOM only
+                    </button>
                     {extGedcomText && <button onClick={batchMergeIntoGedcom} style={{ background:'rgba(155,130,196,0.1)', border:'1px solid '+FC, color:FC, padding:'8px 20px', borderRadius:6, cursor:'pointer', fontSize:13 }}>
                       🗜️ Download ZIP merged into {fileName}
                     </button>}
+                    {extGedcomText && <button onClick={batchMergeIntoGedcomOnly} style={{ background:'transparent', border:'1px solid '+BR, color:TX, padding:'8px 20px', borderRadius:6, cursor:'pointer', fontSize:13 }}>
+                      ⬇ GEDCOM-only merge into {fileName}
+                    </button>}
                   </div>
-                  <div style={{ fontSize:10, color:DM, marginTop:6 }}>These buttons download GEDCOM+image ZIP files — they do not modify your database.</div>
+                  <div style={{ fontSize:10, color:DM, marginTop:6 }}>ZIP buttons include renamed Cloudinary JPGs. GEDCOM-only buttons export text only. None of these export buttons modify your database.</div>
                 </>)}
               </>)}
             </div>)}
