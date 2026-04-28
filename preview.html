@@ -35,7 +35,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.7.33';
+    const APP_VERSION = 'v4.7.34';
     const BUILD_DATE = '2026-04-27';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
@@ -294,6 +294,50 @@ function collectReferencedGedcomMetaIds(personMap = {}, familyMap = {}) {
   }
   for (const f of Object.values(familyMap || {})) collect(f?._extra_gedcom || f?._xg || '');
   return referencedIds;
+}
+
+
+function extractGedcomMetaRecordsFromText(text) {
+  const raw = String(text || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const lines = raw.split('\n');
+  const skipTop = new Set(['INDI','FAM','HEAD','TRLR','SUBM']);
+  const out = [];
+  let cur = [];
+  const flush = () => {
+    if (!cur.length) return;
+    const first = cur[0] || '';
+    const m = first.match(/^0\s+(@[^@]+@)\s+(\S+)/);
+    if (m && !skipTop.has(m[2])) {
+      const rawGedcom = cur.join('\n').replace(/\n+$/,'');
+      out.push({ id: m[1], record_type: m[2], raw_gedcom: rawGedcom, raw: rawGedcom });
+    }
+  };
+  for (const line of lines) {
+    if (/^0\s+/.test(line)) {
+      flush();
+      cur = [line];
+    } else if (cur.length) {
+      cur.push(line);
+    }
+  }
+  flush();
+  return out;
+}
+
+function primeGedcomMetaCacheFromText(text) {
+  const records = extractGedcomMetaRecordsFromText(text);
+  if (typeof window !== 'undefined') {
+    window.gedcomMetaRecords = mergeGedcomMetaCache(window.gedcomMetaRecords || [], records);
+    window.lastLoadedGedcomMetaRecords = records;
+  }
+  return records;
+}
+
+function mftStoryMissingRefs(person) {
+  const refs = extractMftStoryRefs(person);
+  if (!refs.length) return [];
+  const cached = Array.isArray(window.gedcomMetaRecords) ? window.gedcomMetaRecords : [];
+  return refs.filter(id => !cached.some(r => r.id === id && r.record_type === '_STO'));
 }
 
 function normalizeGedcomArray(value) {
@@ -1669,6 +1713,7 @@ async function loadSourceGedcom() {
 async function migrateGedcomToSupabase(gedcomText, onProgress) {
   // Use the canonical shared tokenizer (faithful — preserves whitespace).
   const elements = tokenizeGedcom(gedcomText);
+  const topLevelMetaRecords = primeGedcomMetaCacheFromText(gedcomText);
   const noteMap = buildGedcomNoteMap(elements);
   const ftlsMediaObjeIds = buildFtlsMediaObjeIdSet(elements);
 
@@ -1806,8 +1851,25 @@ async function migrateGedcomToSupabase(gedcomText, onProgress) {
   // Clear existing data
   onProgress('Clearing existing data...');
   try { await sbFetch('edit_log?id=gt.0', { method: 'DELETE' }); } catch(e) {}
+  try { await sbFetch('gedcom_meta?id=neq.', { method: 'DELETE' }); } catch(e) {}
   try { await sbFetch('families?id=neq.', { method: 'DELETE' }); } catch(e) {}
   try { await sbFetch('persons?id=neq.', { method: 'DELETE' }); } catch(e) {}
+
+  // Preserve top-level GEDCOM records such as NOTE/OBJE/_STO for lossless MFT stories/media.
+  if (topLevelMetaRecords && topLevelMetaRecords.length > 0) {
+    onProgress(`Inserting ${topLevelMetaRecords.length} top-level GEDCOM records...`);
+    const metaRows = topLevelMetaRecords.map(r => ({ id:r.id, record_type:r.record_type, raw_gedcom:r.raw_gedcom || r.raw || '' }));
+    for (let i = 0; i < metaRows.length; i += 50) {
+      const batch = metaRows.slice(i, i + 50);
+      try {
+        await sbFetch('gedcom_meta?on_conflict=id', {
+          method: 'POST',
+          body: JSON.stringify(batch),
+          headers: { 'Prefer': 'resolution=merge-duplicates,return=minimal' }
+        });
+      } catch(e) { console.warn('Could not insert GEDCOM meta batch:', e); }
+    }
+  }
 
   // Insert persons in batches
   const batchSize = 30;
@@ -4778,6 +4840,9 @@ function repairGedcomLinks(people, families) {
 function parseGedcomFile(text) {
   // Use the canonical shared tokenizer (faithful — preserves whitespace).
   const elements = tokenizeGedcom(text);
+  // Cache top-level NOTE/OBJE/_STO/_STS-style records from this GEDCOM so MFT-native
+  // stories display immediately in the preview/tree without requiring a DB backfill.
+  primeGedcomMetaCacheFromText(text);
   const noteMap = buildGedcomNoteMap(elements);
   const ftlsMediaObjeIds = buildFtlsMediaObjeIdSet(elements);
 
@@ -6892,7 +6957,7 @@ function EditForm({node,onSave,onCancel,isNew,parentId,parentName,canEditMftStor
           </div>
         </div>
         
-        {!isNew&&((f.notes||'').trim()||(f.bio||'').trim()||(f.stories||'').trim()||extractGedcomNotePreview(f._xg||''))&&<div style={{marginBottom:16,padding:12,background:'rgba(126,184,208,0.035)',border:`1px solid rgba(126,184,208,0.16)`,borderRadius:8}}>
+        {!isNew&&((f.notes||'').trim()||(f.bio||'').trim()||(f.stories||'').trim()||extractGedcomNotePreview(f._xg||'')||mftStoryLoading||mftStoryRecords.length>0||mftStoryMissingRefs(f).length>0)&&<div style={{marginBottom:16,padding:12,background:'rgba(126,184,208,0.035)',border:`1px solid rgba(126,184,208,0.16)`,borderRadius:8}}>
           <div style={{fontSize:11,color:'#7eb8d0',textTransform:'uppercase',letterSpacing:2,marginBottom:8}}>Read-only narrative reference</div>
           <div style={{fontSize:11,color:DM,lineHeight:1.5,marginBottom:8}}>Reference view only. Edit the actual fields below, or move content into MacFamilyTree-native notes/stories during reconciliation.</div>
           {f.notes&&<div style={{marginTop:8}}><div style={{fontSize:10,color:GD,textTransform:'uppercase',letterSpacing:1.5,marginBottom:3}}>FTLS Notes</div><textarea readOnly value={f.notes||''} rows={3} style={{...inp,resize:'vertical',opacity:0.86}}/></div>}
@@ -6935,7 +7000,8 @@ function EditForm({node,onSave,onCancel,isNew,parentId,parentName,canEditMftStor
             These are MFT-native <code style={{color:TX}}>_STO</code> story records. They stay separate from FTLS Stories to prevent duplicate STORY notes. {canEditMftStories ? 'Admins can edit them here.' : 'Read-only here unless you are an admin.'}
           </div>
           {mftStoryLoading&&<div style={{fontSize:12,color:DM,marginBottom:8}}>Loading MacFamilyTree stories…</div>}
-          {!mftStoryLoading&&mftStoryRecords.length===0&&<div style={{fontSize:12,color:DM,marginBottom:8}}>No MFT-native story record is linked to this person yet.</div>}
+          {!mftStoryLoading&&mftStoryRecords.length===0&&mftStoryMissingRefs(f).length===0&&<div style={{fontSize:12,color:DM,marginBottom:8}}>No MFT-native story record is linked to this person yet.</div>}
+          {!mftStoryLoading&&mftStoryMissingRefs(f).length>0&&<div style={{fontSize:12,color:'#d0a07e',marginBottom:8}}>Story reference found ({mftStoryMissingRefs(f).join(', ')}), but the top-level _STO story record is not loaded in gedcom_meta/cache. Run Backfill from the MFT GEDCOM or re-open this GEDCOM in Diff/Import to load story metadata.</div>}
           {mftStoryRecords.map((rec,ri)=>(
             <div key={rec.id||ri} style={{border:`1px solid ${BR}`,borderRadius:8,padding:10,marginBottom:10,background:'rgba(126,184,208,0.04)'}}>
               <div style={{fontSize:10,color:DM,marginBottom:8}}>MFT Story Record: {rec.id}</div>
@@ -7209,6 +7275,7 @@ function Detail({node,onClose,onEdit,onEditSpouse,onDelSpouse,onMove,onAddChild,
       {node.notes&&<div style={{marginTop:12}}><div style={{fontSize:11,color:GD,textTransform:'uppercase',letterSpacing:2,marginBottom:4}}>Notes</div><div style={{fontSize:13,color:TX,lineHeight:1.6,whiteSpace:'pre-wrap'}}>{node.notes}</div></div>}
       {node.stories&&<div style={{marginTop:12}}><div style={{fontSize:11,color:GD,textTransform:'uppercase',letterSpacing:2,marginBottom:4}}>Stories / Memories</div><div style={{fontSize:13,color:TX,lineHeight:1.6,whiteSpace:'pre-wrap'}}>{node.stories}</div></div>}
       {mftStoryLoading&&<div style={{marginTop:12,fontSize:12,color:DM}}>Loading MacFamilyTree stories…</div>}
+      {!mftStoryLoading&&mftStoryMissingRefs(node).length>0&&<div style={{marginTop:12,fontSize:12,color:'#d0a07e',lineHeight:1.5}}>MFT story reference found ({mftStoryMissingRefs(node).join(', ')}), but the top-level _STO story record is not loaded in FTLS. Run Backfill from the MFT GEDCOM so the story text can display.</div>}
       {mftStoryRecords.length>0&&<div style={{marginTop:12}}>
         <div style={{fontSize:11,color:'#7eb8d0',textTransform:'uppercase',letterSpacing:2,marginBottom:4}}>MacFamilyTree Native Stories</div>
         {mftStoryRecords.map((rec,ri)=><div key={rec.id||ri} style={{marginBottom:10,padding:10,border:`1px solid ${BR}`,borderRadius:8,background:'rgba(126,184,208,0.035)'}}>
@@ -7270,7 +7337,7 @@ function Detail({node,onClose,onEdit,onEditSpouse,onDelSpouse,onMove,onAddChild,
                   </div>
                 </div>
                 {/* Partner */}
-                <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:sp?8:0}}>
+                <div onClick={()=>{ if(sp&&onSelectPerson) onSelectPerson(sp); }} title={sp?'Open spouse profile':''} style={{display:'flex',alignItems:'center',gap:8,marginBottom:sp?8:0,cursor:sp&&onSelectPerson?'pointer':'default',borderRadius:6,padding:2}}>
                   {spPp ? <img src={spPp} style={{width:32,height:32,borderRadius:'50%',objectFit:'cover'}} alt=""/>
                     : <span style={{width:32,height:32,borderRadius:'50%',background:'#1a1a14',border:`1px solid ${BR}`,display:'flex',alignItems:'center',justifyContent:'center',fontSize:16,color:'#3a3a30',flexShrink:0}}>{sp?.g==='F'?'👩':'👨'}</span>}
                   <div onClick={()=>{ if(sp&&onSelectPerson) onSelectPerson(sp); }} title={sp?'Open spouse profile':''} style={{cursor:sp&&onSelectPerson?'pointer':'default'}}>
@@ -7788,6 +7855,9 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
         try {
           const text = evt.target.result;
           setExtGedcomText(text);
+          // Cache top-level _STO story records and other meta from the uploaded GEDCOM
+          // for immediate Detail/Edit display and later optional passthrough import.
+          primeGedcomMetaCacheFromText(text);
           // Use the canonical shared tokenizer (faithful — preserves whitespace).
           const elements = tokenizeGedcom(text);
           const noteMap = buildGedcomNoteMap(elements);
