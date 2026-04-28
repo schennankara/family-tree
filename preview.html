@@ -35,7 +35,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.7.32';
+    const APP_VERSION = 'v4.7.33';
     const BUILD_DATE = '2026-04-27';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
@@ -6927,12 +6927,12 @@ function EditForm({node,onSave,onCancel,isNew,parentId,parentName,canEditMftStor
           </div>
         ))}
 
-        {!isNew&&canEditMftStories&&<div style={{marginBottom:16}}>
+        {!isNew&&(canEditMftStories || mftStoryLoading || mftStoryRecords.length>0)&&<div style={{marginBottom:16}}>
           <div style={{fontSize:11,color:'#7eb8d0',textTransform:'uppercase',letterSpacing:2,marginBottom:8,borderBottom:`1px solid ${BR}`,paddingBottom:4}}>
             MacFamilyTree Native Stories
           </div>
           <div style={{fontSize:11,color:DM,lineHeight:1.5,marginBottom:8}}>
-            These are MFT-native <code style={{color:TX}}>_STO</code> story records. They stay separate from FTLS Stories to prevent duplicate STORY notes.
+            These are MFT-native <code style={{color:TX}}>_STO</code> story records. They stay separate from FTLS Stories to prevent duplicate STORY notes. {canEditMftStories ? 'Admins can edit them here.' : 'Read-only here unless you are an admin.'}
           </div>
           {mftStoryLoading&&<div style={{fontSize:12,color:DM,marginBottom:8}}>Loading MacFamilyTree stories…</div>}
           {!mftStoryLoading&&mftStoryRecords.length===0&&<div style={{fontSize:12,color:DM,marginBottom:8}}>No MFT-native story record is linked to this person yet.</div>}
@@ -6942,18 +6942,18 @@ function EditForm({node,onSave,onCancel,isNew,parentId,parentName,canEditMftStor
               {(rec.entries||[]).map((entry,ei)=>(
                 <div key={entry.entryId||ei} style={{marginBottom:10,paddingBottom:10,borderBottom:ei<(rec.entries||[]).length-1?`1px solid ${BR}`:'none'}}>
                   <label style={{fontSize:11,color:DM,display:'block',marginBottom:2}}>Story Title</label>
-                  <input value={entry.title||''} onChange={e=>updateMftStoryEntry(ri,ei,'title',e.target.value)} style={{...inp,marginBottom:6}}/>
+                  <input readOnly={!canEditMftStories} value={entry.title||''} onChange={e=>{ if(canEditMftStories) updateMftStoryEntry(ri,ei,'title',e.target.value); }} style={{...inp,marginBottom:6,opacity:canEditMftStories?1:0.86}}/>
                   <label style={{fontSize:11,color:DM,display:'block',marginBottom:2}}>Story Text</label>
-                  <textarea value={entry.text||''} onChange={e=>updateMftStoryEntry(ri,ei,'text',e.target.value)} rows={4} style={{...inp,resize:'vertical'}}/>
+                  <textarea readOnly={!canEditMftStories} value={entry.text||''} onChange={e=>{ if(canEditMftStories) updateMftStoryEntry(ri,ei,'text',e.target.value); }} rows={4} style={{...inp,resize:'vertical',opacity:canEditMftStories?1:0.86}}/>
                 </div>
               ))}
-              <button type="button" onClick={()=>addMftStoryEntry(ri)}
+              {canEditMftStories&&<button type="button" onClick={()=>addMftStoryEntry(ri)}
                 style={{background:'transparent',border:`1px solid ${BR}`,color:'#7eb8d0',padding:'5px 12px',borderRadius:5,cursor:'pointer',fontSize:12}}>
                 + Add MFT story item
-              </button>
+              </button>}
             </div>
           ))}
-          <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+          {canEditMftStories&&<div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
             <button type="button" onClick={createMftStoryRecord}
               style={{background:'rgba(126,184,208,0.08)',border:'1px solid rgba(126,184,208,0.35)',color:'#7eb8d0',padding:'6px 14px',borderRadius:5,cursor:'pointer',fontSize:12}}>
               + Create MFT Story Record
@@ -6962,7 +6962,7 @@ function EditForm({node,onSave,onCancel,isNew,parentId,parentName,canEditMftStor
               style={{background:'rgba(196,163,90,0.10)',border:`1px solid ${GD}`,color:GC,padding:'6px 14px',borderRadius:5,cursor:(f.stories||'').trim()?'pointer':'not-allowed',fontSize:12,opacity:(f.stories||'').trim()?1:0.45}}>
               Move FTLS Stories into MFT Story
             </button>
-          </div>
+          </div>}
           {mftStoryDirty&&<div style={{fontSize:11,color:'#7eb8d0',marginTop:6}}>MFT story changes will be saved with this person.</div>}
         </div>}
 
@@ -7014,11 +7014,8 @@ function MarriagePopover({node, onEditSpouse, onDelSpouse, onAddMarriage, onAddC
     document.addEventListener('mousedown', handler);
     return ()=>document.removeEventListener('mousedown', handler);
   },[open]);
-  const currentLabel = marriages.length === 0 ? null
-    : (() => {
-        const cur = currentMarriage(marriages, node.primaryFamId);
-        return cur?.sp?.dn || (marriages.length === 1 ? '(unknown partner)' : null);
-      })();
+  const currentMarriageForLabel = marriages.length === 0 ? null : currentMarriage(marriages, node.primaryFamId);
+  const currentLabel = currentMarriageForLabel?.sp?.dn || (marriages.length === 1 ? '(unknown partner)' : null);
   return (
     <span ref={ref} style={{position:'relative',display:'inline-flex',alignItems:'center',gap:4,fontSize:12,color:DM}}>
       <span
@@ -7027,7 +7024,7 @@ function MarriagePopover({node, onEditSpouse, onDelSpouse, onAddMarriage, onAddC
         style={{color:GD,fontSize:13,cursor:'pointer',padding:'1px 3px',borderRadius:3,
           background:open?'rgba(196,163,90,0.15)':'transparent',userSelect:'none'}}
       >⚭</span>
-      {currentLabel && <span style={{opacity:0.7,maxWidth:120,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{currentLabel}</span>}
+      {currentLabel && <span onClick={e=>{e.stopPropagation(); if(currentMarriageForLabel?.sp && onSelectPerson) onSelectPerson(currentMarriageForLabel.sp); }} title={currentMarriageForLabel?.sp?'Open spouse profile':''} style={{opacity:0.7,maxWidth:120,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',cursor:currentMarriageForLabel?.sp&&onSelectPerson?'pointer':'default',textDecoration:currentMarriageForLabel?.sp&&onSelectPerson?'underline':'none',textDecorationColor:'rgba(196,163,90,0.35)'}}>{currentLabel}</span>}
       {!currentLabel && <span style={{opacity:0.45,fontSize:11}}>add spouse</span>}
       {open && <div style={{position:'absolute',top:'100%',left:0,zIndex:50,marginTop:4,
         background:'#1a1a14',border:`1px solid ${BR}`,borderRadius:8,minWidth:240,boxShadow:'0 4px 20px rgba(0,0,0,0.5)',padding:8}}>
@@ -7043,7 +7040,7 @@ function MarriagePopover({node, onEditSpouse, onDelSpouse, onAddMarriage, onAddC
             <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:8}}>
               <div>
                 {label&&<span style={{fontSize:11,color:DM,fontWeight:400}}>{label}</span>}
-                <div style={{fontSize:13,color:TX,marginTop:2}}>
+                <div onClick={e=>{e.stopPropagation(); if(m.sp&&onSelectPerson){ setOpen(false); onSelectPerson(m.sp); } }} title={m.sp?'Open spouse profile':''} style={{fontSize:13,color:TX,marginTop:2,cursor:m.sp&&onSelectPerson?'pointer':'default',textDecoration:m.sp&&onSelectPerson?'underline':'none',textDecorationColor:'rgba(196,163,90,0.35)'}}>
                   {m.sp?.dn || <span style={{color:DM,fontStyle:'italic'}}>unknown partner</span>}
                 </div>
                 {m.mdate&&<div style={{fontSize:11,color:DM}}>m. {m.mdate}</div>}
@@ -7150,6 +7147,8 @@ function Detail({node,onClose,onEdit,onEditSpouse,onDelSpouse,onMove,onAddChild,
   const [personMedia,setPersonMedia]=useState([]);
   const [mediaLoaded,setMediaLoaded]=useState(false);
   const [lightbox,setLightbox]=useState(null);
+  const [mftStoryRecords,setMftStoryRecords]=useState([]);
+  const [mftStoryLoading,setMftStoryLoading]=useState(false);
   
   useEffect(()=>{
     if(node?.id){
@@ -7157,6 +7156,18 @@ function Detail({node,onClose,onEdit,onEditSpouse,onDelSpouse,onMove,onAddChild,
       loadMedia(node.id).then(m=>{setPersonMedia(m||[]);setMediaLoaded(true)}).catch(()=>setMediaLoaded(true));
     }
   },[node?.id]);
+
+  useEffect(()=>{
+    let cancelled=false;
+    setMftStoryRecords([]);
+    if(!node?.id){ setMftStoryLoading(false); return; }
+    setMftStoryLoading(true);
+    loadMftStoryRecordsForPerson(node)
+      .then(records=>{ if(!cancelled) setMftStoryRecords(records || []); })
+      .catch(e=>{ console.warn('MFT story load failed:', e); })
+      .finally(()=>{ if(!cancelled) setMftStoryLoading(false); });
+    return ()=>{ cancelled=true; };
+  },[node?.id,node?._xg]);
 
   if(!node)return null;
 
@@ -7197,6 +7208,17 @@ function Detail({node,onClose,onEdit,onEditSpouse,onDelSpouse,onMove,onAddChild,
       {node.bio&&<div style={{marginTop:12}}><div style={{fontSize:11,color:GD,textTransform:'uppercase',letterSpacing:2,marginBottom:4}}>Bio</div><div style={{fontSize:13,color:TX,lineHeight:1.6,whiteSpace:'pre-wrap'}}>{node.bio}</div></div>}
       {node.notes&&<div style={{marginTop:12}}><div style={{fontSize:11,color:GD,textTransform:'uppercase',letterSpacing:2,marginBottom:4}}>Notes</div><div style={{fontSize:13,color:TX,lineHeight:1.6,whiteSpace:'pre-wrap'}}>{node.notes}</div></div>}
       {node.stories&&<div style={{marginTop:12}}><div style={{fontSize:11,color:GD,textTransform:'uppercase',letterSpacing:2,marginBottom:4}}>Stories / Memories</div><div style={{fontSize:13,color:TX,lineHeight:1.6,whiteSpace:'pre-wrap'}}>{node.stories}</div></div>}
+      {mftStoryLoading&&<div style={{marginTop:12,fontSize:12,color:DM}}>Loading MacFamilyTree stories…</div>}
+      {mftStoryRecords.length>0&&<div style={{marginTop:12}}>
+        <div style={{fontSize:11,color:'#7eb8d0',textTransform:'uppercase',letterSpacing:2,marginBottom:4}}>MacFamilyTree Native Stories</div>
+        {mftStoryRecords.map((rec,ri)=><div key={rec.id||ri} style={{marginBottom:10,padding:10,border:`1px solid ${BR}`,borderRadius:8,background:'rgba(126,184,208,0.035)'}}>
+          <div style={{fontSize:10,color:DM,marginBottom:6}}>Story record {rec.id}</div>
+          {(rec.entries||[]).map((entry,ei)=><div key={entry.entryId||ei} style={{marginBottom:ei<(rec.entries||[]).length-1?10:0}}>
+            {entry.title&&<div style={{fontSize:13,color:GC,fontWeight:500,marginBottom:4}}>{entry.title}</div>}
+            {entry.text&&<div style={{fontSize:13,color:TX,lineHeight:1.6,whiteSpace:'pre-wrap'}}>{entry.text}</div>}
+          </div>)}
+        </div>)}
+      </div>}
       {extractGedcomNotePreview(node._xg||'')&&<div style={{marginTop:12}}><div style={{fontSize:11,color:'#7eb8d0',textTransform:'uppercase',letterSpacing:2,marginBottom:4}}>MFT Native / Passthrough Notes</div><div style={{fontSize:13,color:TX,lineHeight:1.6,whiteSpace:'pre-wrap'}}>{extractGedcomNotePreview(node._xg||'')}</div></div>}
 
       {/* ── Marriages section — loops spouses[], falls back to legacy sp for GEDCOM-only nodes ── */}
@@ -11312,6 +11334,42 @@ function App(){
     return null;
   },[]);
 
+  const hydratePersonFromMaps=useCallback((id)=>{
+    if(!id || !personMap || !personMap[id]) return null;
+    const base={...personMap[id]};
+    const spouses=[];
+    for(const [fid,fam] of Object.entries(familyMap||{})){
+      const hid=fam.husband_id||fam.husb||'';
+      const wid=fam.wife_id||fam.wife||'';
+      if(hid!==id && wid!==id) continue;
+      const spId = hid===id ? wid : hid;
+      const sp = spId && personMap[spId] ? {...personMap[spId]} : null;
+      const ch = (fam.children||[]).map(cid=>personMap[cid]?{...personMap[cid]}:null).filter(Boolean);
+      spouses.push({
+        famId:fid, sp,
+        mdate:fam.marriage_date||fam.mdate||'',
+        mplace:fam.marriage_place||fam.mplace||'',
+        divorced:!!fam.divorced,
+        divdate:fam.divorce_date||fam.divdate||'',
+        ch
+      });
+    }
+    base.spouses=spouses;
+    base.sp=spouses[0]?.sp||null;
+    base.mdate=spouses[0]?.mdate||'';
+    base.mplace=spouses[0]?.mplace||'';
+    base.ch=spouses.flatMap(s=>s.ch||[]);
+    return base;
+  },[personMap,familyMap]);
+
+  const resolvePersonForDetail=useCallback((personOrId)=>{
+    const id = typeof personOrId === 'string' ? personOrId : personOrId?.id;
+    if(!id) return personOrId || null;
+    const found=findNodeById(tree,id);
+    if(found && ((found.spouses&&found.spouses.length>0) || (found.ch&&found.ch.length>0) || found.id===tree?.id)) return found;
+    return hydratePersonFromMaps(id) || found || personOrId;
+  },[tree,findNodeById,hydratePersonFromMaps]);
+
   const getAncestorIds=useCallback((root,id)=>{
     const path=findPath(root,id)||[];
     return path.slice(0,-1).map(n=>n.id);
@@ -11854,7 +11912,7 @@ function App(){
       {activeTab==='tree'&&<>
       <div style={{maxWidth:1200,margin:'0 auto',padding:'0 16px 60px'}}>
         <TreeNode node={tree} exp={exp} onTog={toggle}
-          onSel={(node)=>setSel(findNodeById(tree,node.id)||node)}
+          onSel={(node)=>setSel(resolvePersonForDetail(node))}
           onEdit={(node)=>requireAuth(()=>openEditForNode(node))}
           onAdd={(id)=>requireAuth(()=>handleTreeAdd(id))}
           onDel={(id)=>requireAuth(()=>handleDelete(id))}
@@ -11867,7 +11925,7 @@ function App(){
           hl={hl}/>
       </div>
       {sel&&!editing&&<Detail
-          node={findNodeById(tree,sel.id)||sel} root={tree}
+          node={resolvePersonForDetail(sel)} root={tree}
           onClose={()=>setSel(null)}
           onEdit={(node)=>requireAuth(()=>openEditForNode(node))}
           onMove={(node)=>requireAuth(()=>setMovingBranch(node))}
@@ -11876,12 +11934,12 @@ function App(){
           onAddChild={(parentId,famId)=>requireAuth(()=>{setAdding(parentId);setAddingToFam(famId||null);})}
           onAddMarriage={(node)=>handleAddMarriage(node)}
           onSetPrimary={(personId,famId)=>handleSetPrimary(personId,famId)}
-          onSelectPerson={(p)=>setSel(findNodeById(tree,p.id)||p)}
+          onSelectPerson={(p)=>setSel(resolvePersonForDetail(p))}
           onViewFamily={(famId)=>setViewingFamilyId(famId)}
         />}
       {viewingFamilyId&&<FamilyDetail familyId={viewingFamilyId} familyMap={familyMap} personMap={personMap} user={user} onClose={()=>setViewingFamilyId(null)} onSaved={async()=>{await reloadTree(true);}}/>}
-      {editing&&<EditForm node={findNodeById(tree,editing.id)||editing} onSave={handleSaveEdit} onCancel={()=>setEditing(null)} isNew={false} canEditMftStories={userIsAdmin}/>}
-      {spouseEditing&&<EditForm node={spouseEditing.spouse||empty()} onSave={handleSaveSpouse} onCancel={()=>setSpouseEditing(null)} isNew={false}/>}
+      {editing&&<EditForm node={resolvePersonForDetail(editing)} onSave={handleSaveEdit} onCancel={()=>setEditing(null)} isNew={false} canEditMftStories={userIsAdmin}/>}
+      {spouseEditing&&<EditForm node={spouseEditing.spouse?resolvePersonForDetail(spouseEditing.spouse):empty()} onSave={handleSaveSpouse} onCancel={()=>setSpouseEditing(null)} isNew={false} canEditMftStories={userIsAdmin}/>}
       {adding&&<EditForm node={empty()} onSave={handleAdd} onCancel={()=>{setAdding(null);setAddingToFam(null);}} isNew={true} parentId={adding} parentName={flat.find(n=>n.id===adding)?._n}/>}
       {choosingFamFor&&(()=>{
         const node=choosingFamFor;
