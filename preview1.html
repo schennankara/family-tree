@@ -35,8 +35,8 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.7.35';
-    const BUILD_DATE = '2026-04-28';
+    const APP_VERSION = 'v4.7.36';
+    const BUILD_DATE = '2026-04-29';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
 
@@ -74,6 +74,211 @@ const cldImg = (url, transforms) => {
   if (!url || !url.includes('cloudinary.com')) return url;
   return url.replace('/upload/', `/upload/${transforms}/`);
 };
+/* ───── FTLS LINK / COPY / MANUAL WORKLIST HELPERS ───── */
+const FTLS_PUBLIC_BASE_URL = 'https://schennankara.github.io/family-tree/';
+
+function ftlsDeepLinkUrl(kind, id) {
+  const cleanId = encodeURIComponent(id || '');
+  const key = kind === 'FAM' ? 'family' : 'person';
+  return `${FTLS_PUBLIC_BASE_URL}#${key}=${cleanId}`;
+}
+
+function appendFtlsIdentityFacts(lines, kind, id) {
+  if (!id) return;
+  lines.push(`1 REFN ${id}`);
+  lines.push('2 TYPE FTLS');
+  lines.push(`1 _FTLSURL ${ftlsDeepLinkUrl(kind, id)}`);
+  lines.push(kind === 'FAM' ? '2 TYPE FTLS Family' : '2 TYPE FTLS Profile');
+}
+
+function stripManagedFtlsIdentityBlocks(raw) {
+  if (!raw) return '';
+  const lines = String(raw).replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const m = line.match(/^1\s+(REFN|_FTLSURL)(?:\s|$)/);
+    if (!m) { out.push(line); continue; }
+    const block = [line];
+    let j = i + 1;
+    while (j < lines.length && !/^1\s+/.test(lines[j]) && !/^0\s+/.test(lines[j])) { block.push(lines[j]); j++; }
+    const text = block.join('\n');
+    const isFtls = m[1] === '_FTLSURL' || /^2\s+TYPE\s+FTLS(?:\s|$)/m.test(text) || /^2\s+TYPE\s+FTLS\s+(Profile|Family)/m.test(text);
+    if (!isFtls) out.push(...block);
+    i = j - 1;
+  }
+  return out.filter(x => String(x || '').trim()).join('\n');
+}
+
+function getFtlsRefnValue(el) {
+  for (const child of (el.children || [])) {
+    if (child.tag !== 'REFN') continue;
+    const type = (child.children || []).find(c => c.tag === 'TYPE')?.value || '';
+    if (String(type).trim().toUpperCase() === 'FTLS') return (child.value || '').trim();
+  }
+  return '';
+}
+
+function safeClipboardCopy(text) {
+  const value = text == null ? '' : String(text);
+  if (navigator.clipboard && window.isSecureContext) {
+    return navigator.clipboard.writeText(value).then(() => true).catch(() => fallbackCopyText(value));
+  }
+  return Promise.resolve(fallbackCopyText(value));
+}
+
+function fallbackCopyText(text) {
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return ok;
+  } catch(e) { return false; }
+}
+
+function CopyButton({ value, label='Copy' }) {
+  const [copied, setCopied] = React.useState(false);
+  return <button onClick={(e)=>{ e.stopPropagation(); safeClipboardCopy(value || '').then(ok=>{ setCopied(!!ok); setTimeout(()=>setCopied(false),1200); }); }}
+    style={{background:'rgba(196,163,90,0.08)',border:'1px solid rgba(196,163,90,0.22)',color:copied?'#6b9e72':GC,padding:'1px 7px',borderRadius:4,cursor:'pointer',fontSize:10,marginLeft:6}}>
+    {copied ? 'Copied' : label}
+  </button>;
+}
+
+const MFT_MANUAL_FIELD_TARGETS = {
+  dn: 'MFT custom fact _DISPLAYNAME / TYPE Display Name',
+  loc: 'MFT custom fact LOCATION / TYPE Location',
+  bio: 'MFT custom fact _BIO / TYPE Bio',
+  stories: 'MFT custom fact _STORIES / TYPE Stories',
+  emp: 'MFT custom fact _EMPLOYER / TYPE Employer',
+  fb: 'MFT custom fact _FACEBOOK / TYPE Facebook',
+  ig: 'MFT custom fact _INSTAGRAM / TYPE Instagram',
+  li: 'MFT custom fact _LINKEDIN / TYPE LinkedIn',
+  pgl: 'MFT custom fact _PHOTOGALLERY / TYPE Photo Gallery Link',
+  dl: 'MFT custom fact _DOCUMENTS / TYPE Documents Link',
+  notes: 'MFT native person note',
+};
+const MFT_MANUAL_FIELD_KEYS = new Set(Object.keys(MFT_MANUAL_FIELD_TARGETS));
+
+function ftlsTimestampSlug(d = new Date()) {
+  const pad = n => String(n).padStart(2,'0');
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}`;
+}
+
+function csvEscape(value) {
+  return '"' + String(value == null ? '' : value).replace(/"/g, '""').replace(/\r\n/g, '\n').replace(/\r/g, '\n') + '"';
+}
+function csvLine(values) { return values.map(csvEscape).join(','); }
+
+function parseCsvRows(text) {
+  const rows = [];
+  let row = [], cell = '', inQuotes = false;
+  const s = String(text || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (inQuotes) {
+      if (ch === '"' && s[i+1] === '"') { cell += '"'; i++; }
+      else if (ch === '"') inQuotes = false;
+      else cell += ch;
+    } else {
+      if (ch === '"') inQuotes = true;
+      else if (ch === ',') { row.push(cell); cell = ''; }
+      else if (ch === '\n') { row.push(cell); rows.push(row); row = []; cell = ''; }
+      else cell += ch;
+    }
+  }
+  if (cell || row.length) { row.push(cell); rows.push(row); }
+  return rows.filter(r => r.some(c => String(c || '').trim()));
+}
+
+function parseWorklistCsv(text) {
+  const rows = parseCsvRows(text);
+  if (rows.length < 2) return [];
+  const header = rows[0].map(h => h.trim());
+  return rows.slice(1).map(r => {
+    const obj = {};
+    header.forEach((h,i)=>obj[h]=r[i] || '');
+    return obj;
+  });
+}
+
+function buildManualWorklistRows(diffResult, sourceName, sourceText) {
+  if (!diffResult) return [];
+  const generatedAt = new Date().toISOString();
+  const sourceHash = simpleStableHash(sourceText || sourceName || '');
+  const rows = [];
+  const pushPersonDiffs = (m, matchType) => {
+    for (const d of (m.diffs || [])) {
+      if (!MFT_MANUAL_FIELD_KEYS.has(d.key)) continue;
+      const scopeId = m.ftlsId || m.id || m.ftls?.id || '';
+      const ftlsPerson = m.ftls || {};
+      const displayName = ftlsPerson.dn || m.ext?.dn || scopeId;
+      const ftlsValue = d.ftls || '';
+      const mftValue = d.ext || '';
+      if (!String(ftlsValue).trim() && !String(mftValue).trim()) continue;
+      rows.push({
+        worklist_id: `FTLS-MFT-${ftlsTimestampSlug(new Date(generatedAt))}`,
+        generated_at: generatedAt,
+        source_gedcom_name: sourceName || '',
+        source_gedcom_hash: sourceHash,
+        ftls_version: (typeof APP_VERSION !== 'undefined' ? APP_VERSION : ''),
+        match_type: matchType || 'matched',
+        scope_type: 'person',
+        scope_id: scopeId,
+        display_name: displayName,
+        field_key: d.key,
+        field_label: d.label || d.key,
+        mft_target: MFT_MANUAL_FIELD_TARGETS[d.key] || '',
+        mft_value: mftValue,
+        ftls_value: ftlsValue,
+        status: 'open',
+        value_hash: simpleStableHash(ftlsValue),
+        admin_note: ''
+      });
+    }
+  };
+  (diffResult.matched || []).filter(m => (m.diffs || []).length).forEach(m => pushPersonDiffs(m, 'matched'));
+  (diffResult.fuzzyMatched || []).filter(m => (m.diffs || []).length).forEach(m => pushPersonDiffs(m, 'fuzzy'));
+  return rows;
+}
+
+function worklistRowsToCsv(rows) {
+  const header = ['worklist_id','generated_at','source_gedcom_name','source_gedcom_hash','ftls_version','match_type','scope_type','scope_id','display_name','field_key','field_label','mft_target','mft_value','ftls_value','status','value_hash','admin_note'];
+  return [csvLine(header), ...(rows || []).map(r => csvLine(header.map(h => r[h] || '')))].join('\n') + '\n';
+}
+
+function escapeHtml(value) {
+  return String(value == null ? '' : value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+
+function worklistRowsToHtml(rows) {
+  const generated = (rows && rows[0]?.generated_at) || new Date().toISOString();
+  const source = (rows && rows[0]?.source_gedcom_name) || '';
+  const body = (rows || []).map(r => `<tr><td>${escapeHtml(r.status||'open')}</td><td>${escapeHtml(r.display_name)}</td><td>${escapeHtml(r.field_label)}</td><td>${escapeHtml(r.mft_target)}</td><td><pre>${escapeHtml(r.mft_value)}</pre></td><td><pre>${escapeHtml(r.ftls_value)}</pre></td></tr>`).join('\n');
+  return `<!doctype html><html><head><meta charset="utf-8"><title>FTLS MFT Update Worklist</title><style>body{font-family:system-ui,-apple-system,sans-serif;background:#faf8f3;color:#222;padding:24px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:8px;vertical-align:top}th{background:#eee}pre{white-space:pre-wrap;margin:0;font-family:inherit}</style></head><body><h1>FTLS MFT Update Worklist</h1><p><b>Generated:</b> ${escapeHtml(generated)}<br><b>Source GEDCOM:</b> ${escapeHtml(source)}<br><b>FTLS version:</b> ${escapeHtml(typeof APP_VERSION !== 'undefined' ? APP_VERSION : '')}</p><table><thead><tr><th>Status</th><th>Person/Family</th><th>Field</th><th>MFT target</th><th>MFT value</th><th>FTLS value</th></tr></thead><tbody>${body}</tbody></table></body></html>`;
+}
+
+function downloadManualWorklist(rows, baseName = 'FTLS_MFT_Update_Worklist') {
+  const stamp = ftlsTimestampSlug();
+  const safeBase = `${baseName}_${stamp}`;
+  const csv = worklistRowsToCsv(rows || []);
+  const html = worklistRowsToHtml(rows || []);
+  if (window.JSZip) {
+    const zip = new JSZip();
+    zip.file(`${safeBase}.csv`, csv);
+    zip.file(`${safeBase}.html`, html);
+    zip.generateAsync({type:'blob'}).then(blob => downloadBlobAsFile(blob, `${safeBase}.zip`));
+  } else {
+    downloadBlobAsFile(new Blob([csv], {type:'text/csv;charset=utf-8'}), `${safeBase}.csv`);
+    downloadBlobAsFile(new Blob([html], {type:'text/html;charset=utf-8'}), `${safeBase}.html`);
+  }
+}
+
 
 /* ───── GEDCOM SHARED CONSTANTS ─────
    Previously duplicated at lines 1201, 2640 (PERSON_SPECIFIC_META) and
@@ -93,11 +298,11 @@ const KNOWN_INDI_L1 = new Set([
   'NAME', 'SEX', 'BIRT', 'DEAT', 'ADDR', 'RESI', 'LOCATION', 'EMAI', 'EMAIL', 'PHON',
   '_FACEBOOK', '_INSTAGRAM', '_LINKEDIN', 'WWW', '_PHOTO', 'OCCU', '_EMPLOYER',
   '_PHOTOGALLERY', '_DOCUMENTS', '_BIO', '_STORIES', '_DISPLAYNAME',
-  'NOTE', 'FAMC', 'FAMS'
+  'NOTE', 'REFN', '_FTLSURL', 'FAMC', 'FAMS'
 ]);
 
 // L1 tags that FTLS manages on FAM records. Same principle as above.
-const KNOWN_FAM_L1 = new Set(['HUSB', 'WIFE', 'CHIL', 'MARR', 'DIV']);
+const KNOWN_FAM_L1 = new Set(['HUSB', 'WIFE', 'CHIL', 'MARR', 'DIV', 'REFN', '_FTLSURL']);
 
 /* ───── CANONICAL GEDCOM TOKENIZER ─────
    The ONLY tokenizer in this app. Previously duplicated inline at three
@@ -2557,6 +2762,10 @@ function stripInternalEditFields(person) {
 function personToGedcomLines(person, context = {}) {
   const L = [`0 ${person.id} INDI`];
   const standalone = []; // standalone NOTE records to emit at top level
+  const exportMode = context.exportMode || 'hydrate';
+  const isUpdateMode = exportMode === 'update';
+  appendFtlsIdentityFacts(L, 'INDI', person.id);
+  if (person._xg) person._xg = stripManagedFtlsIdentityBlocks(person._xg);
 
   // Primary NAME — match MacFamilyTree format:
   //   1 NAME {bo}. {fn} {mn} /{ln}/
@@ -2639,7 +2848,9 @@ function personToGedcomLines(person, context = {}) {
   };
 
   // Person's own notes — detect if it's a pointer to existing NOTE record or actual text
-  if (person.notes) {
+  // Update mode intentionally skips narrative notes/custom facts because MFT merge
+  // tends to append or keep first-written narrative values.
+  if (!isUpdateMode && person.notes) {
     if (/^@[^@]+@$/.test(person.notes.trim())) {
       // It's a pointer to an existing standalone NOTE record in gedcom_meta
       L.push(`1 NOTE ${person.notes.trim()}`);
@@ -2653,6 +2864,7 @@ function personToGedcomLines(person, context = {}) {
   }
   // FTLS-only fields export as MFT custom facts using the existing FTLS tags
   // where they already existed. Do not use NOTE for bio/stories/link fields.
+  if (!isUpdateMode) {
   appendMftCustomFact(L, 'LOCATION', 'Location', person.loc);
   appendMftCustomFact(L, '_DISPLAYNAME', 'Display Name', person.dn);
   appendMftCustomFact(L, '_BIO', 'Bio', dedupeNoteTextLines(person.bio || ''));
@@ -2664,6 +2876,7 @@ function personToGedcomLines(person, context = {}) {
   appendMftCustomFact(L, '_EMPLOYER', 'Employer', person.emp);
   appendMftCustomFact(L, '_PHOTOGALLERY', 'Photo Gallery Link', person.pgl);
   appendMftCustomFact(L, '_DOCUMENTS', 'Documents Link', person.dl);
+  }
   if (person._xg) {
     person._xg = stripGedcomLevel1Block(person._xg, [
       'LOCATION','_DISPLAYNAME','_BIO','_STORIES','_FACEBOOK','_INSTAGRAM','_LINKEDIN',
@@ -2674,10 +2887,9 @@ function personToGedcomLines(person, context = {}) {
   // The old FTLS Profile NOTE is no longer emitted. Those fields now export
   // as MFT custom facts above, keeping MFT's Notes section for real notes.
 
-  // Machine-readable reconciliation snapshot. This intentionally includes even
-  // blank FTLS-managed fields so a later import can distinguish "empty in FTLS"
-  // from "not exported by FTLS" during two-way reconciliation.
-  addStandaloneNote(buildFtlsReconciliationSnapshot(person, context), 'FTLS');
+  // Machine-readable reconciliation snapshot. Hydrate mode keeps the existing
+  // worksheet behavior; update mode skips it to avoid MFT note pollution.
+  if (!isUpdateMode) addStandaloneNote(buildFtlsReconciliationSnapshot(person, context), 'FTLS');
 
   return { indi: L, standalone };
 }
@@ -2741,6 +2953,7 @@ function exportTreeToGedcom(tree, personMap, familyMap, mediaBundle = null) {
     if (exportedFamilies.has(fam.id)) return null;
     exportedFamilies.add(fam.id);
     const L = [`0 ${fam.id} FAM`];
+    appendFtlsIdentityFacts(L, 'FAM', fam.id);
     if (fam.husband_id) L.push(`1 HUSB ${fam.husband_id}`);
     if (fam.wife_id) L.push(`1 WIFE ${fam.wife_id}`);
     buildFamilyMarriageLines(fam).forEach(line => L.push(line));
@@ -2749,7 +2962,7 @@ function exportTreeToGedcom(tree, personMap, familyMap, mediaBundle = null) {
     // Preserved extra GEDCOM lines for family. MARR/DIV are FTLS-managed now,
     // so strip stale preserved copies before appending passthrough data.
     appendFtlsMediaRefs(L, 'FAM', fam.id, mediaBundle, fam._extra_gedcom || '');
-    const xg = stripGedcomLevel1Block(fam._extra_gedcom || '', ['MARR', 'DIV']);
+    const xg = stripManagedFtlsIdentityBlocks(stripGedcomLevel1Block(fam._extra_gedcom || '', ['MARR', 'DIV']));
     if (xg) { xg.split('\n').forEach(xl => { if (xl.trim()) L.push(xl); }); }
     addStandaloneFamilyReconciliationNote(L, standaloneNotes, fam, personMap || {});
     return L;
@@ -3448,8 +3661,20 @@ function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap)
     return hMatch && wMatch;
   }
 
+  // Pass 0: Standard GEDCOM REFN / TYPE FTLS cross-reference.
+  // This lets MFT change its local xrefs while still carrying the stable FTLS ID.
+  for (const [id, ext] of Object.entries(extPeople)) {
+    const ftlsRef = ext._ftlsRefn || '';
+    if (!ftlsRef || !ftlsPersonMap[ftlsRef] || ftlsMatched.has(ftlsRef) || extMatched.has(id)) continue;
+    const diffs = diffPerson(ftlsPersonMap[ftlsRef], ext);
+    results.matched.push({ id: ftlsRef, extId: id, ftls: ftlsPersonMap[ftlsRef], ext, diffs, matchedBy: 'REFN/FTLS' });
+    ftlsMatched.add(ftlsRef);
+    extMatched.add(id);
+  }
+
   // Pass 1: Exact ID match
   for (const [id, ext] of Object.entries(extPeople)) {
+    if (extMatched.has(id)) continue;
     if (ftlsPersonMap[id]) {
       const diffs = diffPerson(ftlsPersonMap[id], ext);
       // Compare parent family (FAMC) — checks ID AND spouse names (handles cross-system ID mismatches)
@@ -4458,7 +4683,8 @@ async function restorePrunedMeta(archiveId) {
 }
 
 
-function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, allPersonMap, forcedFamilyIds, mediaBundle = null) {
+function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, allPersonMap, forcedFamilyIds, mediaBundle = null, options = {}) {
+  const exportMode = options.exportMode || 'hydrate';
   const extIds = extFamilyIds || new Set();
   const forcedFamIds = forcedFamilyIds instanceof Set ? forcedFamilyIds : new Set(forcedFamilyIds || []);
   const extFams = extFamiliesMap || {};
@@ -4508,7 +4734,7 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, 
   for (const [pid, person] of Object.entries(pMap)) {
     if (exportedPersons.has(pid)) continue;
     exportedPersons.add(pid);
-    const { indi: L, standalone } = personToGedcomLines(person, { fams: famsLookup[pid] || [], famc: famcLookup[pid] || [] });
+    const { indi: L, standalone } = personToGedcomLines(person, { fams: famsLookup[pid] || [], famc: famcLookup[pid] || [], exportMode });
     if (standalone.length > 0) diffStandaloneNotes.push(...standalone);
     // FAMS/FAMC from FULL family map
     (famsLookup[pid] || []).forEach(ref => L.push(`1 FAMS ${ref}`));
@@ -4553,6 +4779,7 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, 
     }
     
     const F = [`0 ${fid} FAM`];
+    appendFtlsIdentityFacts(F, 'FAM', fid);
     if (hid) F.push(`1 HUSB ${hid}`);
     if (wid) F.push(`1 WIFE ${wid}`);
     const md = fam.marriage_date || fam.mdate || '';
@@ -4562,7 +4789,7 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, 
     buildFamilyDivorceLines(fam).forEach(line => F.push(line));
     kids.forEach(c => F.push(`1 CHIL ${c}`));
     appendFtlsMediaRefs(F, 'FAM', fid, mediaBundle, fam._extra_gedcom || '');
-    const famXg = stripGedcomLevel1Block(fam._extra_gedcom || '', ['MARR', 'DIV']);
+    const famXg = stripManagedFtlsIdentityBlocks(stripGedcomLevel1Block(fam._extra_gedcom || '', ['MARR', 'DIV']));
     if (famXg) famXg.split('\n').forEach(xl => { if (xl.trim()) F.push(xl); });
     addStandaloneFamilyReconciliationNote(F, diffStandaloneNotes, { ...fam, id: fid, husband_id: hid, wife_id: wid, marriage_date: md, marriage_place: mp, divorce_date: dd }, allPersonMap || {});
     lines.push(...F);
@@ -4597,7 +4824,7 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, 
     const anchor = anchorMap[refId];
     if (anchor) {
       // Full INDI from personMap — gives importing app enough to match
-      const { indi: L, standalone } = personToGedcomLines(anchor, { fams: famsLookup[refId] || [], famc: famcLookup[refId] || [] });
+      const { indi: L, standalone } = personToGedcomLines(anchor, { fams: famsLookup[refId] || [], famc: famcLookup[refId] || [], exportMode });
       if (standalone.length > 0) diffStandaloneNotes.push(...standalone);
       (famsLookup[refId] || []).forEach(ref => L.push(`1 FAMS ${ref}`));
       (famcLookup[refId] || []).forEach(ref => L.push(`1 FAMC ${ref}`));
@@ -4608,7 +4835,7 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, 
       lines.push(...L);
     } else {
       // Bare minimum stub so the FAM reference doesn't dangle
-      lines.push(`0 ${refId} INDI`, `1 NAME (Unknown) //`);
+      lines.push(`0 ${refId} INDI`); appendFtlsIdentityFacts(lines, 'INDI', refId); lines.push(`1 NAME (Unknown) //`);
     }
   }
 
@@ -4643,7 +4870,8 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, 
 }
 
 // Merge FTLS additions into the original external GEDCOM text
-function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamilyMap, extFamilyIds, forcedFamilyIds, mediaBundle = null) {
+function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamilyMap, extFamilyIds, forcedFamilyIds, mediaBundle = null, options = {}) {
+  const exportMode = options.exportMode || 'hydrate';
   const forcedFamIds = forcedFamilyIds instanceof Set ? forcedFamilyIds : new Set(forcedFamilyIds || []);
   const originalElements = tokenizeGedcom(originalText);
   const originalNoteMap = buildGedcomNoteMap(originalElements);
@@ -4681,7 +4909,7 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
       if ((fam.husband_id||fam.husb) === p.id || (fam.wife_id||fam.wife) === p.id) pFams.push(fid);
       if ((fam.children||[]).includes(p.id)) pFamc.push(fid);
     }
-    const { indi: L, standalone } = personToGedcomLines(p, { fams: pFams, famc: pFamc });
+    const { indi: L, standalone } = personToGedcomLines(p, { fams: pFams, famc: pFamc, exportMode });
     if (standalone.length > 0) mergedStandaloneNotes.push(...standalone);
     // Add FAMS/FAMC refs
     pFams.forEach(fid => L.push(`1 FAMS ${fid}`));
@@ -4701,6 +4929,7 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
     const kids = fam.children || [];
     if (forcedFamIds.has(fid) || newPIds.has(hid) || newPIds.has(wid) || kids.some(k => newPIds.has(k))) {
       const F = [`0 ${fid} FAM`];
+      appendFtlsIdentityFacts(F, 'FAM', fid);
       if (hid) F.push(`1 HUSB ${hid}`);
       if (wid) F.push(`1 WIFE ${wid}`);
       const md = fam.marriage_date || fam.mdate || '';
@@ -4710,7 +4939,7 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
       buildFamilyDivorceLines(fam).forEach(line => F.push(line));
       kids.forEach(c => F.push(`1 CHIL ${c}`));
       appendFtlsMediaRefs(F, 'FAM', fid, mediaBundle, fam._extra_gedcom || '');
-      const famXg = stripGedcomLevel1Block(fam._extra_gedcom || '', ['MARR', 'DIV']);
+      const famXg = stripManagedFtlsIdentityBlocks(stripGedcomLevel1Block(fam._extra_gedcom || '', ['MARR', 'DIV']));
       if (famXg) famXg.split('\n').forEach(xl => { if (xl.trim()) F.push(xl); });
       addStandaloneFamilyReconciliationNote(F, mergedStandaloneNotes, { ...fam, id: fid, husband_id: hid, wife_id: wid, marriage_date: md, marriage_place: mp, divorce_date: dd }, {});
       newLines.push(...F);
@@ -4761,9 +4990,11 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
     while (j < before.length && !before[j].trim().startsWith('0 ')) j++;
     const header = before[i];
     let body = before.slice(i + 1, j);
+    body = stripManagedFtlsIdentityBlocks(body.join('\n')).split('\n').filter(x => x.trim());
+    appendFtlsIdentityFacts(body, 'FAM', m[1]);
     body = appendOrReplaceFamilyMarriageBlock(body, fam);
     appendFtlsMediaRefs(body, 'FAM', m[1], mediaBundle, fam._extra_gedcom || '');
-    const bodyXg = stripGedcomLevel1Block(fam._extra_gedcom || '', ['MARR', 'DIV']);
+    const bodyXg = stripManagedFtlsIdentityBlocks(stripGedcomLevel1Block(fam._extra_gedcom || '', ['MARR', 'DIV']));
     if (bodyXg) bodyXg.split('\n').forEach(xl => { if (xl.trim() && !body.includes(xl)) body.push(xl); });
     // Existing generated FTLS notes were already stripped at the whole-file level.
     addStandaloneFamilyReconciliationNote(body, mergedStandaloneNotes, { ...fam, id: m[1] }, exportPersonNameMapForFamilies);
@@ -4785,7 +5016,7 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
   }
   
   function buildReplacementIndi(p) {
-    const { indi: L, standalone } = personToGedcomLines(p, { fams: famsLookup2[p.id] || [], famc: famcLookup2[p.id] || [] });
+    const { indi: L, standalone } = personToGedcomLines(p, { fams: famsLookup2[p.id] || [], famc: famcLookup2[p.id] || [], exportMode });
     if (standalone.length > 0) mergedStandaloneNotes.push(...standalone);
     // Add FAMS/FAMC refs from the family map
     (famsLookup2[p.id] || []).forEach(ref => L.push(`1 FAMS ${ref}`));
@@ -5089,8 +5320,9 @@ function parseIndi(el, noteMap = {}, ftlsMediaObjeIds = new Set()) {
 
   notes = dedupeNoteTextLines(upsertNameSuffixIntoNotes(notes, sx));
 
+  const ftlsRefn = getFtlsRefnValue(el);
   const parsedPerson = {
-    id, fn, mn, ln, dn, nk, md, tp, sx, g,
+    id, _ftlsRefn: ftlsRefn, fn, mn, ln, dn, nk, md, tp, sx, g,
     dob, dod, burd, dec: hasDeat || !!dod, bo: parsedBirthOrder,
     em, ph, a1, a2, ci, st, zp, co,
     fb, ig, li, ws, pp, bio, loc,
@@ -5113,6 +5345,7 @@ function parseFam(el, noteMap = {}, ftlsMediaObjeIds = new Set()) {
   const divdate = getNestedValue(el, 'DIV', 'DATE') || (divEl ? divEl.value : '');
   const parsedFamily = {
     id: el.pointer,
+    _ftlsRefn: getFtlsRefnValue(el),
     husb: getChildValue(el, 'HUSB'),
     wife: getChildValue(el, 'WIFE'),
     children: [...new Set(el.children.filter(c => c.tag === 'CHIL').map(c => c.value))],
@@ -7010,10 +7243,10 @@ function EditForm({node,onSave,onCancel,isNew,parentId,parentName,canEditMftStor
         {!isNew&&((f.notes||'').trim()||(f.bio||'').trim()||(f.stories||'').trim()||extractGedcomNotePreview(f._xg||'')||mftStoryLoading||mftStoryRecords.length>0||mftStoryMissingRefs(f).length>0)&&<div style={{marginBottom:16,padding:12,background:'rgba(126,184,208,0.035)',border:`1px solid rgba(126,184,208,0.16)`,borderRadius:8}}>
           <div style={{fontSize:11,color:'#7eb8d0',textTransform:'uppercase',letterSpacing:2,marginBottom:8}}>Read-only narrative reference</div>
           <div style={{fontSize:11,color:DM,lineHeight:1.5,marginBottom:8}}>Reference view only. Edit the actual fields below, or move content into MacFamilyTree-native notes/stories during reconciliation.</div>
-          {f.notes&&<div style={{marginTop:8}}><div style={{fontSize:10,color:GD,textTransform:'uppercase',letterSpacing:1.5,marginBottom:3}}>FTLS Notes</div><textarea readOnly value={f.notes||''} rows={3} style={{...inp,resize:'vertical',opacity:0.86}}/></div>}
-          {f.bio&&<div style={{marginTop:8}}><div style={{fontSize:10,color:GD,textTransform:'uppercase',letterSpacing:1.5,marginBottom:3}}>FTLS Bio</div><textarea readOnly value={f.bio||''} rows={3} style={{...inp,resize:'vertical',opacity:0.86}}/></div>}
-          {f.stories&&<div style={{marginTop:8}}><div style={{fontSize:10,color:GD,textTransform:'uppercase',letterSpacing:1.5,marginBottom:3}}>FTLS Stories / Memories</div><textarea readOnly value={f.stories||''} rows={3} style={{...inp,resize:'vertical',opacity:0.86}}/></div>}
-          {extractGedcomNotePreview(f._xg||'')&&<div style={{marginTop:8}}><div style={{fontSize:10,color:'#7eb8d0',textTransform:'uppercase',letterSpacing:1.5,marginBottom:3}}>MFT native/passthrough notes</div><textarea readOnly value={extractGedcomNotePreview(f._xg||'')} rows={3} style={{...inp,resize:'vertical',opacity:0.86}}/></div>}
+          {f.notes&&<div style={{marginTop:8}}><div style={{fontSize:10,color:GD,textTransform:'uppercase',letterSpacing:1.5,marginBottom:3}}>FTLS Notes <CopyButton value={f.notes||''}/></div><textarea readOnly value={f.notes||''} rows={3} style={{...inp,resize:'vertical',opacity:0.86}}/></div>}
+          {f.bio&&<div style={{marginTop:8}}><div style={{fontSize:10,color:GD,textTransform:'uppercase',letterSpacing:1.5,marginBottom:3}}>FTLS Bio <CopyButton value={f.bio||''}/></div><textarea readOnly value={f.bio||''} rows={3} style={{...inp,resize:'vertical',opacity:0.86}}/></div>}
+          {f.stories&&<div style={{marginTop:8}}><div style={{fontSize:10,color:GD,textTransform:'uppercase',letterSpacing:1.5,marginBottom:3}}>FTLS Stories / Memories <CopyButton value={f.stories||''}/></div><textarea readOnly value={f.stories||''} rows={3} style={{...inp,resize:'vertical',opacity:0.86}}/></div>}
+          {extractGedcomNotePreview(f._xg||'')&&<div style={{marginTop:8}}><div style={{fontSize:10,color:'#7eb8d0',textTransform:'uppercase',letterSpacing:1.5,marginBottom:3}}>MFT native/passthrough notes <CopyButton value={extractGedcomNotePreview(f._xg||'')}/></div><textarea readOnly value={extractGedcomNotePreview(f._xg||'')} rows={3} style={{...inp,resize:'vertical',opacity:0.86}}/></div>}
         </div>}
 
         {SECTIONS.map(sec=>(
@@ -7287,7 +7520,7 @@ function Detail({node,onClose,onEdit,onEditSpouse,onDelSpouse,onMove,onAddChild,
 
   if(!node)return null;
 
-  const R=({l,v})=>v?<div style={{display:'flex',justifyContent:'space-between',padding:'3px 0',fontSize:13}}><span style={{color:DM}}>{l}</span><span style={{color:TX}}>{v}</span></div>:null;
+  const R=({l,v})=>v?<div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8,padding:'3px 0',fontSize:13}}><span style={{color:DM}}>{l}<CopyButton value={v}/></span><span style={{color:TX,textAlign:'right'}}>{v}</span></div>:null;
   const personAddress = [node.a1, node.a2, node.ci, node.st, node.zp, node.co].filter(Boolean).join(', ');
   const lineage=(findPath(root,node.id)||[]).map(n=>n.dn);
   const profileUrl = node.pp ? cldImg(node.pp,'c_fill,w_120,h_120,g_face') : null;
@@ -7321,9 +7554,9 @@ function Detail({node,onClose,onEdit,onEditSpouse,onDelSpouse,onMove,onAddChild,
       <R l="Born" v={node.dob}/><R l="Birthplace" v={node.loc}/><R l="Died" v={node.dod}/>
       <R l="Profession" v={node.prof}/><R l="Employer" v={node.emp}/><R l="Email" v={node.em}/><R l="Phone" v={node.ph}/>
       <R l="Residence" v={personAddress}/>
-      {node.bio&&<div style={{marginTop:12}}><div style={{fontSize:11,color:GD,textTransform:'uppercase',letterSpacing:2,marginBottom:4}}>Bio</div><div style={{fontSize:13,color:TX,lineHeight:1.6,whiteSpace:'pre-wrap'}}>{node.bio}</div></div>}
-      {node.notes&&<div style={{marginTop:12}}><div style={{fontSize:11,color:GD,textTransform:'uppercase',letterSpacing:2,marginBottom:4}}>Notes</div><div style={{fontSize:13,color:TX,lineHeight:1.6,whiteSpace:'pre-wrap'}}>{node.notes}</div></div>}
-      {node.stories&&<div style={{marginTop:12}}><div style={{fontSize:11,color:GD,textTransform:'uppercase',letterSpacing:2,marginBottom:4}}>Stories / Memories</div><div style={{fontSize:13,color:TX,lineHeight:1.6,whiteSpace:'pre-wrap'}}>{node.stories}</div></div>}
+      {node.bio&&<div style={{marginTop:12}}><div style={{fontSize:11,color:GD,textTransform:'uppercase',letterSpacing:2,marginBottom:4}}>Bio <CopyButton value={node.bio}/></div><div style={{fontSize:13,color:TX,lineHeight:1.6,whiteSpace:'pre-wrap'}}>{node.bio}</div></div>}
+      {node.notes&&<div style={{marginTop:12}}><div style={{fontSize:11,color:GD,textTransform:'uppercase',letterSpacing:2,marginBottom:4}}>Notes <CopyButton value={node.notes}/></div><div style={{fontSize:13,color:TX,lineHeight:1.6,whiteSpace:'pre-wrap'}}>{node.notes}</div></div>}
+      {node.stories&&<div style={{marginTop:12}}><div style={{fontSize:11,color:GD,textTransform:'uppercase',letterSpacing:2,marginBottom:4}}>Stories / Memories <CopyButton value={node.stories}/></div><div style={{fontSize:13,color:TX,lineHeight:1.6,whiteSpace:'pre-wrap'}}>{node.stories}</div></div>}
       {mftStoryLoading&&<div style={{marginTop:12,fontSize:12,color:DM}}>Loading MacFamilyTree stories…</div>}
       {!mftStoryLoading&&mftStoryMissingRefs(node).length>0&&<div style={{marginTop:12,fontSize:12,color:'#d0a07e',lineHeight:1.5}}>MFT story reference found ({mftStoryMissingRefs(node).join(', ')}), but the top-level _STO story record is not loaded in FTLS. Run Backfill from the MFT GEDCOM so the story text can display.</div>}
       {mftStoryRecords.length>0&&<div style={{marginTop:12}}>
@@ -7336,7 +7569,7 @@ function Detail({node,onClose,onEdit,onEditSpouse,onDelSpouse,onMove,onAddChild,
           </div>)}
         </div>)}
       </div>}
-      {extractGedcomNotePreview(node._xg||'')&&<div style={{marginTop:12}}><div style={{fontSize:11,color:'#7eb8d0',textTransform:'uppercase',letterSpacing:2,marginBottom:4}}>MFT Native / Passthrough Notes</div><div style={{fontSize:13,color:TX,lineHeight:1.6,whiteSpace:'pre-wrap'}}>{extractGedcomNotePreview(node._xg||'')}</div></div>}
+      {extractGedcomNotePreview(node._xg||'')&&<div style={{marginTop:12}}><div style={{fontSize:11,color:'#7eb8d0',textTransform:'uppercase',letterSpacing:2,marginBottom:4}}>MFT Native / Passthrough Notes <CopyButton value={extractGedcomNotePreview(node._xg||'')}/></div><div style={{fontSize:13,color:TX,lineHeight:1.6,whiteSpace:'pre-wrap'}}>{extractGedcomNotePreview(node._xg||'')}</div></div>}
 
       {/* ── Marriages section — loops spouses[], falls back to legacy sp for GEDCOM-only nodes ── */}
       {(()=>{
@@ -7499,7 +7732,7 @@ function FamilyDetail({familyId, familyMap, personMap, onClose, onSaved, user}) 
   const kids = (fam.children || []).map(id => personMap?.[id]).filter(Boolean);
   const familyNotes = extractGedcomNotePreview(fam._extra_gedcom || fam._xg || '');
   const mediaRefs = ((fam._extra_gedcom || fam._xg || '').match(/^1\s+OBJE\s+@[^@]+@(?:\n[2-9]\s+.*)*/gm) || []).join('\n\n');
-  const R=({l,v})=>v?<div style={{display:'flex',justifyContent:'space-between',padding:'3px 0',fontSize:13}}><span style={{color:DM}}>{l}</span><span style={{color:TX,textAlign:'right',marginLeft:12}}>{v}</span></div>:null;
+  const R=({l,v})=>v?<div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8,padding:'3px 0',fontSize:13}}><span style={{color:DM}}>{l}<CopyButton value={v}/></span><span style={{color:TX,textAlign:'right',marginLeft:12}}>{v}</span></div>:null;
   return(<>
     <div onClick={onClose} style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.55)',zIndex:190}}/>
     <div style={{position:'fixed',left:'50%',top:'50%',transform:'translate(-50%,-50%)',width:Math.min(560,window.innerWidth-32),maxHeight:'88vh',overflowY:'auto',background:CD,border:`1px solid ${BR}`,borderRadius:12,zIndex:191,padding:22,boxShadow:'0 12px 48px rgba(0,0,0,0.55)'}}>
@@ -7519,7 +7752,7 @@ function FamilyDetail({familyId, familyMap, personMap, onClose, onSaved, user}) 
         {kids.length>0&&<div style={{fontSize:12,color:DM,marginTop:8}}>Children: <span style={{color:TX}}>{kids.map(k=>k.dn||k.id).join(', ')}</span></div>}
       </div>
       <div style={{marginBottom:12}}>
-        <div style={{fontSize:11,color:GD,textTransform:'uppercase',letterSpacing:2,marginBottom:5}}>MFT / family notes passthrough</div>
+        <div style={{fontSize:11,color:GD,textTransform:'uppercase',letterSpacing:2,marginBottom:5}}>MFT / family notes passthrough {familyNotes&&<CopyButton value={familyNotes}/>}</div>
         {familyNotes?<textarea readOnly value={familyNotes} rows={5} style={{width:'100%',background:'#1a1a14',border:`1px solid ${BR}`,color:TX,padding:'8px 10px',borderRadius:6,fontSize:12,resize:'vertical',fontFamily:'inherit'}}/>:<div style={{fontSize:12,color:DM}}>No family-level notes preserved yet.</div>}
       </div>
       {mediaRefs&&<div style={{marginBottom:12}}>
@@ -7860,6 +8093,8 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
   const [merging, setMerging] = useState(false);
   const [mergeLog, setMergeLog] = useState([]);
   const [expandedDiffs, setExpandedDiffs] = useState(new Set());
+  const [exportMode, setExportMode] = useState('update'); // update = structural/media/link only; hydrate = full custom facts + worksheet
+  const [worklistRows, setWorklistRows] = useState([]);
 
   // Direction state: 'import' | 'export' | null
   // extDir: { personId: 'import'|null } for ext-only persons
@@ -7926,7 +8161,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
           setTab('summary');
           // Reset all directions
           setExtDir({}); setFtlsDir({}); setChangedDir({}); setFieldDir({}); setExtFamDir({}); setFamilyFactDir({});
-          setExpandedDiffs(new Set()); setMergeLog([]);
+          setExpandedDiffs(new Set()); setMergeLog([]); setWorklistRows([]);
           setFuzzyResolved({}); setFuzzyFamResolved({});
           setFollowOnMatches([]); setFollowOnResolved({});
         } catch (err) { alert('Error parsing GEDCOM: ' + err.message); }
@@ -8591,7 +8826,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
     let mediaRecords = [];
     try { mediaRecords = await sbFetch('media?select=*'); } catch(e) { console.warn('Could not load media for GEDCOM export:', e); }
     const mediaBundle = buildFtlsMediaGedcomBundle(mediaRecords || [], personMap || {}, familyMap || {});
-    const content = exportDiffGedcom(persons, familyMap, extFamilyIds, extFamiliesMap, personMap, forcedFamilyIds, mediaBundle);
+    const content = exportDiffGedcom(persons, familyMap, extFamilyIds, extFamiliesMap, personMap, forcedFamilyIds, mediaBundle, { exportMode });
     const zipResult = await downloadGedcomZip(content, mediaBundle, 'FTLS_Export_For_Merge');
     setMergeLog(prev => [...prev, '⬆ Exported ' + persons.length + ' persons and ' + forcedFamilyIds.size + ' family fact record(s) as ZIP (' + (zipResult.images || 0) + ' image file(s))']);
   };
@@ -8605,7 +8840,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
     const forcedFamilyIds = new Set(basket.exports.filter(e => e.type === 'family_facts').map(e => e.familyId));
     if (persons.length === 0 && forcedFamilyIds.size === 0) { alert('No items to export.'); return; }
     try { window.gedcomMetaRecords = await sbFetch('gedcom_meta?select=*'); } catch(e) { window.gedcomMetaRecords = []; }
-    const content = exportDiffGedcom(persons, familyMap, extFamilyIds, extFamiliesMap, personMap, forcedFamilyIds, null);
+    const content = exportDiffGedcom(persons, familyMap, extFamilyIds, extFamiliesMap, personMap, forcedFamilyIds, null, { exportMode });
     downloadGedcomOnly(content, 'FTLS_Export_For_Merge');
     setMergeLog(prev => [...prev, '⬆ Exported ' + persons.length + ' persons and ' + forcedFamilyIds.size + ' family fact record(s) as GEDCOM only (no image ZIP)']);
   };
@@ -8626,7 +8861,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
     let mediaRecords = [];
     try { mediaRecords = await sbFetch('media?select=*'); } catch(e) { console.warn('Could not load media for GEDCOM merge export:', e); }
     const mediaBundle = buildFtlsMediaGedcomBundle(mediaRecords || [], personMap || {}, familyMap || {});
-    const content = buildMergedGedcom(extGedcomText, persons, expFields, familyMap, extFamilyIds, forcedFamilyIds, mediaBundle);
+    const content = buildMergedGedcom(extGedcomText, persons, expFields, familyMap, extFamilyIds, forcedFamilyIds, mediaBundle, { exportMode });
     const zipResult = await downloadGedcomZip(content, mediaBundle, fileName.replace(/\.ged$/i, '') + '_merged');
     setMergeLog(prev => [...prev, '⬆ Merged into ' + fileName + ' as ZIP (' + persons.length + ' persons, ' + expFields.length + ' field updates, ' + forcedFamilyIds.size + ' family fact record(s), ' + (zipResult.images || 0) + ' image file(s))']);
   };
@@ -8643,10 +8878,44 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
       personId: e.person.id,
       fields: e.fields.map(f => ({ key: f.key, value: f.ftls }))
     }));
-    const content = buildMergedGedcom(extGedcomText, persons, expFields, familyMap, extFamilyIds, forcedFamilyIds, null);
+    const content = buildMergedGedcom(extGedcomText, persons, expFields, familyMap, extFamilyIds, forcedFamilyIds, null, { exportMode });
     downloadGedcomOnly(content, fileName.replace(/\.ged$/i, '') + '_merged');
     setMergeLog(prev => [...prev, '⬆ Merged into ' + fileName + ' as GEDCOM only (' + persons.length + ' persons, ' + expFields.length + ' field updates, ' + forcedFamilyIds.size + ' family fact record(s))']);
   };
+
+
+  const generateManualWorklist = () => {
+    const rows = buildManualWorklistRows(diffResult, fileName, extGedcomText);
+    setWorklistRows(rows);
+    setTab('worklist');
+    setMergeLog(prev => [...prev, `📋 Generated MFT manual update worklist (${rows.length} item${rows.length===1?'':'s'})`]);
+  };
+
+  const loadManualWorklistCsv = () => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.csv,text/csv';
+    input.onchange = (e) => {
+      const file = e.target.files && e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (evt) => {
+        try {
+          const rows = parseWorklistCsv(evt.target.result || '');
+          setWorklistRows(rows);
+          setTab('worklist');
+          setMergeLog(prev => [...prev, `📋 Loaded manual worklist CSV: ${file.name} (${rows.length} item${rows.length===1?'':'s'})`]);
+        } catch(err) { alert('Could not load worklist CSV: ' + (err?.message || err)); }
+      };
+      reader.readAsText(file, 'utf-8');
+    };
+    input.click();
+  };
+
+  const updateWorklistRowStatus = (idx, status) => {
+    setWorklistRows(prev => prev.map((r,i)=>i===idx ? { ...r, status } : r));
+  };
+
 
   const S = diffResult?.stats;
   const tabSt = (t) => ({ fontSize:12, padding:'6px 12px', cursor:'pointer', borderRadius:'6px 6px 0 0', background:tab===t?'rgba(196,163,90,0.15)':'transparent', color:tab===t?GC:DM, border:tab===t?'1px solid '+GD:'1px solid transparent', borderBottom:'none', whiteSpace:'nowrap' });
@@ -8698,6 +8967,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
               {S.extOnly>0 && <span style={tabSt('ext_only')} onClick={()=>setTab('ext_only')}>External Only ({S.extOnly})</span>}
               {S.ftlsOnly>0 && <span style={tabSt('ftls_only')} onClick={()=>setTab('ftls_only')}>FTLS Only ({S.ftlsOnly})</span>}
               {(diffResult.fuzzyMatched.length>0 || (diffResult.duplicateExactMatches||[]).length>0 || (diffResult.fuzzyMatchedFamilies||[]).length>0) && <span style={tabSt('fuzzy')} onClick={()=>setTab('fuzzy')}>Fuzzy ({diffResult.fuzzyMatched.length + (diffResult.duplicateExactMatches||[]).length + (diffResult.fuzzyMatchedFamilies||[]).length})</span>}
+              <span style={tabSt('worklist')} onClick={()=>setTab('worklist')}>📋 MFT Worklist {worklistRows.length>0 && <span style={badge('rgba(126,184,208,0.6)')}>{worklistRows.length}</span>}</span>
               <span style={tabSt('basket')} onClick={()=>setTab('basket')}>🧺 Basket {basketCount>0 && <span style={badge('rgba(196,163,90,0.7)')}>{basketCount}</span>}</span>
               {mergeLog.length>0 && <span style={tabSt('log')} onClick={()=>setTab('log')}>Log ({mergeLog.length})</span>}
             </div>
@@ -9615,6 +9885,53 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
               </>)}
             </div>)}
 
+            {/* ──── MFT MANUAL UPDATE WORKLIST ──── */}
+            {tab==='worklist' && (<div style={{ padding:'12px 0' }}>
+              <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', gap:10, flexWrap:'wrap', marginBottom:12 }}>
+                <div>
+                  <div style={{ fontSize:14, color:GC, fontWeight:600 }}>MFT Manual Update Worklist</div>
+                  <div style={{ fontSize:12, color:DM, lineHeight:1.5 }}>For fields MFT may not replace on GEDCOM merge. Use Copy, paste into MFT, then mark the row done or ignored. CSV reload resumes this checklist later.</div>
+                </div>
+                <div style={{ display:'flex', gap:8, flexWrap:'wrap' }}>
+                  <button onClick={generateManualWorklist} style={{ background:'rgba(126,184,208,0.12)', border:'1px solid rgba(126,184,208,0.35)', color:'#7eb8d0', padding:'7px 14px', borderRadius:6, cursor:'pointer', fontSize:12 }}>Generate from current diff</button>
+                  <button onClick={loadManualWorklistCsv} style={{ background:'transparent', border:'1px solid '+BR, color:TX, padding:'7px 14px', borderRadius:6, cursor:'pointer', fontSize:12 }}>Load CSV</button>
+                  <button onClick={()=>downloadManualWorklist(worklistRows)} disabled={worklistRows.length===0} style={{ background:'rgba(196,163,90,0.1)', border:'1px solid '+GD, color:GC, padding:'7px 14px', borderRadius:6, cursor:worklistRows.length?'pointer':'not-allowed', fontSize:12, opacity:worklistRows.length?1:0.5 }}>Export dated CSV/HTML</button>
+                </div>
+              </div>
+              {worklistRows.length===0 ? <div style={{ textAlign:'center', padding:'36px 20px', color:DM, border:'1px dashed '+BR, borderRadius:8 }}>
+                No worklist loaded. Generate one from the current diff or load a previous CSV.
+              </div> : (<>
+                <div style={{ fontSize:11, color:DM, marginBottom:8 }}>
+                  {worklistRows.filter(r=>(r.status||'open')==='open').length} open · {worklistRows.filter(r=>r.status==='done').length} done · {worklistRows.filter(r=>r.status==='ignored').length} ignored
+                </div>
+                {worklistRows.map((r,idx)=>(
+                  <div key={idx} style={{ border:'1px solid '+BR, borderRadius:8, marginBottom:10, overflow:'hidden', background:(r.status==='done'?'rgba(107,158,114,0.04)':r.status==='ignored'?'rgba(255,255,255,0.025)':'rgba(126,184,208,0.035)') }}>
+                    <div style={{ padding:'8px 12px', display:'flex', justifyContent:'space-between', gap:10, alignItems:'center', flexWrap:'wrap', borderBottom:'1px solid rgba(255,255,255,0.04)' }}>
+                      <div>
+                        <span style={{ fontSize:13, color:TX, fontWeight:500 }}>{r.display_name || r.scope_id}</span>
+                        <span style={{ fontSize:11, color:DM, marginLeft:8 }}>{r.field_label || r.field_key}</span>
+                        <span style={badge(r.status==='done'?'rgba(107,158,114,0.55)':r.status==='ignored'?'rgba(130,130,130,0.45)':'rgba(126,184,208,0.55)')}>{r.status || 'open'}</span>
+                      </div>
+                      <div style={{ display:'flex', gap:6, flexWrap:'wrap' }}>
+                        <CopyButton value={r.ftls_value || ''} label="Copy FTLS" />
+                        <CopyButton value={r.mft_target || ''} label="Copy target" />
+                        <button onClick={()=>updateWorklistRowStatus(idx,'done')} style={{ background:'rgba(107,158,114,0.12)', border:'1px solid rgba(107,158,114,0.35)', color:MC, padding:'3px 10px', borderRadius:4, cursor:'pointer', fontSize:11 }}>Done</button>
+                        <button onClick={()=>updateWorklistRowStatus(idx,'ignored')} style={{ background:'transparent', border:'1px solid '+BR, color:DM, padding:'3px 10px', borderRadius:4, cursor:'pointer', fontSize:11 }}>Ignore</button>
+                        <button onClick={()=>updateWorklistRowStatus(idx,'open')} style={{ background:'transparent', border:'1px solid '+BR, color:TX, padding:'3px 10px', borderRadius:4, cursor:'pointer', fontSize:11 }}>Reopen</button>
+                      </div>
+                    </div>
+                    <div style={{ padding:'9px 12px', fontSize:12, color:DM, lineHeight:1.5 }}>
+                      <div style={{ marginBottom:6 }}><span style={{ color:'#7eb8d0' }}>Target:</span> {r.mft_target || '—'}</div>
+                      <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:10 }}>
+                        <div><div style={{ fontSize:10, color:DM, textTransform:'uppercase', letterSpacing:1.5, marginBottom:3 }}>MFT had</div><pre style={{ whiteSpace:'pre-wrap', margin:0, background:'#0a0a08', border:'1px solid rgba(255,255,255,0.05)', borderRadius:5, padding:7, color:TX, maxHeight:120, overflow:'auto' }}>{r.mft_value || ''}</pre></div>
+                        <div><div style={{ fontSize:10, color:GC, textTransform:'uppercase', letterSpacing:1.5, marginBottom:3 }}>FTLS has</div><pre style={{ whiteSpace:'pre-wrap', margin:0, background:'#0a0a08', border:'1px solid rgba(196,163,90,0.12)', borderRadius:5, padding:7, color:TX, maxHeight:120, overflow:'auto' }}>{r.ftls_value || ''}</pre></div>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </>)}
+            </div>)}
+
             {/* ──── BASKET ──── */}
             {tab==='basket' && (<div style={{ padding:'12px 0' }}>
               {basket.imports.length===0 && basket.exports.length===0 && basket.importFams.length===0 && (basket.familyFactImports||[]).length===0 && repairableOrphanFams.length===0 && orphanFamilyCandidates.length===0 ? (
@@ -9757,6 +10074,14 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
                       </span>
                     </div>);
                   })}
+                  <div style={{ marginTop:10, marginBottom:10, padding:10, background:'rgba(255,255,255,0.025)', border:'1px solid '+BR, borderRadius:8 }}>
+                    <div style={{fontSize:11,color:DM,textTransform:'uppercase',letterSpacing:1.5,marginBottom:6}}>Export mode</div>
+                    <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
+                      <button onClick={()=>setExportMode('update')} style={{background:exportMode==='update'?'rgba(107,158,114,0.14)':'transparent',border:'1px solid '+(exportMode==='update'?MC:BR),color:exportMode==='update'?MC:DM,padding:'5px 12px',borderRadius:5,cursor:'pointer',fontSize:12}}>Update / safe merge</button>
+                      <button onClick={()=>setExportMode('hydrate')} style={{background:exportMode==='hydrate'?'rgba(196,163,90,0.14)':'transparent',border:'1px solid '+(exportMode==='hydrate'?GD:BR),color:exportMode==='hydrate'?GC:DM,padding:'5px 12px',borderRadius:5,cursor:'pointer',fontSize:12}}>Hydrate / full fields</button>
+                      <span style={{fontSize:11,color:DM,lineHeight:1.5}}>Update exports structural fields, media, REFN and FTLS links; Hydrate also exports FTLS custom narrative facts and worksheets.</span>
+                    </div>
+                  </div>
                   <div style={{ marginTop:12, display:'flex', gap:10, flexWrap:'wrap' }}>
                     <button onClick={batchExportGedcom} style={{ background:'rgba(196,163,90,0.1)', border:'1px solid '+GD, color:GC, padding:'8px 20px', borderRadius:6, cursor:'pointer', fontSize:13 }}>
                       🗜️ Download GEDCOM + Images ZIP
@@ -11543,6 +11868,22 @@ function App(){
     revealNode(targetId,{select:true});
     setSearch('');
   },[revealNode]);
+
+  // FTLS deep links exported into MFT use #person=@ID@ or #family=@ID@.
+  // The normal viewer/login gate still applies; once access is granted, open the target.
+  useEffect(()=>{
+    if(!tree || viewerGate) return;
+    const hash = (window.location.hash || '').replace(/^#/, '');
+    const m = hash.match(/^(person|family)=(.*)$/);
+    if(!m) return;
+    const id = decodeURIComponent(m[2] || '');
+    if(!id) return;
+    setActiveTab('tree');
+    if(m[1] === 'family') { setViewingFamilyId(id); return; }
+    const target = resolvePersonForDetail(id);
+    if(target){ setSel(target); revealNode(id,{select:false}); }
+  },[tree,viewerGate,resolvePersonForDetail,revealNode]);
+
 
   // State for viewer submission flow
   const [viewerSubmitData, setViewerSubmitData] = useState(null); // {personId, personName, changes, type}
