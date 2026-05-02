@@ -35,7 +35,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.7.37';
+    const APP_VERSION = 'v4.7.38';
     const BUILD_DATE = '2026-05-02';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
@@ -88,10 +88,16 @@ function appendFtlsIdentityFacts(lines, kind, id) {
   const url = ftlsDeepLinkUrl(kind, id);
   lines.push(`1 REFN ${id}`);
   lines.push('2 TYPE FTLS');
+  // Keep the underscore form for FTLS round-trip detection, but MacFamilyTree
+  // appears to hide/drop underscore custom facts during merge. Also emit a
+  // non-underscore custom fact using the same convention as MFT's TEST/TRIAL
+  // export: 1 FTLSURL <value> / 2 TYPE FTLS Profile|Family.
   lines.push(`1 _FTLSURL ${url}`);
   lines.push(kind === 'FAM' ? '2 TYPE FTLS Family' : '2 TYPE FTLS Profile');
-  // Also emit the person link as native WWW so MFT has a real clickable URL field.
-  // Keep _FTLSURL as the machine-readable FTLS custom fact; WWW is for usability.
+  lines.push(`1 FTLSURL ${url}`);
+  lines.push(kind === 'FAM' ? '2 TYPE FTLS Family' : '2 TYPE FTLS Profile');
+  // Also emit the person link as WWW for apps that support a native website URL.
+  // stripManagedFtlsIdentityBlocks only strips this when TYPE marks it as FTLS.
   if (kind !== 'FAM') {
     lines.push(`1 WWW ${url}`);
     lines.push('2 TYPE FTLS Profile');
@@ -104,14 +110,14 @@ function stripManagedFtlsIdentityBlocks(raw) {
   const out = [];
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    const m = line.match(/^1\s+(REFN|_FTLSURL|WWW)(?:\s|$)/);
+    const m = line.match(/^1\s+(REFN|_FTLSURL|FTLSURL|WWW)(?:\s|$)/);
     if (!m) { out.push(line); continue; }
     const block = [line];
     let j = i + 1;
     while (j < lines.length && !/^1\s+/.test(lines[j]) && !/^0\s+/.test(lines[j])) { block.push(lines[j]); j++; }
     const text = block.join('\n');
     const tag = m[1];
-    const isFtls = tag === '_FTLSURL'
+    const isFtls = tag === '_FTLSURL' || tag === 'FTLSURL'
       || /^2\s+TYPE\s+FTLS(?:\s|$)/m.test(text)
       || /^2\s+TYPE\s+FTLS\s+(Profile|Family)/m.test(text);
     // Only strip WWW when it is the generated FTLS Profile URL. Preserve a person's real website.
@@ -122,12 +128,101 @@ function stripManagedFtlsIdentityBlocks(raw) {
 }
 
 function getFtlsRefnValue(el) {
+  let untypedFtlsLike = '';
   for (const child of (el.children || [])) {
     if (child.tag !== 'REFN') continue;
+    const value = (child.value || '').trim();
     const type = (child.children || []).find(c => c.tag === 'TYPE')?.value || '';
-    if (String(type).trim().toUpperCase() === 'FTLS') return (child.value || '').trim();
+    if (String(type).trim().toUpperCase() === 'FTLS') return value;
+    // MFT 11 preserved the REFN value in testing but dropped the TYPE child.
+    // If the value still has FTLS's @123@-style xref shape, keep it as a
+    // fallback so REFN-based matching survives the MFT round trip.
+    if (!untypedFtlsLike && /^@[^@]+@$/.test(value)) untypedFtlsLike = value;
+  }
+  return untypedFtlsLike;
+}
+
+function normalizeGedcomComparableText(value) {
+  return String(value == null ? '' : value)
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/\n+/g, ' ')
+    .replace(/\s*,\s*/g, ', ')
+    .replace(/(?:,\s*){2,}/g, ', ')
+    .replace(/\s+/g, ' ')
+    .replace(/,\s*$/g, '')
+    .trim()
+    .toLowerCase();
+}
+
+function gedcomLevel1Blocks(raw, tags) {
+  const tagSet = new Set((Array.isArray(tags) ? tags : [tags]).map(t => String(t || '').toUpperCase()));
+  const lines = String(raw || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  const blocks = [];
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(/^1\s+(\S+)(?:\s+(.*))?$/);
+    if (!m || !tagSet.has(String(m[1] || '').toUpperCase())) continue;
+    const block = [lines[i]];
+    let j = i + 1;
+    while (j < lines.length && !/^1\s+/.test(lines[j]) && !/^0\s+/.test(lines[j])) { block.push(lines[j]); j++; }
+    blocks.push(block);
+    i = j - 1;
+  }
+  return blocks;
+}
+
+function gedcomBlockOwnValue(block) {
+  if (!block || !block.length) return '';
+  const m = String(block[0] || '').match(/^1\s+\S+(?:\s+(.*))?$/);
+  let value = m ? (m[1] || '') : '';
+  for (const line of block.slice(1)) {
+    const cm = String(line || '').match(/^2\s+(CONT|CONC)(?:\s+(.*))?$/);
+    if (cm) value += (cm[1] === 'CONT' ? '\n' : '') + (cm[2] || '');
+  }
+  return value;
+}
+
+function gedcomBlockChildValue(block, tag) {
+  const wanted = String(tag || '').toUpperCase();
+  for (const line of block || []) {
+    const m = String(line || '').match(/^2\s+(\S+)(?:\s+(.*))?$/);
+    if (m && String(m[1] || '').toUpperCase() === wanted) return m[2] || '';
   }
   return '';
+}
+
+function gedcomRecordHasLevel1Value(raw, tags, value) {
+  const target = normalizeGedcomComparableText(value);
+  if (!target) return false;
+  return gedcomLevel1Blocks(raw, tags).some(block => normalizeGedcomComparableText(gedcomBlockOwnValue(block)) === target);
+}
+
+function gedcomRecordHasCustomFactValue(raw, tag, typeLabel, value) {
+  const target = normalizeGedcomComparableText(value);
+  if (!target) return false;
+  const blocks = gedcomLevel1Blocks(raw, [tag]);
+  const typeTarget = normalizeGedcomComparableText(typeLabel || '');
+  return blocks.some(block => {
+    const type = normalizeGedcomComparableText(gedcomBlockChildValue(block, 'TYPE'));
+    if (typeTarget && type && type !== typeTarget) return false;
+    return normalizeGedcomComparableText(gedcomBlockOwnValue(block)) === target;
+  });
+}
+
+function gedcomRecordHasResidenceValue(raw, value) {
+  const target = normalizeGedcomComparableText(value);
+  if (!target) return false;
+  for (const block of gedcomLevel1Blocks(raw, ['RESI'])) {
+    const own = normalizeGedcomComparableText(gedcomBlockOwnValue(block));
+    const plac = normalizeGedcomComparableText(gedcomBlockChildValue(block, 'PLAC'));
+    if (own === target || plac === target) return true;
+  }
+  for (const block of gedcomLevel1Blocks(raw, ['ADDR'])) {
+    const combined = [gedcomBlockOwnValue(block), gedcomBlockChildValue(block, 'ADR1'), gedcomBlockChildValue(block, 'ADR2'), gedcomBlockChildValue(block, 'CITY'), gedcomBlockChildValue(block, 'STAE'), gedcomBlockChildValue(block, 'POST'), gedcomBlockChildValue(block, 'CTRY')]
+      .filter(Boolean).join(', ');
+    if (normalizeGedcomComparableText(combined) === target) return true;
+  }
+  return false;
 }
 
 function safeClipboardCopy(text) {
@@ -309,11 +404,11 @@ const KNOWN_INDI_L1 = new Set([
   'NAME', 'SEX', 'BIRT', 'DEAT', 'ADDR', 'RESI', 'LOCATION', 'EMAI', 'EMAIL', 'PHON',
   '_FACEBOOK', '_INSTAGRAM', '_LINKEDIN', 'WWW', '_PHOTO', 'OCCU', '_EMPLOYER',
   '_PHOTOGALLERY', '_DOCUMENTS', '_BIO', '_STORIES', '_DISPLAYNAME',
-  'NOTE', 'REFN', '_FTLSURL', 'FAMC', 'FAMS'
+  'NOTE', 'REFN', '_FTLSURL', 'FTLSURL', 'FAMC', 'FAMS'
 ]);
 
 // L1 tags that FTLS manages on FAM records. Same principle as above.
-const KNOWN_FAM_L1 = new Set(['HUSB', 'WIFE', 'CHIL', 'MARR', 'DIV', 'REFN', '_FTLSURL']);
+const KNOWN_FAM_L1 = new Set(['HUSB', 'WIFE', 'CHIL', 'MARR', 'DIV', 'REFN', '_FTLSURL', 'FTLSURL']);
 
 /* ───── CANONICAL GEDCOM TOKENIZER ─────
    The ONLY tokenizer in this app. Previously duplicated inline at three
@@ -1143,6 +1238,20 @@ function findGeneratedFtlsNoteIds(elements, noteMap = {}) {
     }
   }
   return ids;
+}
+
+function findGeneratedFtlsNoteScopes(elements, noteMap = {}) {
+  const scopes = { personIds: new Set(), familyIds: new Set() };
+  for (const el of elements || []) {
+    if (el.tag !== 'NOTE' || !el.pointer) continue;
+    const noteText = noteMap[el.pointer] || el.value || '';
+    if (!isFtlsGeneratedNoteText(noteText)) continue;
+    const personMatch = String(noteText).match(/(?:^|\n)FTLS Person ID:\s*([^\n]+)/i);
+    const familyMatch = String(noteText).match(/(?:^|\n)FTLS Family ID:\s*([^\n]+)/i);
+    if (personMatch) scopes.personIds.add(personMatch[1].trim());
+    if (familyMatch) scopes.familyIds.add(familyMatch[1].trim());
+  }
+  return scopes;
 }
 
 function stripGeneratedFtlsNoteRecordsFromGedcomLines(lines, generatedNoteIds) {
@@ -2822,6 +2931,12 @@ function personToGedcomLines(person, context = {}) {
   const standalone = []; // standalone NOTE records to emit at top level
   const exportMode = context.exportMode || 'hydrate';
   const isUpdateMode = exportMode === 'update';
+  const referenceRaw = context.referenceRaw || '';
+  const suppressSameInReference = !!context.suppressSameInReference;
+  const refHas = (tags, value) => suppressSameInReference && gedcomRecordHasLevel1Value(referenceRaw, tags, value);
+  const refHasCustom = (tag, typeLabel, value) => suppressSameInReference && gedcomRecordHasCustomFactValue(referenceRaw, tag, typeLabel, value);
+  const refHasResidence = (value) => suppressSameInReference && gedcomRecordHasResidenceValue(referenceRaw, value);
+  const skipFtlsWorksheet = !!context.skipFtlsWorksheet;
   appendFtlsIdentityFacts(L, 'INDI', person.id);
   if (person._xg) person._xg = stripManagedFtlsIdentityBlocks(person._xg);
 
@@ -2872,14 +2987,22 @@ function personToGedcomLines(person, context = {}) {
   }
   // Contact — use MFT-native GEDCOM contact fields. MacFamilyTree exports
   // email as EMAIL (not EMAI), and PHON/EMAIL may carry CHAN/_CRE children.
-  if (person.ph) { L.push(`1 PHON ${person.ph}`); appendMftTimestampChildren(L, 2); }
-  if (person.em) { L.push(`1 EMAIL ${person.em}`); appendMftTimestampChildren(L, 2); }
+  if (person.ph) {
+    if (!refHas(['PHON'], person.ph)) { L.push(`1 PHON ${person.ph}`); appendMftTimestampChildren(L, 2); }
+    if (person._xg && hasGedcomLevel1Block(person._xg, 'PHON')) person._xg = stripGedcomLevel1Block(person._xg, 'PHON');
+  }
+  if (person.em) {
+    if (!refHas(['EMAIL','EMAI'], person.em)) { L.push(`1 EMAIL ${person.em}`); appendMftTimestampChildren(L, 2); }
+    if (person._xg && (/^1 (EMAIL|EMAI)/m).test(person._xg)) person._xg = stripGedcomLevel1Block(person._xg, ['EMAIL','EMAI']);
+  }
   // Full contact address → MFT-style Residence fact. This is separate from
   // the Personal Information Location textbox, which exports as LOCATION below.
   const contactResidence = combinedContactResidenceValue(person);
   if (contactResidence) {
-    L.push(`1 RESI ${contactResidence}`);
-    appendMftTimestampChildren(L, 2);
+    if (!refHasResidence(contactResidence)) {
+      L.push(`1 RESI ${contactResidence}`);
+      appendMftTimestampChildren(L, 2);
+    }
     // Strip old address/residence passthrough so FTLS does not export duplicate addresses.
     if (person._xg && (/^1 (RESI|ADDR)/m).test(person._xg)) {
       person._xg = stripGedcomLevel1Block(person._xg, ['RESI','ADDR']);
@@ -2888,9 +3011,15 @@ function personToGedcomLines(person, context = {}) {
     // No FTLS contact address — let preserved MFT RESI/ADDR pass through.
   }
   // Occupation
-  if (person.prof) L.push(`1 OCCU ${person.prof}`);
+  if (person.prof) {
+    if (!refHas(['OCCU'], person.prof)) L.push(`1 OCCU ${person.prof}`);
+    if (person._xg && hasGedcomLevel1Block(person._xg, 'OCCU')) person._xg = stripGedcomLevel1Block(person._xg, 'OCCU');
+  }
   // Website
-  if (person.ws) L.push(`1 WWW ${person.ws}`);
+  if (person.ws) {
+    if (!refHas(['WWW'], person.ws)) L.push(`1 WWW ${person.ws}`);
+    if (person._xg && hasGedcomLevel1Block(person._xg, 'WWW')) person._xg = stripGedcomLevel1Block(person._xg, 'WWW');
+  }
 
   // Helper: create a standalone NOTE record and add pointer to INDI
   // MacFamilyTree uses standalone NOTE records (0-level) referenced by pointer
@@ -2924,17 +3053,19 @@ function personToGedcomLines(person, context = {}) {
   // FTLS-only fields export as MFT custom facts using the existing FTLS tags
   // where they already existed. Do not use NOTE for bio/stories/link fields.
   if (!isUpdateMode) {
-  appendMftCustomFact(L, 'LOCATION', 'Location', person.loc);
-  appendMftCustomFact(L, '_DISPLAYNAME', 'Display Name', person.dn);
-  appendMftCustomFact(L, '_BIO', 'Bio', dedupeNoteTextLines(person.bio || ''));
-  appendMftCustomFact(L, '_STORIES', 'Stories', dedupeNoteTextLines(person.stories || ''));
-  appendMftCustomFact(L, '_FACEBOOK', 'Facebook', person.fb);
-  appendMftCustomFact(L, '_INSTAGRAM', 'Instagram', person.ig);
-  appendMftCustomFact(L, '_LINKEDIN', 'LinkedIn', person.li);
-  if (person.pp) L.push(`1 _PHOTO ${person.pp}`);
-  appendMftCustomFact(L, '_EMPLOYER', 'Employer', person.emp);
-  appendMftCustomFact(L, '_PHOTOGALLERY', 'Photo Gallery Link', person.pgl);
-  appendMftCustomFact(L, '_DOCUMENTS', 'Documents Link', person.dl);
+  if (!refHasCustom('LOCATION', 'Location', person.loc)) appendMftCustomFact(L, 'LOCATION', 'Location', person.loc);
+  if (!refHasCustom('_DISPLAYNAME', 'Display Name', person.dn)) appendMftCustomFact(L, '_DISPLAYNAME', 'Display Name', person.dn);
+  const cleanBio = dedupeNoteTextLines(person.bio || '');
+  const cleanStories = dedupeNoteTextLines(person.stories || '');
+  if (!refHasCustom('_BIO', 'Bio', cleanBio)) appendMftCustomFact(L, '_BIO', 'Bio', cleanBio);
+  if (!refHasCustom('_STORIES', 'Stories', cleanStories)) appendMftCustomFact(L, '_STORIES', 'Stories', cleanStories);
+  if (!refHasCustom('_FACEBOOK', 'Facebook', person.fb)) appendMftCustomFact(L, '_FACEBOOK', 'Facebook', person.fb);
+  if (!refHasCustom('_INSTAGRAM', 'Instagram', person.ig)) appendMftCustomFact(L, '_INSTAGRAM', 'Instagram', person.ig);
+  if (!refHasCustom('_LINKEDIN', 'LinkedIn', person.li)) appendMftCustomFact(L, '_LINKEDIN', 'LinkedIn', person.li);
+  if (person.pp && !refHas(['_PHOTO'], person.pp)) L.push(`1 _PHOTO ${person.pp}`);
+  if (!refHasCustom('_EMPLOYER', 'Employer', person.emp)) appendMftCustomFact(L, '_EMPLOYER', 'Employer', person.emp);
+  if (!refHasCustom('_PHOTOGALLERY', 'Photo Gallery Link', person.pgl)) appendMftCustomFact(L, '_PHOTOGALLERY', 'Photo Gallery Link', person.pgl);
+  if (!refHasCustom('_DOCUMENTS', 'Documents Link', person.dl)) appendMftCustomFact(L, '_DOCUMENTS', 'Documents Link', person.dl);
   }
   if (person._xg) {
     person._xg = stripGedcomLevel1Block(person._xg, [
@@ -2948,7 +3079,7 @@ function personToGedcomLines(person, context = {}) {
 
   // Machine-readable reconciliation snapshot. Hydrate mode keeps the existing
   // worksheet behavior; update mode skips it to avoid MFT note pollution.
-  if (!isUpdateMode) addStandaloneNote(buildFtlsReconciliationSnapshot(person, context), 'FTLS');
+  if (!isUpdateMode && !skipFtlsWorksheet) addStandaloneNote(buildFtlsReconciliationSnapshot(person, context), 'FTLS');
 
   return { indi: L, standalone };
 }
@@ -4851,7 +4982,7 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, 
     appendFtlsMediaRefs(F, 'FAM', fid, mediaBundle, fam._extra_gedcom || '');
     const famXg = stripManagedFtlsIdentityBlocks(stripGedcomLevel1Block(fam._extra_gedcom || '', ['MARR', 'DIV']));
     if (famXg) famXg.split('\n').forEach(xl => { if (xl.trim()) F.push(xl); });
-    addStandaloneFamilyReconciliationNote(F, diffStandaloneNotes, { ...fam, id: fid, husband_id: hid, wife_id: wid, marriage_date: md, marriage_place: mp, divorce_date: dd }, allPersonMap || {});
+    if (exportMode !== 'update') addStandaloneFamilyReconciliationNote(F, diffStandaloneNotes, { ...fam, id: fid, husband_id: hid, wife_id: wid, marriage_date: md, marriage_place: mp, divorce_date: dd }, allPersonMap || {});
     lines.push(...F);
   }
 
@@ -4937,6 +5068,7 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
   const originalElements = tokenizeGedcom(originalText);
   const originalNoteMap = buildGedcomNoteMap(originalElements);
   const generatedNoteIds = findGeneratedFtlsNoteIds(originalElements, originalNoteMap);
+  const generatedNoteScopes = findGeneratedFtlsNoteScopes(originalElements, originalNoteMap);
   const adoptedMediaIds = buildFtlsMediaObjeIdSet(originalElements);
   if (mediaBundle) adoptedMediaIds.forEach(id => { mediaBundle.generatedIds.add(id); mediaBundle.adoptedIds.add(id); });
   const lines = stripGeneratedFtlsNoteRecordsFromGedcomLines(
@@ -5002,7 +5134,9 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
       appendFtlsMediaRefs(F, 'FAM', fid, mediaBundle, fam._extra_gedcom || '');
       const famXg = stripManagedFtlsIdentityBlocks(stripGedcomLevel1Block(fam._extra_gedcom || '', ['MARR', 'DIV']));
       if (famXg) famXg.split('\n').forEach(xl => { if (xl.trim()) F.push(xl); });
-      addStandaloneFamilyReconciliationNote(F, mergedStandaloneNotes, { ...fam, id: fid, husband_id: hid, wife_id: wid, marriage_date: md, marriage_place: mp, divorce_date: dd }, {});
+      if (exportMode !== 'update' && !generatedNoteScopes.familyIds.has(fid)) {
+        addStandaloneFamilyReconciliationNote(F, mergedStandaloneNotes, { ...fam, id: fid, husband_id: hid, wife_id: wid, marriage_date: md, marriage_place: mp, divorce_date: dd }, {});
+      }
       newLines.push(...F);
     }
   }
@@ -5057,8 +5191,12 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
     appendFtlsMediaRefs(body, 'FAM', m[1], mediaBundle, fam._extra_gedcom || '');
     const bodyXg = stripManagedFtlsIdentityBlocks(stripGedcomLevel1Block(fam._extra_gedcom || '', ['MARR', 'DIV']));
     if (bodyXg) bodyXg.split('\n').forEach(xl => { if (xl.trim() && !body.includes(xl)) body.push(xl); });
-    // Existing generated FTLS notes were already stripped at the whole-file level.
-    addStandaloneFamilyReconciliationNote(body, mergedStandaloneNotes, { ...fam, id: m[1] }, exportPersonNameMapForFamilies);
+    // Existing generated FTLS notes were already stripped from the outgoing GEDCOM.
+    // Do not re-emit the worksheet when the reference MFT tree already has one;
+    // MFT merge cannot delete the old note and would append another copy.
+    if (exportMode !== 'update' && !generatedNoteScopes.familyIds.has(m[1])) {
+      addStandaloneFamilyReconciliationNote(body, mergedStandaloneNotes, { ...fam, id: m[1] }, exportPersonNameMapForFamilies);
+    }
     before.splice(i, j - i, header, ...body);
   }
 
@@ -5076,8 +5214,15 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
     if (wid) { if (!famsLookup2[wid]) famsLookup2[wid] = []; famsLookup2[wid].push(fid); }
   }
   
-  function buildReplacementIndi(p) {
-    const { indi: L, standalone } = personToGedcomLines(p, { fams: famsLookup2[p.id] || [], famc: famcLookup2[p.id] || [], exportMode });
+  function buildReplacementIndi(p, referenceRaw = '') {
+    const { indi: L, standalone } = personToGedcomLines(p, {
+      fams: famsLookup2[p.id] || [],
+      famc: famcLookup2[p.id] || [],
+      exportMode,
+      referenceRaw,
+      suppressSameInReference: true,
+      skipFtlsWorksheet: generatedNoteScopes.personIds.has(p.id)
+    });
     if (standalone.length > 0) mergedStandaloneNotes.push(...standalone);
     // Add FAMS/FAMC refs from the family map
     (famsLookup2[p.id] || []).forEach(ref => L.push(`1 FAMS ${ref}`));
@@ -5124,7 +5269,8 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
       }
       if (preserved.length > 0) p._xg = preserved.join('\n');
     }
-    before.splice(i, j - i, ...buildReplacementIndi(p));
+    const originalPersonRaw = before.slice(i, j).join('\n');
+    before.splice(i, j - i, ...buildReplacementIndi(p, originalPersonRaw));
   }
 
 
