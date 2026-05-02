@@ -35,8 +35,8 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.7.36';
-    const BUILD_DATE = '2026-04-29';
+    const APP_VERSION = 'v4.7.37';
+    const BUILD_DATE = '2026-05-02';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
 
@@ -85,10 +85,17 @@ function ftlsDeepLinkUrl(kind, id) {
 
 function appendFtlsIdentityFacts(lines, kind, id) {
   if (!id) return;
+  const url = ftlsDeepLinkUrl(kind, id);
   lines.push(`1 REFN ${id}`);
   lines.push('2 TYPE FTLS');
-  lines.push(`1 _FTLSURL ${ftlsDeepLinkUrl(kind, id)}`);
+  lines.push(`1 _FTLSURL ${url}`);
   lines.push(kind === 'FAM' ? '2 TYPE FTLS Family' : '2 TYPE FTLS Profile');
+  // Also emit the person link as native WWW so MFT has a real clickable URL field.
+  // Keep _FTLSURL as the machine-readable FTLS custom fact; WWW is for usability.
+  if (kind !== 'FAM') {
+    lines.push(`1 WWW ${url}`);
+    lines.push('2 TYPE FTLS Profile');
+  }
 }
 
 function stripManagedFtlsIdentityBlocks(raw) {
@@ -97,13 +104,17 @@ function stripManagedFtlsIdentityBlocks(raw) {
   const out = [];
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    const m = line.match(/^1\s+(REFN|_FTLSURL)(?:\s|$)/);
+    const m = line.match(/^1\s+(REFN|_FTLSURL|WWW)(?:\s|$)/);
     if (!m) { out.push(line); continue; }
     const block = [line];
     let j = i + 1;
     while (j < lines.length && !/^1\s+/.test(lines[j]) && !/^0\s+/.test(lines[j])) { block.push(lines[j]); j++; }
     const text = block.join('\n');
-    const isFtls = m[1] === '_FTLSURL' || /^2\s+TYPE\s+FTLS(?:\s|$)/m.test(text) || /^2\s+TYPE\s+FTLS\s+(Profile|Family)/m.test(text);
+    const tag = m[1];
+    const isFtls = tag === '_FTLSURL'
+      || /^2\s+TYPE\s+FTLS(?:\s|$)/m.test(text)
+      || /^2\s+TYPE\s+FTLS\s+(Profile|Family)/m.test(text);
+    // Only strip WWW when it is the generated FTLS Profile URL. Preserve a person's real website.
     if (!isFtls) out.push(...block);
     i = j - 1;
   }
@@ -744,6 +755,53 @@ function ftlsMediaMetaLines(mediaBundle) {
     .filter(id => !(mediaBundle.adoptedIds && mediaBundle.adoptedIds.has(id)))
     .map(id => mediaBundle.metaById.get(id))
     .filter(Boolean);
+}
+
+function collectObjeRefsFromGedcomLines(lines) {
+  const refs = new Set();
+  for (const line of lines || []) {
+    const m = String(line || '').match(/^1\s+OBJE\s+(@[^@]+@)/);
+    if (m) refs.add(m[1]);
+  }
+  return refs;
+}
+
+function collectTopLevelObjeIdsFromGedcomLines(lines) {
+  const ids = new Set();
+  for (const line of lines || []) {
+    const m = String(line || '').match(/^0\s+(@[^@]+@)\s+OBJE(?:\s|$)/);
+    if (m) ids.add(m[1]);
+  }
+  return ids;
+}
+
+function ftlsMediaReferenceClosureLines(lines, mediaBundle) {
+  if (!mediaBundle) return [];
+  const refs = collectObjeRefsFromGedcomLines(lines);
+  const topLevel = collectTopLevelObjeIdsFromGedcomLines(lines);
+  const add = [];
+  for (const ref of refs) {
+    if (!/^@FTLSM_/i.test(ref)) continue;
+    mediaBundle.usedIds.add(ref); // guarantees the matching JPG is placed in the ZIP
+    if (topLevel.has(ref)) continue;
+    const raw = mediaBundle.metaById.get(ref);
+    if (raw) {
+      add.push(raw);
+      topLevel.add(ref);
+      // If this was marked adopted only because an owner-level OBJE came back from MFT,
+      // but the top-level OBJE is absent from this export, generate the top-level record now.
+      if (mediaBundle.adoptedIds) mediaBundle.adoptedIds.delete(ref);
+    } else {
+      console.warn('FTLS media reference has no top-level OBJE metadata available:', ref);
+    }
+  }
+  return add;
+}
+
+function appendFtlsMediaReferenceClosure(lines, mediaBundle) {
+  const add = ftlsMediaReferenceClosureLines(lines, mediaBundle);
+  if (add.length) lines.push(...add);
+  return add;
 }
 
 /* ───── GEDCOM NOTE / ADDRESS HELPERS ─────
@@ -2812,9 +2870,10 @@ function personToGedcomLines(person, context = {}) {
     L.push(`2 DATE ${person.burd}`);
     if (person._xg && hasGedcomLevel1Block(person._xg, 'BURI')) person._xg = stripGedcomLevel1Block(person._xg, 'BURI');
   }
-  // Contact
-  if (person.ph) L.push(`1 PHON ${person.ph}`);
-  if (person.em) L.push(`1 EMAI ${person.em}`);
+  // Contact — use MFT-native GEDCOM contact fields. MacFamilyTree exports
+  // email as EMAIL (not EMAI), and PHON/EMAIL may carry CHAN/_CRE children.
+  if (person.ph) { L.push(`1 PHON ${person.ph}`); appendMftTimestampChildren(L, 2); }
+  if (person.em) { L.push(`1 EMAIL ${person.em}`); appendMftTimestampChildren(L, 2); }
   // Full contact address → MFT-style Residence fact. This is separate from
   // the Personal Information Location textbox, which exports as LOCATION below.
   const contactResidence = combinedContactResidenceValue(person);
@@ -3044,6 +3103,7 @@ function exportTreeToGedcom(tree, personMap, familyMap, mediaBundle = null) {
   fams.forEach(fam => lines.push(...fam));
   const mediaMetaLines = ftlsMediaMetaLines(mediaBundle);
   if (mediaMetaLines.length > 0) lines.push(...mediaMetaLines);
+  appendFtlsMediaReferenceClosure(lines, mediaBundle);
   if (standaloneNotes.length > 0) lines.push(...standaloneNotes);
   lines.push('0 TRLR');
 
@@ -4861,6 +4921,7 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, 
 
   const mediaMetaLines = ftlsMediaMetaLines(mediaBundle);
   if (mediaMetaLines.length > 0) lines.push(...mediaMetaLines);
+  appendFtlsMediaReferenceClosure(lines, mediaBundle);
 
   // Include standalone NOTE records generated by personToGedcomLines
   if (diffStandaloneNotes.length > 0) lines.push(...diffStandaloneNotes);
@@ -5068,7 +5129,9 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
 
 
   const mediaMetaLines = ftlsMediaMetaLines(mediaBundle);
-  return [...before, ...newLines, ...mediaMetaLines, ...mergedStandaloneNotes, '0 TRLR'].join('\n') + '\n';
+  const mergedOut = [...before, ...newLines, ...mediaMetaLines];
+  appendFtlsMediaReferenceClosure(mergedOut, mediaBundle);
+  return [...mergedOut, ...mergedStandaloneNotes, '0 TRLR'].join('\n') + '\n';
 }
 
 
