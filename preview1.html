@@ -35,7 +35,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.7.47-deeplink-scroll-visual';
+    const APP_VERSION = 'v4.7.48-deeplink-blank-fix';
     const BUILD_DATE = '2026-05-03';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
@@ -12186,7 +12186,7 @@ function App(){
   const cssEscapeFtlsId=useCallback((value)=>{
     const raw=String(value||'');
     if(window.CSS&&CSS.escape)return CSS.escape(raw);
-    return raw.replace(/\/g,'\\').replace(/"/g,'\"');
+    return raw.replace(/\\/g,'\\\\').replace(/"/g,'\\"');
   },[]);
 
   const scrollToVisibleTreeNode=useCallback((nodeId)=>{
