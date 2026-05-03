@@ -35,7 +35,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.7.46-single-ftlsurl-deeplink';
+    const APP_VERSION = 'v4.7.47-deeplink-scroll-visual';
     const BUILD_DATE = '2026-05-03';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
@@ -7788,7 +7788,7 @@ function TreeNode({node,exp,onTog,onSel,onEdit,onAdd,onDel,onEditSpouse,onDelSpo
   const hasMultipleMarriages = (node.spouses||[]).length > 1;
   return(
     <div>
-      <div style={{display:'flex',alignItems:'center',gap:6,padding:'6px 8px',borderRadius:6,
+      <div data-ftls-node-id={node.id} style={{display:'flex',alignItems:'center',gap:6,padding:'6px 8px',borderRadius:6,
         background:isHL?'rgba(196,163,90,0.15)':'transparent',transition:'background 0.15s'}}
         onMouseEnter={e=>{if(!isHL)e.currentTarget.style.background='rgba(255,255,255,0.03)'}}
         onMouseLeave={e=>{if(!isHL)e.currentTarget.style.background='transparent'}}>
@@ -12183,6 +12183,21 @@ function App(){
       .slice(0,15);
   },[search,flat]);
 
+  const cssEscapeFtlsId=useCallback((value)=>{
+    const raw=String(value||'');
+    if(window.CSS&&CSS.escape)return CSS.escape(raw);
+    return raw.replace(/\/g,'\\').replace(/"/g,'\"');
+  },[]);
+
+  const scrollToVisibleTreeNode=useCallback((nodeId)=>{
+    if(!nodeId)return false;
+    const selector=`[data-ftls-node-id="${cssEscapeFtlsId(nodeId)}"]`;
+    const el=document.querySelector(selector);
+    if(!el)return false;
+    el.scrollIntoView({behavior:'smooth',block:'center',inline:'nearest'});
+    return true;
+  },[cssEscapeFtlsId]);
+
   const revealNode=useCallback((nodeId,opts={})=>{
     const ancestorIds=getAncestorIds(tree,nodeId);
     setExp(p=>{
@@ -12195,8 +12210,13 @@ function App(){
       const latest=findNodeById(tree,nodeId);
       if(latest)setSel(latest);
     }
-    setTimeout(()=>setHl(null),2000);
-  },[tree,getAncestorIds,findNodeById]);
+    // After expansion/render, scroll the visual tree row into view if the node
+    // is actually present in the currently-rendered root tree. If the person is
+    // an orphan/disconnected/spouse-only record, the detail panel still opens
+    // from personMap, but there may be no visible row to scroll to.
+    setTimeout(()=>scrollToVisibleTreeNode(nodeId),150);
+    setTimeout(()=>setHl(null),3500);
+  },[tree,getAncestorIds,findNodeById,scrollToVisibleTreeNode]);
 
   const navigateTo=useCallback(node=>{
     // If this is a spouse result, reveal/select the parent node that contains them
@@ -12209,7 +12229,7 @@ function App(){
   // The normal viewer/login gate still applies; once access is granted, open the target.
   // Be forgiving: browsers/MFT may encode @ as %40, and some MFT round trips may
   // preserve only the numeric body of an xref. Resolve exact ID first, then @-stripped ID.
-  const normalizeDeepLinkId = useCallback((id)=>String(id||'').replace(/^@|@$/g,''),[]);
+  const normalizeDeepLinkId = useCallback((id)=>String(id||'').trim().replace(/^@|@$/g,''),[]);
   const resolveFamilyIdForDeepLink = useCallback((id)=>{
     if(!id || !familyMap) return '';
     if(familyMap[id]) return id;
@@ -12226,9 +12246,12 @@ function App(){
   const openFtlsDeepLinkFromHash = useCallback(()=>{
     if(!tree || viewerGate) return false;
     const hash = (window.location.hash || '').replace(/^#/, '');
-    const m = hash.match(/^(person|family)=(.*)$/);
+    const m = hash.match(/^(person|family)=(.*)$/i);
     if(!m) return false;
-    const rawId = decodeURIComponent(m[2] || '').trim();
+    // MFT/browser copies may append extra query-ish text after the ID. Keep only
+    // the encoded xref payload before &, ?, or another hash fragment.
+    const rawPayload = String(m[2] || '').split(/[&?#]/)[0];
+    const rawId = decodeURIComponent(rawPayload).trim();
     if(!rawId) return false;
     setActiveTab('tree');
     if(m[1] === 'family') {
@@ -12239,14 +12262,14 @@ function App(){
       const personId = resolvePersonIdForDeepLink(rawId);
       if(personId) {
         const target = resolvePersonForDetail(personId);
-        if(target){ setSel(target); revealNode(personId,{select:false}); return true; }
+        if(target){ setSel(target); revealNode(personId,{select:true}); return true; }
       }
       console.warn('FTLS family deep link did not match any family:', rawId);
       return false;
     }
     const personId = resolvePersonIdForDeepLink(rawId);
     const target = personId ? resolvePersonForDetail(personId) : null;
-    if(target){ setSel(target); revealNode(personId,{select:false}); return true; }
+    if(target){ setSel(target); revealNode(personId,{select:true}); return true; }
     console.warn('FTLS person deep link did not match any person:', rawId);
     return false;
   },[tree,viewerGate,resolveFamilyIdForDeepLink,resolvePersonIdForDeepLink,resolvePersonForDetail,revealNode]);
