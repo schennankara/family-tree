@@ -35,7 +35,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.7.39-location-zip';
+    const APP_VERSION = 'v4.7.41-location-zip-ftls-link-note-label';
     const BUILD_DATE = '2026-05-03';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
@@ -952,6 +952,7 @@ function resolveGedcomNoteValue(value, noteMap = {}) {
 }
 
 const FTLS_PROFILE_NOTE_PREFIX = '=== FTLS Profile ===';
+const FTLS_LINK_NOTE_PREFIX = '=== FTLS Link ===';
 // Human-readable worksheet shown inside MacFamilyTree for admins. Keep the old
 // snapshot marker in the generated-marker list so older FTLS exports are still
 // recognized and stripped on round-trip.
@@ -961,7 +962,7 @@ const FTLS_RECON_NOTE_END = '=== END FTLS Reconciliation Worksheet ===';
 const FTLS_RECON_NOTE_OLD_END = '=== END FTLS Reconciliation Snapshot ===';
 const FTLS_FAM_RECON_NOTE_PREFIX = '=== FTLS Family Reconciliation Worksheet v1 ===';
 const FTLS_FAM_RECON_NOTE_END = '=== END FTLS Family Reconciliation Worksheet ===';
-const FTLS_GENERATED_NOTE_PREFIXES = [FTLS_PROFILE_NOTE_PREFIX, FTLS_RECON_NOTE_PREFIX, FTLS_RECON_NOTE_OLD_PREFIX, FTLS_FAM_RECON_NOTE_PREFIX];
+const FTLS_GENERATED_NOTE_PREFIXES = [FTLS_PROFILE_NOTE_PREFIX, FTLS_LINK_NOTE_PREFIX, FTLS_RECON_NOTE_PREFIX, FTLS_RECON_NOTE_OLD_PREFIX, FTLS_FAM_RECON_NOTE_PREFIX];
 
 function isFtlsGeneratedNoteText(text) {
   const v = cleanGedcomNoteText(text || '').trimStart();
@@ -2599,6 +2600,7 @@ function buildFtlsReconciliationSnapshot(person, context = {}) {
     '',
     '--- Identity fields ---',
     show('FTLS Person ID', person.id),
+    show('FTLS Profile Link', ftlsDeepLinkUrl('INDI', person.id)),
     show('Display Name', person.dn),
     show('First/Given Name', person.fn),
     show('Middle/Second Name', person.mn),
@@ -2707,6 +2709,7 @@ function buildFtlsFamilyReconciliationSnapshot(fam, personMap = {}) {
     '',
     '--- Family identity ---',
     show('FTLS Family ID', fam.id),
+    show('FTLS Family Link', ftlsDeepLinkUrl('FAM', fam.id)),
     show('Husband ID', hid),
     show('Husband Name', nameFor(hid)),
     show('Wife ID', wid),
@@ -3131,6 +3134,11 @@ function personToGedcomLines(person, context = {}) {
     text.split('\n').forEach(line => noteLines.push(`1 CONT ${line}`));
     standalone.push(...noteLines);
   };
+
+  // MFT 11 does not preserve/display WWW, FTLSURL, or _FTLSURL reliably after merge.
+  // Keep a small generated NOTE that is visible in MFT and stripped/replaced on future FTLS merges.
+  // This is the reliable human-facing bridge back to the live FTLS node.
+  addStandaloneNote(`${FTLS_LINK_NOTE_PREFIX}\nFTLS Profile Link: ${ftlsDeepLinkUrl('INDI', person.id)}\nFTLS Person ID: ${person.id}`, 'FTLS');
 
   // Person's own notes — detect if it's a pointer to existing NOTE record or actual text
   // Update mode intentionally skips narrative notes/custom facts because MFT merge
@@ -7857,7 +7865,7 @@ function Detail({node,onClose,onEdit,onEditSpouse,onDelSpouse,onMove,onAddChild,
         </div>
       </div>
       
-      <R l="Born" v={node.dob}/><R l="Birthplace" v={node.loc}/><R l="Died" v={node.dod}/>
+      <R l="Born" v={node.dob}/><R l="Location" v={node.loc}/><R l="Died" v={node.dod}/>
       <R l="Profession" v={node.prof}/><R l="Employer" v={node.emp}/><R l="Email" v={node.em}/><R l="Phone" v={node.ph}/>
       <R l="Residence" v={personAddress}/>
       {node.bio&&<div style={{marginTop:12}}><div style={{fontSize:11,color:GD,textTransform:'uppercase',letterSpacing:2,marginBottom:4}}>Bio <CopyButton value={node.bio}/></div><div style={{fontSize:13,color:TX,lineHeight:1.6,whiteSpace:'pre-wrap'}}>{node.bio}</div></div>}
