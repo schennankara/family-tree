@@ -35,7 +35,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.7.41-location-zip-ftls-link-note-label';
+    const APP_VERSION = 'v4.7.43-location-zip-ftls-link-note-skip-existing';
     const BUILD_DATE = '2026-05-03';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
@@ -969,6 +969,11 @@ function isFtlsGeneratedNoteText(text) {
   return FTLS_GENERATED_NOTE_PREFIXES.some(prefix => v.startsWith(prefix));
 }
 
+function isFtlsLinkNoteText(text) {
+  const v = cleanGedcomNoteText(text || '').trimStart();
+  return v.startsWith(FTLS_LINK_NOTE_PREFIX);
+}
+
 function parseFtlsReconciliationSnapshotText(text) {
   const cleaned = cleanGedcomNoteText(text || '').trim();
   if (!cleaned.startsWith(FTLS_RECON_NOTE_PREFIX) && !cleaned.startsWith(FTLS_RECON_NOTE_OLD_PREFIX)) return null;
@@ -1249,11 +1254,16 @@ function applyFtlsFamilyReconciliationSnapshotDefaultsToDbRow(row, snapshot) {
   return row;
 }
 
-function findGeneratedFtlsNoteIds(elements, noteMap = {}) {
+function findGeneratedFtlsNoteIds(elements, noteMap = {}, options = {}) {
   const ids = new Set();
+  const preserveLinkNotes = !!options.preserveLinkNotes;
   for (const el of elements || []) {
     const noteText = el.pointer ? (noteMap[el.pointer] || el.value || '') : '';
     if (el.tag === 'NOTE' && el.pointer && isFtlsGeneratedNoteText(noteText)) {
+      // MFT-visible FTLS Link notes are intentionally durable. During merged
+      // export, preserve an existing link note and suppress re-emitting another
+      // one for the same person, instead of strip/recreate causing duplicates.
+      if (preserveLinkNotes && isFtlsLinkNoteText(noteText)) continue;
       ids.add(el.pointer);
     }
   }
@@ -1266,6 +1276,21 @@ function findGeneratedFtlsNoteScopes(elements, noteMap = {}) {
     if (el.tag !== 'NOTE' || !el.pointer) continue;
     const noteText = noteMap[el.pointer] || el.value || '';
     if (!isFtlsGeneratedNoteText(noteText)) continue;
+    const personMatch = String(noteText).match(/(?:^|\n)FTLS Person ID:\s*([^\n]+)/i);
+    const familyMatch = String(noteText).match(/(?:^|\n)FTLS Family ID:\s*([^\n]+)/i);
+    if (personMatch) scopes.personIds.add(personMatch[1].trim());
+    if (familyMatch) scopes.familyIds.add(familyMatch[1].trim());
+  }
+  return scopes;
+}
+
+
+function findFtlsLinkNoteScopes(elements, noteMap = {}) {
+  const scopes = { personIds: new Set(), familyIds: new Set() };
+  for (const el of elements || []) {
+    if (el.tag !== 'NOTE' || !el.pointer) continue;
+    const noteText = noteMap[el.pointer] || el.value || '';
+    if (!isFtlsLinkNoteText(noteText)) continue;
     const personMatch = String(noteText).match(/(?:^|\n)FTLS Person ID:\s*([^\n]+)/i);
     const familyMatch = String(noteText).match(/(?:^|\n)FTLS Family ID:\s*([^\n]+)/i);
     if (personMatch) scopes.personIds.add(personMatch[1].trim());
@@ -2982,6 +3007,7 @@ function personToGedcomLines(person, context = {}) {
   const refHasCustom = (tag, typeLabel, value) => suppressSameInReference && gedcomRecordHasCustomFactValue(referenceRaw, tag, typeLabel, value);
   const refHasResidence = (value) => suppressSameInReference && gedcomRecordHasResidenceValue(referenceRaw, value);
   const skipFtlsWorksheet = !!context.skipFtlsWorksheet;
+  const skipFtlsLinkNote = !!context.skipFtlsLinkNote;
   appendFtlsIdentityFacts(L, 'INDI', person.id);
   if (person._xg) person._xg = stripManagedFtlsIdentityBlocks(person._xg);
 
@@ -3138,7 +3164,7 @@ function personToGedcomLines(person, context = {}) {
   // MFT 11 does not preserve/display WWW, FTLSURL, or _FTLSURL reliably after merge.
   // Keep a small generated NOTE that is visible in MFT and stripped/replaced on future FTLS merges.
   // This is the reliable human-facing bridge back to the live FTLS node.
-  addStandaloneNote(`${FTLS_LINK_NOTE_PREFIX}\nFTLS Profile Link: ${ftlsDeepLinkUrl('INDI', person.id)}\nFTLS Person ID: ${person.id}`, 'FTLS');
+  if (!skipFtlsLinkNote) addStandaloneNote(`${FTLS_LINK_NOTE_PREFIX}\nFTLS Profile Link: ${ftlsDeepLinkUrl('INDI', person.id)}\nFTLS Person ID: ${person.id}`, 'FTLS');
 
   // Person's own notes — detect if it's a pointer to existing NOTE record or actual text
   // Update mode intentionally skips narrative notes/custom facts because MFT merge
@@ -5172,7 +5198,8 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
   const forcedFamIds = forcedFamilyIds instanceof Set ? forcedFamilyIds : new Set(forcedFamilyIds || []);
   const originalElements = tokenizeGedcom(originalText);
   const originalNoteMap = buildGedcomNoteMap(originalElements);
-  const generatedNoteIds = findGeneratedFtlsNoteIds(originalElements, originalNoteMap);
+  const generatedNoteIds = findGeneratedFtlsNoteIds(originalElements, originalNoteMap, { preserveLinkNotes: true });
+  const existingFtlsLinkNoteScopes = findFtlsLinkNoteScopes(originalElements, originalNoteMap);
   const generatedNoteScopes = findGeneratedFtlsNoteScopes(originalElements, originalNoteMap);
   const adoptedMediaIds = buildFtlsMediaObjeIdSet(originalElements);
   if (mediaBundle) adoptedMediaIds.forEach(id => { mediaBundle.generatedIds.add(id); mediaBundle.adoptedIds.add(id); });
@@ -5326,7 +5353,8 @@ function buildMergedGedcom(originalText, exportPersons, exportFields, ftlsFamily
       exportMode,
       referenceRaw,
       suppressSameInReference: true,
-      skipFtlsWorksheet: generatedNoteScopes.personIds.has(p.id)
+      skipFtlsWorksheet: generatedNoteScopes.personIds.has(p.id),
+      skipFtlsLinkNote: existingFtlsLinkNoteScopes.personIds.has(p.id)
     });
     if (standalone.length > 0) mergedStandaloneNotes.push(...standalone);
     // Add FAMS/FAMC refs from the family map
