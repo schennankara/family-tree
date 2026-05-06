@@ -35,7 +35,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.7.49-mft-basket-package';
+    const APP_VERSION = 'v4.7.50-mft-cleanup-placement-fix';
     const BUILD_DATE = '2026-05-03';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
@@ -3034,8 +3034,19 @@ function personToDeletionMarkerGedcomLines(person, action = 'delete_person') {
   const isDetach = action === 'detach_relationship';
   const prefix = isDetach ? 'DETACH_ME' : 'DELETE_ME';
   const label = isDetach ? 'DETACH CANDIDATE' : 'DELETE CANDIDATE';
+  const source = person._cleanupSource || 'ftls';
   const L = [`0 ${person.id} INDI`];
-  appendFtlsIdentityFacts(L, 'INDI', person.id);
+  // For external/MFT-only cleanup targets, use the MFT xref as-is so the marker
+  // renames the existing MFT node. Do not add a fake FTLS deep-link for a record
+  // that is not actually an FTLS person.
+  if (source === 'external_mft') {
+    if (person._ftlsRefn) {
+      L.push(`1 REFN ${person._ftlsRefn}`);
+      L.push('2 TYPE FTLS');
+    }
+  } else {
+    appendFtlsIdentityFacts(L, 'INDI', person.id);
+  }
   const np = primaryGedcomNamePartsForPerson(person, prefix);
   L.push(`1 NAME ${np.nameStr}`);
   if (np.given) L.push(`2 GIVN ${np.given}`);
@@ -3043,7 +3054,7 @@ function personToDeletionMarkerGedcomLines(person, action = 'delete_person') {
   if (person.g) L.push(`1 SEX ${person.g}`);
   L.push(`1 NOTE FTLS ${label}`);
   L.push(`2 CONT Original display name: ${np.display}`);
-  L.push(`2 CONT FTLS ID: ${person.id}`);
+  L.push(`2 CONT Target ID: ${person.id}`);
   L.push(`2 CONT Action: ${action}`);
   if (isDetach && person._cleanupFamilyId) L.push(`2 CONT Target family ID: ${person._cleanupFamilyId}`);
   L.push(`2 CONT Instruction: Import this marker GEDCOM into MacFamilyTree, search ${prefix}, review the match, then ${isDetach ? 'detach the incorrect relationship manually' : 'delete this person manually'}.`);
@@ -3086,7 +3097,7 @@ function applyFtlsCleanupPrefixDefense(parsedPerson, sourceEl) {
 }
 
 function mftCleanupRowsToCsv(rows = []) {
-  const header = ['action','ftls_id','original_name','marked_name','sex','reason','target_family_id','instructions'];
+  const header = ['action','source','target_id','original_name','marked_name','sex','reason','target_family_id','instructions'];
   return [csvLine(header), ...rows.map(r => csvLine(header.map(h => r[h] || '')))].join('\n') + '\n';
 }
 
@@ -3110,7 +3121,7 @@ function buildMftCleanupReadme(rows = [], hasAdditions = false) {
     '',
     `Cleanup targets: ${count}`,
     '',
-    ...rows.map((r, i) => `${i + 1}. ${r.original_name} (${r.ftls_id}) → ${r.marked_name} — ${r.instructions}`)
+    ...rows.map((r, i) => `${i + 1}. ${r.original_name} (${r.target_id || r.ftls_id}) → ${r.marked_name} — ${r.instructions}`)
   ].filter(line => line !== '').join('\n') + '\n';
 }
 
@@ -3139,7 +3150,8 @@ async function downloadMftCleanupWorkflowZip({ additionsGedcom = '', cleanupEntr
     const original = p.dn || [p.fn, p.mn, p.ln].filter(Boolean).join(' ') || p.id;
     return {
       action: entry.action || 'delete_person',
-      ftls_id: p.id || '',
+      source: entry.source || p._cleanupSource || 'ftls',
+      target_id: p.id || '',
       original_name: original,
       marked_name: np.nameStr.replace(/\//g, '').replace(/\s+/g, ' ').trim(),
       sex: p.g || '',
@@ -5175,6 +5187,8 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, 
   const exportMode = options.exportMode || 'hydrate';
   const extIds = extFamilyIds || new Set();
   const forcedFamIds = forcedFamilyIds instanceof Set ? forcedFamilyIds : new Set(forcedFamilyIds || []);
+  const placementFamilyByPersonId = options.placementFamilyByPersonId || {};
+  Object.values(placementFamilyByPersonId || {}).filter(Boolean).forEach(fid => forcedFamIds.add(fid));
   const extFams = extFamiliesMap || {};
   const personIds = new Set(persons.map(p => p.id));
   const pMap = {};
@@ -5222,11 +5236,13 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, 
   for (const [pid, person] of Object.entries(pMap)) {
     if (exportedPersons.has(pid)) continue;
     exportedPersons.add(pid);
-    const { indi: L, standalone } = personToGedcomLines(person, { fams: famsLookup[pid] || [], famc: famcLookup[pid] || [], exportMode });
+    const personFams = [...new Set(famsLookup[pid] || [])];
+    const personFamc = [...new Set([...(famcLookup[pid] || []), ...(placementFamilyByPersonId[pid] ? [placementFamilyByPersonId[pid]] : [])])];
+    const { indi: L, standalone } = personToGedcomLines(person, { fams: personFams, famc: personFamc, exportMode });
     if (standalone.length > 0) diffStandaloneNotes.push(...standalone);
-    // FAMS/FAMC from FULL family map
-    (famsLookup[pid] || []).forEach(ref => L.push(`1 FAMS ${ref}`));
-    (famcLookup[pid] || []).forEach(ref => L.push(`1 FAMC ${ref}`));
+    // FAMS/FAMC from the bounded diff plan, plus explicit placement family when selected.
+    personFams.forEach(ref => L.push(`1 FAMS ${ref}`));
+    personFamc.forEach(ref => L.push(`1 FAMC ${ref}`));
     appendFtlsMediaRefs(L, 'INDI', pid, mediaBundle, person._xg || '');
     const personXg = person._xg || '';
     // Preserved extra GEDCOM lines
@@ -5240,13 +5256,20 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, 
   for (const pid of personIds) {
     (famcLookup[pid] || []).forEach(fid => referencedFamIds.add(fid));
     (famsLookup[pid] || []).forEach(fid => referencedFamIds.add(fid));
+    if (placementFamilyByPersonId[pid]) referencedFamIds.add(placementFamilyByPersonId[pid]);
   }
 
   // FAM records — include if: (1) new family, (2) children changed, OR (3) referenced by an exported person
   for (const [fid, fam] of Object.entries(ftlsFamilyMap)) {
     const hid = fam.husband_id || fam.husb || '';
     const wid = fam.wife_id || fam.wife || '';
-    const kids = fam.children || [];
+    const kids = [...(fam.children || [])];
+    // Explicit placement: when an FTLS-only person is exported as a child of this
+    // family, include the person in CHIL even if the current familyMap did not
+    // already have that child. This is the TeBow-class orphan prevention fix.
+    for (const [pid, targetFamId] of Object.entries(placementFamilyByPersonId || {})) {
+      if (targetFamId === fid && !kids.includes(pid)) kids.push(pid);
+    }
     const involvesOur = personIds.has(hid) || personIds.has(wid) || kids.some(k => personIds.has(k));
     const referencedByExport = referencedFamIds.has(fid);
     const forceFamilyExport = forcedFamIds.has(fid);
@@ -8612,6 +8635,9 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
   const [extDir, setExtDir] = useState({});
   // ftlsDir: { personId: 'export'|null } for ftls-only persons
   const [ftlsDir, setFtlsDir] = useState({});
+  // ftlsPlacementFam: optional target parent FAM for FTLS-only people being exported to MFT.
+  // This prevents selected FTLS-only children from importing into MFT as orphans.
+  const [ftlsPlacementFam, setFtlsPlacementFam] = useState({});
   // changedDir: { personId: 'import'|'export'|null } person-level default
   const [changedDir, setChangedDir] = useState({});
   // fieldDir: { personId: { fieldKey: 'import'|'export'|null } } per-field override
@@ -8671,7 +8697,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
           setDiffResult(result);
           setTab('summary');
           // Reset all directions
-          setExtDir({}); setFtlsDir({}); setChangedDir({}); setFieldDir({}); setExtFamDir({}); setFamilyFactDir({});
+          setExtDir({}); setFtlsDir({}); setFtlsPlacementFam({}); setChangedDir({}); setFieldDir({}); setExtFamDir({}); setFamilyFactDir({});
           setExpandedDiffs(new Set()); setMergeLog([]); setWorklistRows([]);
           setFuzzyResolved({}); setFuzzyFamResolved({});
           setFollowOnMatches([]); setFollowOnResolved({});
@@ -9006,6 +9032,29 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
     });
   };
 
+
+  function inferFtlsParentFamilyId(personId) {
+    for (const [fid, fam] of Object.entries(familyMap || {})) {
+      if ((fam.children || []).includes(personId)) return fid;
+    }
+    return '';
+  }
+
+  function familyDisplayLabel(fid) {
+    const fam = familyMap?.[fid];
+    if (!fam) return fid;
+    const h = fam.husband_id || fam.husb || '';
+    const w = fam.wife_id || fam.wife || '';
+    const hName = h && personMap[h] ? (personMap[h].dn || personMap[h].fn || h) : h;
+    const wName = w && personMap[w] ? (personMap[w].dn || personMap[w].fn || w) : w;
+    const couple = [hName, wName].filter(Boolean).join(' + ') || fid;
+    return `${couple} (${fid})`;
+  }
+
+  const sortedFtlsFamiliesForPlacement = useMemo(() => {
+    return Object.keys(familyMap || {}).sort((a, b) => familyDisplayLabel(a).localeCompare(familyDisplayLabel(b)));
+  }, [familyMap, personMap]);
+
   // ── Family breadcrumb helpers ──
   // Build "Father & Mother → Spouse, children: A, B, C" string for a person
   // Build lineage path: walk up through parent families to root
@@ -9148,14 +9197,22 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
     const importFams = [];
     const familyFactImports = [];
 
-    // Ext-only persons marked for import
-    diffResult.extOnly.forEach(p => { if (extDir[p.id] === 'import') imports.push({ type: 'ext_person', person: p }); });
+    // Ext-only persons marked for import or MFT cleanup. Cleanup acts on the
+    // external/MFT-side xref, not an FTLS-only person.
+    diffResult.extOnly.forEach(p => {
+      if (extDir[p.id] === 'import') imports.push({ type: 'ext_person', person: p });
+      else if (extDir[p.id] === 'cleanup') cleanup.push({ type: 'mft_cleanup', action: 'delete_person', source: 'external_mft', person: { ...p, _cleanupSource: 'external_mft' } });
+    });
     // Ext-only families marked for import
     diffResult.familyDiffs.filter(f => f.type === 'ext_only').forEach(f => { if (extFamDir[f.id] === 'import') importFams.push(f.ext); });
-    // FTLS-only persons marked for export or manual MFT cleanup
+    // FTLS-only persons can only be exported/added to MFT. They do not exist in
+    // the compared MFT GEDCOM, so a cleanup marker would create a DELETE_ME orphan.
     diffResult.ftlsOnly.forEach(p => {
-      if (ftlsDir[p.id] === 'export') exports.push({ type: 'ftls_person', person: p });
-      else if (ftlsDir[p.id] === 'cleanup') cleanup.push({ type: 'mft_cleanup', action: 'delete_person', person: p });
+      if (ftlsDir[p.id] === 'export') {
+        const inferredParent = inferFtlsParentFamilyId(p.id);
+        const targetFamilyId = ftlsPlacementFam[p.id] || inferredParent || '';
+        exports.push({ type: 'ftls_person', person: p, targetFamilyId });
+      }
     });
 
     // Changed persons — split fields by direction
@@ -9201,7 +9258,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
     });
 
     return { imports, exports, cleanup, importFams, orphanFams, familyFactImports };
-  }, [diffResult, extDir, ftlsDir, changedDir, fieldDir, extFamDir, familyFactDir, personMap]);
+  }, [diffResult, extDir, ftlsDir, ftlsPlacementFam, changedDir, fieldDir, extFamDir, familyFactDir, personMap, familyMap]);
 
   const orphanFamilyCandidates = useMemo(() => {
     return basket.orphanFams.map(fam => {
@@ -9334,7 +9391,12 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
       if (!persons.find(p => p.id === e.person.id)) persons.push(e.person);
     });
     const forcedFamilyIds = new Set(basket.exports.filter(e => e.type === 'family_facts').map(e => e.familyId));
-    return { persons, forcedFamilyIds };
+    const placementFamilyByPersonId = {};
+    basket.exports.filter(e => e.type === 'ftls_person' && e.targetFamilyId).forEach(e => {
+      placementFamilyByPersonId[e.person.id] = e.targetFamilyId;
+      forcedFamilyIds.add(e.targetFamilyId);
+    });
+    return { persons, forcedFamilyIds, placementFamilyByPersonId };
   };
 
   const confirmCleanupWorkflow = (cleanupEntries) => {
@@ -9351,7 +9413,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
 
   // ── BATCH EXPORT (ZIP with images when needed) ──
   const batchExportGedcom = async () => {
-    const { persons, forcedFamilyIds } = buildExportPersonListAndForcedFamilies();
+    const { persons, forcedFamilyIds, placementFamilyByPersonId } = buildExportPersonListAndForcedFamilies();
     const cleanupEntries = basket.cleanup || [];
     if (persons.length === 0 && forcedFamilyIds.size === 0 && cleanupEntries.length === 0) { alert('No items to export.'); return; }
     if (cleanupEntries.length > 0 && !confirmCleanupWorkflow(cleanupEntries)) return;
@@ -9361,7 +9423,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
     try { mediaRecords = await sbFetch('media?select=*'); } catch(e) { console.warn('Could not load media for GEDCOM export:', e); }
     const mediaBundle = buildFtlsMediaGedcomBundle(mediaRecords || [], personMap || {}, familyMap || {});
     const content = (persons.length > 0 || forcedFamilyIds.size > 0)
-      ? exportDiffGedcom(persons, familyMap, extFamilyIds, extFamiliesMap, personMap, forcedFamilyIds, mediaBundle, { exportMode })
+      ? exportDiffGedcom(persons, familyMap, extFamilyIds, extFamiliesMap, personMap, forcedFamilyIds, mediaBundle, { exportMode, placementFamilyByPersonId })
       : '';
     if (cleanupEntries.length > 0) {
       const result = await downloadMftCleanupWorkflowZip({ additionsGedcom: content, cleanupEntries, mediaBundle, baseFileName: 'FTLS_MFT_Cleanup_Workflow' });
@@ -9374,13 +9436,13 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
 
   // ── BATCH EXPORT (GEDCOM only, no auto-generated image ZIP unless cleanup workflow requires ZIP) ──
   const batchExportGedcomOnly = async () => {
-    const { persons, forcedFamilyIds } = buildExportPersonListAndForcedFamilies();
+    const { persons, forcedFamilyIds, placementFamilyByPersonId } = buildExportPersonListAndForcedFamilies();
     const cleanupEntries = basket.cleanup || [];
     if (persons.length === 0 && forcedFamilyIds.size === 0 && cleanupEntries.length === 0) { alert('No items to export.'); return; }
     if (cleanupEntries.length > 0 && !confirmCleanupWorkflow(cleanupEntries)) return;
     try { window.gedcomMetaRecords = await sbFetch('gedcom_meta?select=*'); } catch(e) { window.gedcomMetaRecords = []; }
     const content = (persons.length > 0 || forcedFamilyIds.size > 0)
-      ? exportDiffGedcom(persons, familyMap, extFamilyIds, extFamiliesMap, personMap, forcedFamilyIds, null, { exportMode })
+      ? exportDiffGedcom(persons, familyMap, extFamilyIds, extFamiliesMap, personMap, forcedFamilyIds, null, { exportMode, placementFamilyByPersonId })
       : '';
     if (cleanupEntries.length > 0) {
       const result = await downloadMftCleanupWorkflowZip({ additionsGedcom: content, cleanupEntries, mediaBundle: null, baseFileName: 'FTLS_MFT_Cleanup_Workflow' });
@@ -9654,7 +9716,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
               // ── Render: FTLS-only person row ──
               const renderFtlsRow = (p) => (<div key={p.id} style={{ ...rowSt }}>
                 <div style={{ display:'flex', alignItems:'center', gap:8 }}>
-                  <DirBtn dir={ftlsDir[p.id]||null} onSet={(d)=>setFtlsDir(prev=>({...prev,[p.id]:d}))} allowImport={false} allowCleanup={true} />
+                  <DirBtn dir={ftlsDir[p.id]||null} onSet={(d)=>setFtlsDir(prev=>({...prev,[p.id]:d}))} allowImport={false} />
                   <span style={{ width:8, height:8, borderRadius:'50%', background:p.g==='M'?MC:FC, flexShrink:0 }} />
                   <span style={{ color:TX, flex:1 }}>{p.dn||'(Unknown)'}</span>
                   {p.dob && <span style={{ color:DM, fontSize:11 }}>b.{p.dob}</span>}
@@ -9897,6 +9959,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
               const clearAll = () => { setExtDir({}); setExtFamDir({}); };
               
               const markedCount = Object.values(extDir).filter(v=>v==='import').length;
+              const cleanupCount = Object.values(extDir).filter(v=>v==='cleanup').length;
               const neededFams = getNeededFamilies();
               
               return (<div style={{ padding:'12px 0' }}>
@@ -9907,14 +9970,14 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
                   <div style={selBar}>
                     <button style={lnkBtn} onClick={markAllConnected}>⬇ All Import</button>
                     <button style={lnkBtn} onClick={clearAll}>Clear All</button>
-                    <span style={{ fontSize:11, color:DM }}>{markedCount} marked</span>
+                    <span style={{ fontSize:11, color:DM }}>{markedCount} import · {cleanupCount} cleanup</span>
                   </div>
                   {connected.map(p => {
                     const conn = isConnected(p);
                     const role = getRole(p);
                     return (<div key={p.id} style={{ ...rowSt }}>
                       <div style={{ display:'flex', alignItems:'center', gap:8 }}>
-                        <DirBtn dir={extDir[p.id]||null} onSet={(d)=>markPerson(p.id, d)} allowExport={false} />
+                        <DirBtn dir={extDir[p.id]||null} onSet={(d)=>markPerson(p.id, d)} allowExport={false} allowCleanup={true} />
                         <span style={{ width:8, height:8, borderRadius:'50%', background:p.g==='M'?MC:FC, flexShrink:0 }} />
                         <span style={{ color:TX, flex:1 }}>
                           {p.dn||'(Unknown)'}
@@ -9935,7 +9998,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
                     const role = getRole(p);
                     return (<div key={p.id} style={{ ...rowSt }}>
                       <div style={{ display:'flex', alignItems:'center', gap:8 }}>
-                        <DirBtn dir={extDir[p.id]||null} onSet={(d)=>markPerson(p.id, d)} allowExport={false} />
+                        <DirBtn dir={extDir[p.id]||null} onSet={(d)=>markPerson(p.id, d)} allowExport={false} allowCleanup={true} />
                         <span style={{ width:8, height:8, borderRadius:'50%', background:p.g==='M'?MC:FC, flexShrink:0 }} />
                         <span style={{ color:'#7a7568', flex:1 }}>
                           {p.dn||'(Unknown)'}
@@ -9971,7 +10034,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
             {tab==='ftls_only' && (()=>{
               const persons = diffResult.ftlsOnly;
               return (<div style={{ padding:'12px 0' }}>
-                <div style={{ fontSize:12, color:DM, marginBottom:8 }}>Mark for export to include in GEDCOM for Rolson/Abey.</div>
+                <div style={{ fontSize:12, color:DM, marginBottom:8 }}>These people exist in FTLS but were not found in the compared MFT GEDCOM. Choose Export to add/update them in MFT. If they should attach to an existing parent family, select that family before exporting.</div>
                 <div style={selBar}>
                   <button style={lnkBtn} onClick={()=>{ const d={}; persons.forEach(p=>{d[p.id]='export'}); setFtlsDir(d); }}>⬆ All Export</button>
                   <button style={lnkBtn} onClick={()=>setFtlsDir({})}>Clear All</button>
@@ -9979,13 +10042,26 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
                 </div>
                 {persons.map(p => (<div key={p.id} style={{ ...rowSt }}>
                   <div style={{ display:'flex', alignItems:'center', gap:8 }}>
-                    <DirBtn dir={ftlsDir[p.id]||null} onSet={(d)=>setFtlsDir(prev=>({...prev,[p.id]:d}))} allowImport={false} allowCleanup={true} />
+                    <DirBtn dir={ftlsDir[p.id]||null} onSet={(d)=>setFtlsDir(prev=>({...prev,[p.id]:d}))} allowImport={false} />
                     <span style={{ width:8, height:8, borderRadius:'50%', background:p.g==='M'?MC:FC, flexShrink:0 }} />
                     <span style={{ color:TX, flex:1 }}>{p.dn||'(Unknown)'}</span>
                     {p.dob && <span style={{ color:DM, fontSize:11 }}>b.{p.dob}</span>}
                     <span style={{ color:'#5a5548', fontSize:10 }}>{p.id}</span>
                   </div>
                   <FamilyPath personId={p.id} showFtls={true} showExt={false} />
+                  {ftlsDir[p.id] === 'export' && (() => {
+                    const inferred = inferFtlsParentFamilyId(p.id);
+                    const value = ftlsPlacementFam[p.id] || inferred || '';
+                    return <div style={{ marginTop:6, paddingLeft:86, display:'flex', alignItems:'center', gap:6 }}>
+                      <span style={{ fontSize:10, color:DM }}>Parent family in MFT:</span>
+                      <select value={value} onChange={(e)=>setFtlsPlacementFam(prev=>({...prev,[p.id]:e.target.value}))}
+                        style={{ maxWidth:420, fontSize:11, padding:'3px 6px', borderRadius:4, border:'1px solid '+BR }}>
+                        <option value="">Standalone / no parent family</option>
+                        {sortedFtlsFamiliesForPlacement.map(fid => <option key={fid} value={fid}>{familyDisplayLabel(fid)}</option>)}
+                      </select>
+                      {!value && <span style={{ fontSize:10, color:'#c05050' }}>will import as orphan</span>}
+                    </div>;
+                  })()}
                 </div>))}
               </div>);
             })()}
@@ -10486,7 +10562,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
                 <div style={{ textAlign:'center', padding:'40px 20px', color:DM }}>
                   <div style={{ fontSize:36, marginBottom:12 }}>🧺</div>
                   <div style={{ fontSize:14 }}>Basket is empty</div>
-                  <div style={{ fontSize:12, marginTop:8 }}>Go to Changed, External Only, or FTLS Only tabs and mark items for Import or Export.</div>
+                  <div style={{ fontSize:12, marginTop:8 }}>Go to Changed, External Only, or FTLS Only tabs and mark items for Import, Export/Add to MFT, or MFT cleanup where available.</div>
                 </div>
               ) : (<>
                 {/* ORPHAN FAMILY REPAIR — shown automatically, no selection needed */}
