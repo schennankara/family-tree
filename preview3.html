@@ -35,7 +35,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.7.53-diff-self-compare-fix';
+    const APP_VERSION = 'v4.7.54-diff-noise-suppression';
     const BUILD_DATE = '2026-05-03';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
@@ -460,6 +460,50 @@ function normalizeLooseGedcomTextForDiff(v) {
     .replace(/\r/g, '\n')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+
+function normalizeDiffBlankPlaceholders(key, value) {
+  const s = normalizeLooseGedcomTextForDiff(value);
+  if (!s) return '';
+  // FTLS often stores unknown given names as blank, while GEDCOM/MFT can round-trip
+  // the generated placeholder "(Unknown)" as a parsed given name. Treat that as
+  // blank for component-name comparison so self-diff does not create noise.
+  if (['fn','mn','ln','nk','md','tp','sx'].includes(key) && /^\(?unknown\)?$/i.test(s)) return '';
+  return s;
+}
+
+function addressDiffTokenSet(person) {
+  const fields = [person?.a1, person?.a2, person?.ci, person?.st, person?.zp, person?.co];
+  const tokens = [];
+  for (const raw of fields) {
+    const v = normalizeLooseGedcomTextForDiff(raw);
+    if (!v) continue;
+    v.split(',').map(x => x.trim()).filter(Boolean).forEach(part => {
+      const norm = part
+        .replace(/\bU\.?S\.?A\.?\b/ig, 'USA')
+        .replace(/\bUnited States\b/ig, 'USA')
+        .replace(/\s+/g, ' ')
+        .replace(/[.;]+$/g, '')
+        .trim()
+        .toLowerCase();
+      if (norm) tokens.push(norm);
+    });
+  }
+  return new Set(tokens);
+}
+
+function addressTokenSetsEquivalent(left, right) {
+  const a = addressDiffTokenSet(left);
+  const b = addressDiffTokenSet(right);
+  if (a.size === 0 && b.size === 0) return true;
+  if (a.size === 0 || b.size === 0) return false;
+  // For self-diff and MFT round-trips, the same address can be decomposed into
+  // different FTLS fields (city/county/address2/state swaps). If the meaningful
+  // address tokens match as a set, suppress individual address component diffs.
+  for (const x of a) if (!b.has(x)) return false;
+  for (const x of b) if (!a.has(x)) return false;
+  return true;
 }
 
 function normalizeGedcomNamePart(v) {
@@ -3685,6 +3729,8 @@ const PERSON_VISIBLE_DIFF_FIELDS = PERSON_DIFF_FIELDS.filter(([key]) => key !== 
 
 function diffPersonFields(left, right, fields=PERSON_DIFF_FIELDS) {
   const diffs = [];
+  const ADDRESS_DIFF_KEYS = new Set(['a1','a2','ci','st','co','zp']);
+  const suppressAddressComponentNoise = addressTokenSetsEquivalent(left, right);
   const isMeaningfulBirthOrder = (v) => {
     if (v === null || v === undefined) return false;
     const s = String(v).trim();
@@ -3712,9 +3758,13 @@ function diffPersonFields(left, right, fields=PERSON_DIFF_FIELDS) {
         .trim();
     }
     if (typeof value === 'boolean') return String(value);
-    return normalizeLooseGedcomTextForDiff(value);
+    return normalizeDiffBlankPlaceholders(key, value);
   };
   for (const [key, label] of fields) {
+    // MFT/FTLS can round-trip a single RESI value into different address
+    // component fields. If the full address token set is equivalent, suppress
+    // noisy Address2/City/State/etc. component diffs.
+    if (suppressAddressComponentNoise && ADDRESS_DIFF_KEYS.has(key)) continue;
     const leftVal = left?.[key];
     const rightVal = right?.[key];
     const leftNorm = normalizeForDiff(key, leftVal);
