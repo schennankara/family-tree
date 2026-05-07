@@ -35,7 +35,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.7.52-autoplacement-dedupe';
+    const APP_VERSION = 'v4.7.53-diff-self-compare-fix';
     const BUILD_DATE = '2026-05-03';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
@@ -452,6 +452,18 @@ function tokenizeGedcom(text) {
 */
 function normalizedValue(v) {
   return (v == null ? '' : String(v)).trim();
+}
+
+function normalizeLooseGedcomTextForDiff(v) {
+  return (v == null ? '' : String(v))
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function normalizeGedcomNamePart(v) {
+  return normalizeLooseGedcomTextForDiff(v).replace(/\s+\//g, '/').replace(/\/\s+/g, '/');
 }
 
 function normalizeMarriagePlaceText(value) {
@@ -2240,10 +2252,10 @@ async function migrateGedcomToSupabase(gedcomText, onProgress) {
             // on whitespace — that fabricates structure that isn't in the data
             // and produces fn="T", mn="O" for inputs like "T O Jacob".
             // Middle name comes from SECG (set below); never invent it from GIVN.
-            fn = givnEl.value.replace(/^\d+\.\s*/, '');
+            fn = normalizeGedcomNamePart(givnEl.value.replace(/^\d+\.\s*/, ''));
           }
-          if (surnEl) ln = surnEl.value;
-          if (secgEl && !mn) mn = secgEl.value;
+          if (surnEl) ln = normalizeGedcomNamePart(surnEl.value);
+          if (secgEl && !mn) mn = normalizeGedcomNamePart(secgEl.value);
           if (!fn && !ln) {
             const nv = nameEl.value.replace(/^\d+\.\s*/,'');
             const sm = nv.match(/^(.*?)\/([^\/]*)\//);
@@ -3700,7 +3712,7 @@ function diffPersonFields(left, right, fields=PERSON_DIFF_FIELDS) {
         .trim();
     }
     if (typeof value === 'boolean') return String(value);
-    return (value ?? '').toString().trim();
+    return normalizeLooseGedcomTextForDiff(value);
   };
   for (const [key, label] of fields) {
     const leftVal = left?.[key];
@@ -4436,8 +4448,9 @@ function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap)
       const diffs = [];
       if ((extFam.husb||'') !== (ftlsFam.husband_id||ftlsFam.husb||'')) diffs.push({ field:'husband', label:'Husband', ext:extFam.husb, ftls:ftlsFam.husband_id||ftlsFam.husb });
       if ((extFam.wife||'') !== (ftlsFam.wife_id||ftlsFam.wife||'')) diffs.push({ field:'wife', label:'Wife', ext:extFam.wife, ftls:ftlsFam.wife_id||ftlsFam.wife });
-      const extKids = (extFam.children||[]).sort().join(',');
-      const ftlsKids = (ftlsFam.children||[]).sort().join(',');
+      const normChildSet = (kids) => [...new Set(kids || [])].map(x => String(x || '').trim()).filter(Boolean).sort().join(',');
+      const extKids = normChildSet(extFam.children);
+      const ftlsKids = normChildSet(ftlsFam.children);
       if (extKids !== ftlsKids) diffs.push({ field:'children', label:'Children', ext:extFam.children, ftls:ftlsFam.children });
       const extMdate = normalizedValue(extFam.mdate || extFam.marriage_date || '');
       const ftlsMdate = normalizedValue(ftlsFam.marriage_date || ftlsFam.mdate || '');
@@ -5743,9 +5756,9 @@ function parseIndi(el, noteMap = {}, ftlsMediaObjeIds = new Set()) {
       // // delimiter (e.g. "Baby //" → "Baby" not "Baby "). The space before //
       // is GEDCOM syntactic delimiter, not user data. Internal whitespace is
       // still preserved.
-      nk = nameEl.value.replace(/\s*\/\/\s*$/, '').replace(/\//g, '');
+      nk = normalizeGedcomNamePart(nameEl.value.replace(/\s*\/\/\s*$/, '').replace(/\//g, ''));
     } else if (type === 'birth') {
-      md = nameEl.value.replace(/\s*\/\/\s*$/, '').replace(/\//g, '');
+      md = normalizeGedcomNamePart(nameEl.value.replace(/\s*\/\/\s*$/, '').replace(/\//g, ''));
     } else if (type === 'married') {
       // Skip married-name-only entries (the "George married to George" issue)
       continue;
@@ -5763,10 +5776,10 @@ function parseIndi(el, noteMap = {}, ftlsMediaObjeIds = new Set()) {
         // Strip leading birth-order number prefix like "4. Samuel" → "Samuel"
         const boMatch = givnEl.value.match(/^(\d+)\.\s*/);
         if (boMatch) parsedBirthOrder = parseInt(boMatch[1]);
-        fn = givnEl.value.replace(/^\d+\.\s*/, '');
+        fn = normalizeGedcomNamePart(givnEl.value.replace(/^\d+\.\s*/, ''));
       }
-      if (surnEl) ln = surnEl.value;
-      if (secgEl && !mn) mn = secgEl.value;
+      if (surnEl) ln = normalizeGedcomNamePart(surnEl.value);
+      if (secgEl && !mn) mn = normalizeGedcomNamePart(secgEl.value);
       
       // Extract middle name from NAME string: compare given portion with fn
       // NAME "Steve S /Chennankara/" → givenPart="Steve S", fn="Steve" → mn="S"
@@ -5790,13 +5803,13 @@ function parseIndi(el, noteMap = {}, ftlsMediaObjeIds = new Set()) {
         if (slashMatch) {
           const givenPart = slashMatch[1].trim();  // used internally for split, OK to trim
           // FAITHFUL: preserve whitespace on the stored surname itself.
-          ln = slashMatch[2];
+          ln = normalizeGedcomNamePart(slashMatch[2]);
           const gParts = givenPart.split(' ');
           fn = gParts[0] || '';
-          if (gParts.length > 1) mn = gParts.slice(1).join(' ');
+          if (gParts.length > 1) mn = normalizeGedcomNamePart(gParts.slice(1).join(' '));
         } else {
           // FAITHFUL: preserve whitespace; slashes are GEDCOM syntax only.
-          fn = nameVal.replace(/\//g, '');
+          fn = normalizeGedcomNamePart(nameVal.replace(/\//g, ''));
         }
       }
     }
