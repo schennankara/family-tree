@@ -35,7 +35,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.7.54-diff-noise-suppression';
+    const APP_VERSION = 'v4.7.56-stable-diff-export-fix';
     const BUILD_DATE = '2026-05-03';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
@@ -464,13 +464,32 @@ function normalizeLooseGedcomTextForDiff(v) {
 
 
 function normalizeDiffBlankPlaceholders(key, value) {
-  const s = normalizeLooseGedcomTextForDiff(value);
+  let s = normalizeLooseGedcomTextForDiff(value);
   if (!s) return '';
   // FTLS often stores unknown given names as blank, while GEDCOM/MFT can round-trip
   // the generated placeholder "(Unknown)" as a parsed given name. Treat that as
   // blank for component-name comparison so self-diff does not create noise.
   if (['fn','mn','ln','nk','md','tp','sx'].includes(key) && /^\(?unknown\)?$/i.test(s)) return '';
+
+  // MFT frequently appends postal codes to a place component such as
+  // "Kerala 689667" or "Coimbatore 641028". For component-level comparison,
+  // strip the trailing postal code from city/state/country buckets; the ZIP code
+  // itself is still represented by zp when present. This prevents self-diff noise
+  // without changing stored/exported values.
+  if (['ci','st','co'].includes(key)) {
+    s = s.replace(/\s+\d{5,6}(?:-\d{4})?$/g, '').trim();
+  }
   return s;
+}
+
+function normalizeAddressToken(value) {
+  return normalizeLooseGedcomTextForDiff(value)
+    .replace(/\bU\.?S\.?A\.?\b/ig, 'USA')
+    .replace(/\bUnited States(?: of America)?\b/ig, 'USA')
+    .replace(/[.;:]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
 }
 
 function addressDiffTokenSet(person) {
@@ -479,16 +498,15 @@ function addressDiffTokenSet(person) {
   for (const raw of fields) {
     const v = normalizeLooseGedcomTextForDiff(raw);
     if (!v) continue;
-    v.split(',').map(x => x.trim()).filter(Boolean).forEach(part => {
-      const norm = part
-        .replace(/\bU\.?S\.?A\.?\b/ig, 'USA')
-        .replace(/\bUnited States\b/ig, 'USA')
-        .replace(/\s+/g, ' ')
-        .replace(/[.;]+$/g, '')
-        .trim()
-        .toLowerCase();
-      if (norm) tokens.push(norm);
-    });
+    // Split on commas AND whitespace so "2600 Independence Road" matches the
+    // same tokens even if MFT shifted it from Address to State or PLAC.
+    const parts = v
+      .replace(/\bU\.?S\.?A\.?\b/ig, 'USA')
+      .replace(/\bUnited States(?: of America)?\b/ig, 'USA')
+      .split(/[\s,]+/)
+      .map(x => normalizeAddressToken(x))
+      .filter(Boolean);
+    for (const part of parts) tokens.push(part);
   }
   return new Set(tokens);
 }
@@ -498,12 +516,29 @@ function addressTokenSetsEquivalent(left, right) {
   const b = addressDiffTokenSet(right);
   if (a.size === 0 && b.size === 0) return true;
   if (a.size === 0 || b.size === 0) return false;
-  // For self-diff and MFT round-trips, the same address can be decomposed into
-  // different FTLS fields (city/county/address2/state swaps). If the meaningful
-  // address tokens match as a set, suppress individual address component diffs.
-  for (const x of a) if (!b.has(x)) return false;
-  for (const x of b) if (!a.has(x)) return false;
-  return true;
+
+  const intersection = [...a].filter(x => b.has(x)).length;
+  const union = new Set([...a, ...b]).size;
+  const jaccard = union ? intersection / union : 0;
+
+  // Exact token equality is the self-diff ideal.
+  let exact = true;
+  for (const x of a) if (!b.has(x)) exact = false;
+  for (const x of b) if (!a.has(x)) exact = false;
+  if (exact) return true;
+
+  // MFT sometimes adds/drops one administrative token or moves a postal code into
+  // a state/place token. Suppress component diffs when the address token overlap
+  // is very high. True different addresses still surface as a compound mismatch.
+  if (Math.min(a.size, b.size) >= 3 && jaccard >= 0.80) return true;
+  return false;
+}
+
+function compoundAddressString(person) {
+  return [person?.a1, person?.a2, person?.ci, person?.st, person?.zp, person?.co]
+    .map(v => normalizeLooseGedcomTextForDiff(v))
+    .filter(Boolean)
+    .join(', ');
 }
 
 function normalizeGedcomNamePart(v) {
@@ -4210,13 +4245,16 @@ function computeGedcomDiff(extPeople, extFamilies, ftlsPersonMap, ftlsFamilyMap)
   // Uses fuzzy person identity so parent-family diffs don't light up just because IDs drifted.
   function sameParentFamily(ftlsParent, extParent) {
     if (!ftlsParent && !extParent) return true;
-    // If one side has no parent family, that's missing data — not a conflict.
-    // A partial GEDCOM import won't include every ancestor's parent family
-    // (e.g. importing Luca Joy under his mother Alexa won't necessarily include
-    // Alexa's own parents). Treating that as "different parents" generates
-    // false-alarm diffs in the Changed Fields tab. Real conflicts (both sides
-    // specify a family AND they differ) are still caught below.
-    if (!ftlsParent || !extParent) return true;
+
+    // v4.7.56: Be conservative and visible. If the same person exists on both
+    // sides but one side has a parent family and the other side does not, that is
+    // a placement difference, not something to hide as "partial GEDCOM" noise.
+    // This gives the correct three-way behavior:
+    //   external lacks person entirely -> FTLS Only
+    //   external has person but no/wrong FAMC -> Changed / Parent Family
+    //   external has person and correct FAMC -> no diff
+    if (!!ftlsParent !== !!extParent) return false;
+
     if (ftlsParent.familyId === extParent.familyId) return true;
     const hMatch = personsEquivalent(ftlsParent.husband, extParent.husband);
     const wMatch = personsEquivalent(ftlsParent.wife, extParent.wife);
