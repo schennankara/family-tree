@@ -35,7 +35,7 @@
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const APP_VERSION = 'v4.7.50-mft-cleanup-placement-fix';
+    const APP_VERSION = 'v4.7.52-autoplacement-dedupe';
     const BUILD_DATE = '2026-05-03';
     const { useState, useCallback, useMemo, useRef, useEffect } = React;
 
@@ -5216,6 +5216,31 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, 
     if (wid) { if (!famsLookup[wid]) famsLookup[wid] = []; famsLookup[wid].push(fid); }
   }
 
+  // Bounded diff-export relationship plan.
+  // If a basket person has an explicit placement target, only that parent-family
+  // is emitted for FAMC. This prevents a TeBow/Luca-class export from dragging
+  // every other parent family where the same person appears in FTLS.
+  const plannedFamsByPersonId = {};
+  const plannedFamcByPersonId = {};
+  const plannedReferencedFamIds = new Set(forcedFamIds);
+  const getPlannedFams = (pid) => plannedFamsByPersonId[pid] || [];
+  const getPlannedFamc = (pid) => plannedFamcByPersonId[pid] || [];
+  for (const pid of personIds) {
+    const explicitPlacement = placementFamilyByPersonId[pid] || '';
+    // Diff basket export is bounded: person records should only carry
+    // relationships to families intentionally emitted in this package. This
+    // prevents exporting one selected person from dragging in every spouse/parent
+    // family they have in the full FTLS database.
+    const fams = [...new Set(famsLookup[pid] || [])].filter(fid => forcedFamIds.has(fid));
+    const famc = explicitPlacement
+      ? [explicitPlacement]
+      : [...new Set(famcLookup[pid] || [])].filter(fid => forcedFamIds.has(fid));
+    plannedFamsByPersonId[pid] = fams;
+    plannedFamcByPersonId[pid] = famc;
+    fams.forEach(fid => plannedReferencedFamIds.add(fid));
+    famc.forEach(fid => plannedReferencedFamIds.add(fid));
+  }
+
   function gedcomDate() {
     const d = new Date();
     const months = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
@@ -5231,13 +5256,13 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, 
     '1 CHAR UTF-8','1 GEDC','2 VERS 5.5.1','2 FORM LINEAGE-LINKED','1 SUBM @SUBM1@',
     '0 @SUBM1@ SUBM','1 NAME FTLS Export');
 
-  // INDI records — for each person, include FAMC/FAMS from ALL families
+  // INDI records — for each basket person, include only the bounded relationship refs planned for this export
   const diffStandaloneNotes = [];
   for (const [pid, person] of Object.entries(pMap)) {
     if (exportedPersons.has(pid)) continue;
     exportedPersons.add(pid);
-    const personFams = [...new Set(famsLookup[pid] || [])];
-    const personFamc = [...new Set([...(famcLookup[pid] || []), ...(placementFamilyByPersonId[pid] ? [placementFamilyByPersonId[pid]] : [])])];
+    const personFams = getPlannedFams(pid);
+    const personFamc = getPlannedFamc(pid);
     const { indi: L, standalone } = personToGedcomLines(person, { fams: personFams, famc: personFamc, exportMode });
     if (standalone.length > 0) diffStandaloneNotes.push(...standalone);
     // FAMS/FAMC from the bounded diff plan, plus explicit placement family when selected.
@@ -5251,15 +5276,12 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, 
     lines.push(...L);
   }
 
-  // Collect all family IDs referenced by exported persons (FAMC + FAMS)
-  const referencedFamIds = new Set();
-  for (const pid of personIds) {
-    (famcLookup[pid] || []).forEach(fid => referencedFamIds.add(fid));
-    (famsLookup[pid] || []).forEach(fid => referencedFamIds.add(fid));
-    if (placementFamilyByPersonId[pid]) referencedFamIds.add(placementFamilyByPersonId[pid]);
-  }
+  // Collect only family IDs intentionally referenced by this basket export.
+  // Do not pull every DB relationship for a selected person; explicit placement
+  // must constrain the GEDCOM to the selected parent-family.
+  const referencedFamIds = new Set(plannedReferencedFamIds);
 
-  // FAM records — include if: (1) new family, (2) children changed, OR (3) referenced by an exported person
+  // FAM records — include if intentionally referenced by this basket export or explicitly forced
   for (const [fid, fam] of Object.entries(ftlsFamilyMap)) {
     const hid = fam.husband_id || fam.husb || '';
     const wid = fam.wife_id || fam.wife || '';
@@ -5270,10 +5292,9 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, 
     for (const [pid, targetFamId] of Object.entries(placementFamilyByPersonId || {})) {
       if (targetFamId === fid && !kids.includes(pid)) kids.push(pid);
     }
-    const involvesOur = personIds.has(hid) || personIds.has(wid) || kids.some(k => personIds.has(k));
     const referencedByExport = referencedFamIds.has(fid);
     const forceFamilyExport = forcedFamIds.has(fid);
-    if (!involvesOur && !referencedByExport && !forceFamilyExport) continue;
+    if (!referencedByExport && !forceFamilyExport) continue;
     
     // If family exists in external AND not referenced by any exported person,
     // only include if children list changed — unless the user explicitly selected
@@ -5326,7 +5347,11 @@ function exportDiffGedcom(persons, ftlsFamilyMap, extFamilyIds, extFamiliesMap, 
     const wid = fam.wife_id || fam.wife || '';
     if (hid) referencedPersonIds.add(hid);
     if (wid) referencedPersonIds.add(wid);
-    (fam.children || []).forEach(cid => referencedPersonIds.add(cid));
+    const kids = [...(fam.children || [])];
+    for (const [pid, targetFamId] of Object.entries(placementFamilyByPersonId || {})) {
+      if (targetFamId === fid && !kids.includes(pid)) kids.push(pid);
+    }
+    kids.forEach(cid => referencedPersonIds.add(cid));
   }
   // Emit minimal anchor INDI for anyone referenced but not already exported.
   // Critical MFT behavior: anchors are for relationship attachment only. Do not
@@ -9033,11 +9058,18 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
   };
 
 
+  function getFtlsParentFamilyIds(personId) {
+    return Object.entries(familyMap || {})
+      .filter(([, fam]) => (fam.children || []).includes(personId))
+      .map(([fid]) => fid);
+  }
+
   function inferFtlsParentFamilyId(personId) {
-    for (const [fid, fam] of Object.entries(familyMap || {})) {
-      if ((fam.children || []).includes(personId)) return fid;
-    }
-    return '';
+    const parentIds = getFtlsParentFamilyIds(personId);
+    // Auto-place only when FTLS has exactly one parent family for this person.
+    // If there are multiple possible parent families, require an explicit user
+    // selection so the export does not drag in the wrong branch.
+    return parentIds.length === 1 ? parentIds[0] : '';
   }
 
   function familyDisplayLabel(fid) {
@@ -9386,16 +9418,35 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
 
   // ── BATCH EXPORT (download GEDCOM) ──
   const buildExportPersonListAndForcedFamilies = () => {
-    const persons = basket.exports.filter(e => e.type === 'ftls_person').map(e => e.person);
-    basket.exports.filter(e => e.type === 'changed_fields').forEach(e => {
-      if (!persons.find(p => p.id === e.person.id)) persons.push(e.person);
-    });
+    const persons = [];
+    const addPerson = (p) => { if (p && !persons.find(x => x.id === p.id)) persons.push(p); };
+    basket.exports.filter(e => e.type === 'ftls_person').forEach(e => addPerson(e.person));
+    basket.exports.filter(e => e.type === 'changed_fields').forEach(e => addPerson(e.person));
+
+    // Families explicitly selected in the Changed/Family Facts section are
+    // authoritative and are emitted once via this Set. Person autoplacement may
+    // point to the same family; Set dedupe prevents duplicate FAM records.
     const forcedFamilyIds = new Set(basket.exports.filter(e => e.type === 'family_facts').map(e => e.familyId));
     const placementFamilyByPersonId = {};
-    basket.exports.filter(e => e.type === 'ftls_person' && e.targetFamilyId).forEach(e => {
-      placementFamilyByPersonId[e.person.id] = e.targetFamilyId;
-      forcedFamilyIds.add(e.targetFamilyId);
+
+    const selectedFamilyContainingPerson = (pid) => {
+      const matches = [...forcedFamilyIds].filter(fid => (familyMap?.[fid]?.children || []).includes(pid));
+      return matches.length === 1 ? matches[0] : '';
+    };
+
+    basket.exports.filter(e => e.type === 'ftls_person').forEach(e => {
+      const pid = e.person?.id;
+      if (!pid) return;
+      const explicit = e.targetFamilyId || '';
+      const fromSelectedFamily = selectedFamilyContainingPerson(pid);
+      const inferredSingleParent = inferFtlsParentFamilyId(pid);
+      const targetFamilyId = explicit || fromSelectedFamily || inferredSingleParent || '';
+      if (targetFamilyId) {
+        placementFamilyByPersonId[pid] = targetFamilyId;
+        forcedFamilyIds.add(targetFamilyId);
+      }
     });
+
     return { persons, forcedFamilyIds, placementFamilyByPersonId };
   };
 
@@ -10034,7 +10085,7 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
             {tab==='ftls_only' && (()=>{
               const persons = diffResult.ftlsOnly;
               return (<div style={{ padding:'12px 0' }}>
-                <div style={{ fontSize:12, color:DM, marginBottom:8 }}>These people exist in FTLS but were not found in the compared MFT GEDCOM. Choose Export to add/update them in MFT. If they should attach to an existing parent family, select that family before exporting.</div>
+                <div style={{ fontSize:12, color:DM, marginBottom:8 }}>These people exist in FTLS but were not found in the compared MFT GEDCOM. Choose Export to add/update them in MFT. If FTLS has exactly one known parent family, FTLS will auto-include that family. If multiple/no parent families are possible, choose the intended parent family or they may import as an orphan.</div>
                 <div style={selBar}>
                   <button style={lnkBtn} onClick={()=>{ const d={}; persons.forEach(p=>{d[p.id]='export'}); setFtlsDir(d); }}>⬆ All Export</button>
                   <button style={lnkBtn} onClick={()=>setFtlsDir({})}>Clear All</button>
@@ -10050,15 +10101,20 @@ function GedcomDiffModal({ onClose, personMap, familyMap, user, onMergeComplete,
                   </div>
                   <FamilyPath personId={p.id} showFtls={true} showExt={false} />
                   {ftlsDir[p.id] === 'export' && (() => {
+                    const parentIds = getFtlsParentFamilyIds(p.id);
                     const inferred = inferFtlsParentFamilyId(p.id);
                     const value = ftlsPlacementFam[p.id] || inferred || '';
-                    return <div style={{ marginTop:6, paddingLeft:86, display:'flex', alignItems:'center', gap:6 }}>
+                    const selectedFamilyNote = value && !ftlsPlacementFam[p.id] && inferred
+                      ? 'auto-included from FTLS parent family'
+                      : (parentIds.length > 1 && !ftlsPlacementFam[p.id] ? 'multiple possible FTLS parent families — choose one' : '');
+                    return <div style={{ marginTop:6, paddingLeft:86, display:'flex', alignItems:'center', gap:6, flexWrap:'wrap' }}>
                       <span style={{ fontSize:10, color:DM }}>Parent family in MFT:</span>
                       <select value={value} onChange={(e)=>setFtlsPlacementFam(prev=>({...prev,[p.id]:e.target.value}))}
                         style={{ maxWidth:420, fontSize:11, padding:'3px 6px', borderRadius:4, border:'1px solid '+BR }}>
                         <option value="">Standalone / no parent family</option>
                         {sortedFtlsFamiliesForPlacement.map(fid => <option key={fid} value={fid}>{familyDisplayLabel(fid)}</option>)}
                       </select>
+                      {selectedFamilyNote && <span style={{ fontSize:10, color:'#7eb8d0' }}>{selectedFamilyNote}</span>}
                       {!value && <span style={{ fontSize:10, color:'#c05050' }}>will import as orphan</span>}
                     </div>;
                   })()}
